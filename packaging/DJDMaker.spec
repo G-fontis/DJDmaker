@@ -67,6 +67,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    version=str(PROJECT_ROOT / "packaging" / "windows_version_info.txt"),
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,

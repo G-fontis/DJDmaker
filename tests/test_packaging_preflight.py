@@ -154,9 +154,16 @@ def test_spec_is_windowed_onedir_and_build_script_never_creates_zip() -> None:
     assert '"PySide6.QtMultimedia"' in spec
     assert '"runtime/ffmpeg"' in spec
     assert '"default-settings.json"' in spec
+    assert '"windows_version_info.txt"' in spec
+    version_info = (PROJECT_ROOT / "packaging" / "windows_version_info.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "ProductVersion', u'0.1'" in version_info
+    assert "FileVersion', u'0.1.0.0'" in version_info
     assert '"config"' in spec
     assert "--release-tree" in script
     assert 'Move-Item -LiteralPath $Source -Destination $Destination' in script
+    assert '$ResolvedLicense -ne $StagedLicense' in script
     assert "Compress-Archive" not in script
     assert ".zip" not in script.casefold()
     assert 'os.environ["PATH"]' in hook

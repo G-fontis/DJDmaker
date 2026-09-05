@@ -19,7 +19,9 @@ $env:DJD_FFPROBE_PATH = (Resolve-Path -LiteralPath $FFprobePath).Path
 $ResolvedLicense = (Resolve-Path -LiteralPath $FFmpegLicense).Path
 New-Item -ItemType Directory -Force -Path $AssetRoot | Out-Null
 $StagedLicense = Join-Path $AssetRoot "FFmpeg-LICENSE.txt"
-Copy-Item -LiteralPath $ResolvedLicense -Destination $StagedLicense -Force
+if ($ResolvedLicense -ne $StagedLicense) {
+    Copy-Item -LiteralPath $ResolvedLicense -Destination $StagedLicense -Force
+}
 $env:DJD_FFMPEG_LICENSE = $StagedLicense
 
 & $Python -m djd_maker.packaging.preflight --root $ProjectRoot
