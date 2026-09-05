@@ -35,6 +35,7 @@ def test_gitignore_has_required_safety_patterns() -> None:
         "*token*",
         "*credential*",
         "*secret*",
+        "system/**",
         ".venv/",
         "build/",
         "dist/",

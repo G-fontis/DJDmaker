@@ -49,9 +49,9 @@ Desktop.ini
 *.db-*
 *.sqlite
 *.sqlite3
-system/*.json
-system/jobs/**
+system/**
 !system/.gitkeep
+!system/jobs/
 !system/jobs/.gitkeep
 
 # Browser profiles, diagnostics and logs

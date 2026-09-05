@@ -83,6 +83,7 @@ class DownloadSafetyGate:
 class Job:
     source_path: str
     id: str = field(default_factory=lambda: uuid4().hex)
+    parent_job_id: str | None = None
     state: JobState = JobState.WAITING
     notebook_id: str | None = None
     notebook_url: str | None = None
@@ -120,4 +121,3 @@ class Job:
         gate = values.get("safety_gate", {})
         values["safety_gate"] = DownloadSafetyGate(**gate)
         return cls(**values)
-

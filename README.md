@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## 現在の開発段階
 
-Unit 0（開発基盤・元エンジン調査・統合設計）です。実サイトを操作するエンジン本体やFFmpeg変換本体はまだ統合していません。
+Unit 1（GUI非依存の実処理コア）まで実装済みです。JSON永続化、動画検証、RAW安全保存、Ending、HLS/ZIP、Notebook adapter骨格、並列lane pipeline、Fake Notebookによるheadless E2Eを含みます。実NotebookLMの動画artifact削除は、専用DOMを実画面確認するまでfail-closedで無効です。
 
 このリポジトリではDBを使用しません。設定、キュー、状態、ジョブはアプリ配置フォルダ内のJSONへ原子的に保存する設計です。生成動画、ブラウザプロファイル、Cookie、ログ、秘密情報はGit管理対象外です。
 
@@ -50,6 +50,7 @@ docs/        調査・設計資料
 - [GUI設計](docs/gui-design.md)
 - [テスト戦略](docs/test-strategy.md)
 - [次Unitの推奨分割](docs/unit1-plan.md)
+- [Unit 1実装記録](docs/unit1-implementation.md)
 
 ## 安全原則
 
