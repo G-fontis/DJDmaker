@@ -127,6 +127,18 @@ def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path
     assert window.total_label.text() == "全Job: 1"
     assert window.zip_complete_label.text() == "ZIP完了: 1/1"
     assert window.completion_group.isVisibleTo(window)
+    root_layout = window.centralWidget().layout()
+    controls_layout = root_layout.itemAt(4).layout()
+    assert [controls_layout.itemAt(index).widget() for index in range(8)] == [
+        window.settings_button,
+        window.login_button,
+        window.start_button,
+        window.reload_button,
+        window.pause_button,
+        window.stop_button,
+        window.log_button,
+        window.details_button,
+    ]
     window.close()
     assert "shutdown" in controller.calls
 

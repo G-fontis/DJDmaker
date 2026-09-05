@@ -120,14 +120,14 @@ class MainWindow(QMainWindow):
         self.log_button = QPushButton("ログを見る")
         self.settings_button = QPushButton("設定")
         for button in (
-            self.reload_button,
+            self.settings_button,
+            self.login_button,
             self.start_button,
+            self.reload_button,
             self.pause_button,
             self.stop_button,
-            self.login_button,
-            self.details_button,
             self.log_button,
-            self.settings_button,
+            self.details_button,
         ):
             controls.addWidget(button)
         root.addLayout(controls)
