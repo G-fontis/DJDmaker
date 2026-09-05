@@ -1,0 +1,2 @@
+# DJDmaker
+台本からGeminiNoteBookで授業動画を作成するアプリ
