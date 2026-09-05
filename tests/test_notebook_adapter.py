@@ -18,6 +18,27 @@ from djd_maker.core.interfaces import RemoteDeletionDenied
 from djd_maker.core.models import DownloadSafetyGate
 
 
+# Minimal, secret-free extraction from GNBCreator's saved live diagnostic:
+# diagnostics/20260905_101556/STATE_10_VIDEO_MENU/{elements.json,accessibility.txt}
+LIVE_ARTIFACT_MENU_FIXTURE = (
+    ("button", "再生", "artifact-action-button"),
+    ("button", "その他", "artifact-more-button"),
+    ("menuitem", "共有", "mat-mdc-menu-item"),
+    ("menuitem", "名前を変更", "mat-mdc-menu-item"),
+    ("menuitem", "ダウンロード", "mat-mdc-menu-item"),
+    ("menuitem", "プロンプトとソースを表示", "mat-mdc-menu-item"),
+    ("menuitem", "削除", "mat-mdc-menu-item"),
+)
+
+
+def test_verified_defaults_match_minimal_live_artifact_menu_fixture():
+    role_names = {(role, name) for role, name, _css_class in LIVE_ARTIFACT_MENU_FIXTURE}
+    defaults = ArtifactDeleteSelectors()
+    assert ("button", defaults.more_button_names[0]) in role_names
+    assert ("menuitem", defaults.artifact_menu_markers[0]) in role_names
+    assert ("menuitem", defaults.delete_menu_names[0]) in role_names
+
+
 class Locator:
     def __init__(self, *, count=1, text="", visible=True):
         self._count = count
@@ -156,7 +177,7 @@ class DeleteCard(DeleteNode):
         if role == "button" and name in ("その他", "More"):
             return DeleteNode(
                 visible=self.visible and name == self.page.more_name,
-                on_click=lambda: self.page.events.append("more"),
+                on_click=self.page._open_menu,
             )
         return DeleteNode(visible=False)
 
@@ -200,6 +221,10 @@ class ArtifactDeletePage:
         self.confirmation = confirmation
         self.dialog_visible = False
         self.toast = toast
+        self.menu_open = False
+        self.reappear_on_reload = False
+        self.server_deleted = False
+        self.artifact_marker_available = True
         self.cards = [DeleteCard(self, title) for title in titles]
 
     def locator(self, selector):
@@ -211,16 +236,28 @@ class ArtifactDeletePage:
         for card in self.cards:
             card.visible = False
 
+    def _open_menu(self):
+        self.events.append("more")
+        self.menu_open = True
+
     def get_by_role(self, role, **_kwargs):
         if role == "menu":
             page = self
 
             class Menu(DeleteNode):
+                def count(self): return int(page.menu_open)
+                def is_visible(self, **_kwargs): return page.menu_open
                 def get_by_role(self, item_role, *, name, exact):
                     assert item_role == "menuitem" and exact
                     return DeleteNode(
-                        visible=name == page.delete_name,
-                        on_click=page._delete_clicked,
+                        visible=(
+                            name == page.delete_name
+                            or (
+                                page.artifact_marker_available
+                                and name in ("ダウンロード", "Download")
+                            )
+                        ),
+                        on_click=(page._delete_clicked if name == page.delete_name else None),
                     )
 
             return Menu()
@@ -255,11 +292,24 @@ class ArtifactDeletePage:
     def wait_for_timeout(self, _milliseconds):
         pass
 
+    def reload(self, *, wait_until):
+        assert wait_until == "domcontentloaded"
+        self.events.append("refresh")
+        if self.server_deleted:
+            for card in self.cards:
+                card.visible = False
+        if self.reappear_on_reload:
+            for card in self.cards:
+                card.visible = True
+
 
 def test_artifact_delete_uses_verified_scoped_sequence_without_dialog():
     page = ArtifactDeletePage()
     NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
-    assert page.events == [("scope", "lecture"), "more", "delete", "removed"]
+    assert page.events == [
+        ("scope", "lecture"), "more", "delete", "removed", "refresh",
+        ("scope", "lecture"),
+    ]
 
 
 def test_artifact_delete_supports_fallback_names_and_optional_confirmation():
@@ -267,7 +317,13 @@ def test_artifact_delete_supports_fallback_names_and_optional_confirmation():
         confirmation="Delete this video?", more_name="More", delete_name="Delete"
     )
     NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
-    assert page.events[-3:] == ["more", "delete", "removed"]
+    assert page.events[1:4] == ["more", "delete", "removed"]
+
+
+def test_artifact_delete_supports_japanese_confirmation():
+    page = ArtifactDeletePage(confirmation="この動画を削除しますか？")
+    NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
+    assert "removed" in page.events
 
 
 def test_artifact_delete_refuses_notebook_confirmation():
@@ -297,12 +353,52 @@ def test_artifact_delete_can_confirm_by_explicitly_configured_toast():
     def server_delete():
         page.events.append("server-delete")
         page.toast = True
+        page.server_deleted = True
     page._remove = server_delete
     selectors = ArtifactDeleteSelectors(success_toast_markers=("動画を削除しました",))
     NotebookDomAdapter(
         page, artifact_delete_selectors=selectors
     ).delete_video_artifact("lecture", complete_gate())
     assert "server-delete" in page.events
+
+
+def test_wrong_menu_is_rejected_before_delete_click():
+    page = ArtifactDeletePage()
+    page.artifact_marker_available = False
+    with pytest.raises(DomMismatchError, match="Download"):
+        NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
+    assert "delete" not in page.events
+    assert "removed" not in page.events
+
+
+def test_artifact_must_stay_absent_after_refresh():
+    page = ArtifactDeletePage()
+    page.reappear_on_reload = True
+    diagnostics = []
+    with pytest.raises(ArtifactDeletionRetryableError, match="reappeared"):
+        NotebookDomAdapter(page, diagnostic=diagnostics.append).delete_video_artifact(
+            "lecture", complete_gate()
+        )
+    assert "refresh" in page.events
+    assert diagnostics[-1] == "DELETE_RETRYABLE:artifact_reappeared"
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_raw_survives_remote_delete_and_retry(tmp_path, retryable):
+    raw = tmp_path / "raw_files" / "lecture.mp4"
+    raw.parent.mkdir()
+    original = b"immutable-raw-video"
+    raw.write_bytes(original)
+    page = ArtifactDeletePage()
+    if retryable:
+        page._remove = lambda: page.events.append("server-result-unknown")
+        with pytest.raises(ArtifactDeletionRetryableError):
+            NotebookDomAdapter(page, timeout_ms=1).delete_video_artifact(
+                "lecture", complete_gate()
+            )
+    else:
+        NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
+    assert raw.read_bytes() == original
 
 
 def test_unobserved_delete_result_is_retryable():

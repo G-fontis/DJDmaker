@@ -17,6 +17,7 @@ djd-maker = "djd_maker.gui.app:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<9"]
+build = ["pyinstaller>=6,<7"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

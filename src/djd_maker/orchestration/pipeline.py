@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any, Protocol
 from zipfile import BadZipFile, ZipFile
 
-from djd_maker.core.interfaces import EndingEngine, HlsEngine, NotebookEngine
+from djd_maker.core.interfaces import (
+    EndingEngine,
+    HlsEngine,
+    NotebookEngine,
+    require_remote_deletion_gate,
+)
 from djd_maker.core.models import Job, JobState
 
 
@@ -60,6 +65,19 @@ class PipelineCoordinator:
     MEDIA_STATES = frozenset(
         {JobState.RAW_READY, JobState.ENDING, JobState.HLS_ENCODING, JobState.ZIPPING}
     )
+    STATE_PROGRESS = {
+        JobState.WAITING: 0.0,
+        JobState.UPLOADING: 5.0,
+        JobState.GENERATING: 10.0,
+        JobState.WAITING_VIDEO: 20.0,
+        JobState.DOWNLOADING: 30.0,
+        JobState.DOWNLOAD_VERIFY_FAILED: 30.0,
+        JobState.RAW_READY: 40.0,
+        JobState.ENDING: 55.0,
+        JobState.HLS_ENCODING: 75.0,
+        JobState.ZIPPING: 90.0,
+        JobState.COMPLETED: 100.0,
+    }
 
     def __init__(
         self,
@@ -93,6 +111,8 @@ class PipelineCoordinator:
 
     def _transition(self, job: Job, target: JobState) -> None:
         job.transition_to(target)
+        if target in self.STATE_PROGRESS:
+            job.progress_percent = self.STATE_PROGRESS[target]
         self._save(job)
 
     def run_cycle(self) -> None:
@@ -190,6 +210,7 @@ class PipelineCoordinator:
                 job.safety_gate = gate
                 self._transition(job, JobState.RAW_READY)
                 try:
+                    require_remote_deletion_gate(gate)
                     self.notebook.delete_video_artifact(job, gate)
                 except Exception as exc:
                     # RAW is already durable and verified. Remote cleanup can be
@@ -287,6 +308,7 @@ class PipelineCoordinator:
             raise KeyError(job_id)
         if not job.raw_path or not Path(job.raw_path).is_file():
             raise ValueError("verified RAW is required before remote cleanup retry")
+        require_remote_deletion_gate(job.safety_gate)
         self.notebook.delete_video_artifact(job, job.safety_gate)
         if job.error_code == "REMOTE_ARTIFACT_DELETE_FAILED":
             job.error_code = None

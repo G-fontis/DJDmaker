@@ -20,6 +20,7 @@ from djd_maker.media.validator import VideoValidator
 from djd_maker.orchestration.gui_controller import GuiPipelineController
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
 from djd_maker.orchestration.scheduler import PersistentPollScheduler
+from djd_maker.packaging.preflight import application_root
 
 from .controller import AsyncControllerBridge
 from .main_window import MainWindow
@@ -105,6 +106,6 @@ def build_desktop(
 
 
 def main() -> int:
-    application, window, _service = build_desktop(Path.cwd())
+    application, window, _service = build_desktop(application_root())
     window.show()
     return application.exec()

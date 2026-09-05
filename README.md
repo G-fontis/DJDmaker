@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## 現在の開発段階
 
-Unit 2まで実装済みです。PySide6 GUI、永続Notebook scheduler、非同期Pipeline接続、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除adapter、Fake Notebook GUI E2Eを含みます。動画artifact削除はGNB_Creatorの保存済みlive DOMを根拠に移植済みですが、現行Gemini Notebookでの再確認はブラウザセッション未接続のためpendingです。DOM不一致やNotebook削除dialogを検出した場合はfail-closedで停止します。
+Unit 3の非live実装まで完了しています。PySide6 GUI、永続Notebook scheduler、非同期Pipeline接続、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除adapter、Fake Notebook GUI E2E、Windows packaging preflightを含みます。動画artifact削除はGNB_Creatorの保存済みlive DOMを根拠に移植し、削除後refreshと再出現拒否まで実装済みです。現行Gemini Notebookでの1件Acceptanceはブラウザセッション接続待ちです。
 
 このリポジトリではDBを使用しません。設定、キュー、状態、ジョブはアプリ配置フォルダ内のJSONへ原子的に保存する設計です。生成動画、ブラウザプロファイル、Cookie、ログ、秘密情報はGit管理対象外です。
 
@@ -61,6 +61,8 @@ docs/        調査・設計資料
 - [Unit 1実装記録](docs/unit1-implementation.md)
 - [Unit 2実装記録](docs/unit2-implementation.md)
 - [Unit 2エンジン忠実性補正](docs/unit2-engine-fidelity-patch.md)
+- [Unit 3 Live Acceptance記録](docs/unit3-acceptance.md)
+- [Windows packaging preflight](docs/windows-packaging.md)
 
 ## 安全原則
 

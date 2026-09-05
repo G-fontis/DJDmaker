@@ -58,6 +58,7 @@ class ArtifactDeleteSelectors:
 
     more_button_names: tuple[str, ...] = ("その他", "More")
     delete_menu_names: tuple[str, ...] = ("削除", "Delete")
+    artifact_menu_markers: tuple[str, ...] = ("ダウンロード", "Download")
     confirm_button_names: tuple[str, ...] = ("削除", "Delete")
     success_toast_markers: tuple[str, ...] = ()
 
@@ -314,7 +315,7 @@ class NotebookDomAdapter:
             f"visible {role} was not found for candidates: {', '.join(names)}"
         )
 
-    def _playable_artifact(self, artifact_title: str) -> Any:
+    def _playable_artifact(self, artifact_title: str) -> tuple[Any, bool]:
         cards = self.page.locator("artifact-library-item")
         try:
             matching = cards.filter(has_text=artifact_title)
@@ -324,7 +325,7 @@ class NotebookDomAdapter:
                     self._visible(candidate.get_by_role("button", name=name, exact=True))
                     for name in ("再生", "Play")
                 ):
-                    return candidate
+                    return candidate, True
             playable = []
             for index in range(cards.count()):
                 card = cards.nth(index)
@@ -334,12 +335,41 @@ class NotebookDomAdapter:
                 ):
                     playable.append(card)
             if len(playable) == 1:
-                return playable[0]
+                return playable[0], False
         except Exception as exc:
             self.diagnostic("DOM_MISMATCH:artifact_scope_inspection")
             raise DomMismatchError("video artifact scope could not be inspected") from exc
         self.diagnostic("DOM_MISMATCH:delete_artifact_not_unique")
         raise DomMismatchError("delete target is not exactly one playable video artifact")
+
+    def _target_is_present(self, artifact_title: str, title_scoped: bool) -> bool:
+        cards = self.page.locator("artifact-library-item")
+        if title_scoped:
+            cards = cards.filter(has_text=artifact_title)
+        for index in range(cards.count()):
+            card = cards.nth(index)
+            if any(
+                self._visible(card.get_by_role("button", name=name, exact=True))
+                for name in ("再生", "Play")
+            ):
+                return True
+        return False
+
+    def _verify_absent_after_refresh(
+        self, artifact_title: str, title_scoped: bool
+    ) -> None:
+        try:
+            self.page.reload(wait_until="domcontentloaded")
+        except Exception as exc:
+            self.diagnostic(f"DELETE_RETRYABLE:refresh_{type(exc).__name__}")
+            raise ArtifactDeletionRetryableError(
+                "artifact disappeared but refresh verification failed"
+            ) from exc
+        if self._target_is_present(artifact_title, title_scoped):
+            self.diagnostic("DELETE_RETRYABLE:artifact_reappeared")
+            raise ArtifactDeletionRetryableError(
+                "deleted artifact reappeared after refresh"
+            )
 
     def _visible_dialog(self) -> Any | None:
         try:
@@ -373,13 +403,24 @@ class NotebookDomAdapter:
             raise ArtifactDeletionDisabled(
                 "artifact-only deletion controls are explicitly disabled"
             )
-        card = self._playable_artifact(artifact_title)
+        card, title_scoped = self._playable_artifact(artifact_title)
         try:
             toast_was_visible = self._success_toast_visible(selectors)
+            existing_menus = self.page.get_by_role("menu")
+            if any(
+                self._visible(existing_menus.nth(index))
+                for index in range(existing_menus.count())
+            ):
+                raise DomMismatchError("a menu was already open before artifact scoping")
             self._first_role(card, "button", selectors.more_button_names).click()
             menus = self.page.get_by_role("menu")
             if menus.count() != 1 or not self._visible(menus.first):
                 raise DomMismatchError("exactly one artifact action menu is required")
+            # The captured artifact menu contains Download; the Notebook project
+            # menu is rejected even if it also contains an exact Delete label.
+            self._first_role(
+                menus.first, "menuitem", selectors.artifact_menu_markers
+            )
             self._first_role(
                 menus.first, "menuitem", selectors.delete_menu_names
             ).click()
@@ -394,11 +435,13 @@ class NotebookDomAdapter:
             )
             while time.monotonic() < probe_deadline:
                 if not self._visible(card):
+                    self._verify_absent_after_refresh(artifact_title, title_scoped)
                     return
                 if (
                     not toast_was_visible
                     and self._success_toast_visible(selectors)
                 ):
+                    self._verify_absent_after_refresh(artifact_title, title_scoped)
                     return
                 dialog = self._visible_dialog()
                 if dialog is not None:
@@ -421,6 +464,7 @@ class NotebookDomAdapter:
                     not toast_was_visible and self._success_toast_visible(selectors)
                 )
                 if not self._visible(card) or new_success_toast:
+                    self._verify_absent_after_refresh(artifact_title, title_scoped)
                     return
                 self.page.wait_for_timeout(100)
         except (DomMismatchError, ArtifactDeletionRetryableError):

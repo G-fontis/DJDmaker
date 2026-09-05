@@ -165,6 +165,7 @@ def test_fake_notebook_pipeline_completes_headlessly(tmp_path):
     assert Path(result.raw_path).name == "SD001_仕事とは.mp4"
     assert Path(result.zip_path).name == "SD001_仕事とは.zip"
     assert notebook.artifact_delete_calls == [job.id]
+    assert result.progress_percent == 100.0
 
 
 def test_waiting_notebook_does_not_block_raw_ready_job(tmp_path):
