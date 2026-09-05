@@ -192,10 +192,14 @@ class GuiPipelineController:
                             self._log_callback(
                                 {
                                     "job_id": job.id,
+                                    "script_name": job.script_name,
                                     "engine": "DJDmaker",
                                     "stage": job.state.value,
                                     "level": "ERROR" if job.state is JobState.FAILED else "INFO",
-                                    "message": f"state: {previous.value if previous else 'NEW'} -> {job.state.value}",
+                                    "message": (
+                                        f"[{job.script_name}] state: "
+                                        f"{previous.value if previous else 'NEW'} -> {job.state.value}"
+                                    ),
                                 }
                             )
                             self._last_states[job.id] = job.state
@@ -208,6 +212,9 @@ class GuiPipelineController:
                         break
                 self._stop_event.wait(self.cycle_interval_seconds)
         finally:
+            # No terminal job can require another Notebook poll. Keep scheduler
+            # state aligned with the stopped worker after natural completion too.
+            self.scheduler.stop()
             try:
                 self.cleanup()
             except Exception as exc:

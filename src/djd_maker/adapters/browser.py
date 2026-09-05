@@ -93,6 +93,12 @@ class BrowserManager:
             except Exception:
                 pass
 
+    def restart(self) -> Any:
+        """Recreate the context while retaining the authenticated profile."""
+
+        self.stop()
+        return self.start()
+
 
 def run_manual_login(
     profile_dir: str | Path,

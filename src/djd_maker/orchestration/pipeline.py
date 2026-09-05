@@ -116,6 +116,7 @@ class PipelineCoordinator:
         self._save(job)
 
     def run_cycle(self) -> None:
+        self._reject_output_name_collisions()
         # Browser automation remains serialized. Waiting in this lane never
         # prevents already downloaded jobs from entering the media pool below.
         for job in self.jobs.list():
@@ -264,9 +265,14 @@ class PipelineCoordinator:
                 self._transition(job, JobState.HLS_ENCODING)
 
             if job.state in {JobState.HLS_ENCODING, JobState.ZIPPING}:
+                resuming_zip_publish = job.state is JobState.ZIPPING
                 if job.state is JobState.HLS_ENCODING:
                     self._transition(job, JobState.ZIPPING)
                 if output_zip.exists():
+                    if not resuming_zip_publish:
+                        raise FileExistsError(
+                            f"既存ZIPを別工程の成果物として採用しません: {output_zip}"
+                        )
                     if not self._valid_zip(output_zip):
                         raise FileExistsError(f"不正な既存ZIPを上書きしません: {output_zip}")
                     job.zip_path = str(output_zip)
@@ -281,6 +287,30 @@ class PipelineCoordinator:
             job.error_code = "MEDIA_STAGE_FAILED"
             job.error_message = str(exc)
             if job.state not in {JobState.FAILED, JobState.COMPLETED}:
+                self._transition(job, JobState.FAILED)
+
+    def _reject_output_name_collisions(self) -> None:
+        """Fail duplicate active stems before either job can claim shared paths."""
+
+        by_stem: dict[str, list[Job]] = {}
+        for job in self.jobs.list():
+            if job.state is not JobState.FAILED:
+                by_stem.setdefault(job.script_name.casefold(), []).append(job)
+        for duplicates in by_stem.values():
+            if len(duplicates) < 2:
+                continue
+            completed = [job for job in duplicates if job.state is JobState.COMPLETED]
+            owner = min(
+                completed or duplicates,
+                key=lambda item: (item.created_at, item.id),
+            )
+            for job in duplicates:
+                if job.id == owner.id or job.state in {JobState.COMPLETED, JobState.FAILED}:
+                    continue
+                job.error_code = "OUTPUT_NAME_COLLISION"
+                job.error_message = (
+                    f"output stem {job.script_name!r} is already owned by job {owner.id}"
+                )
                 self._transition(job, JobState.FAILED)
 
     @staticmethod

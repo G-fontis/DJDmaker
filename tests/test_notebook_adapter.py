@@ -327,6 +327,43 @@ def test_artifact_delete_supports_japanese_confirmation():
     assert "removed" in page.events
 
 
+def test_nested_angular_material_dialog_selects_inner_modal():
+    class Dialog:
+        def __init__(self, modal):
+            self.modal = modal
+
+        def count(self):
+            return 1
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self, **_kwargs):
+            return True
+
+        def get_attribute(self, name):
+            assert name == "aria-modal"
+            return self.modal
+
+    outer = Dialog("false")
+    inner = Dialog("true")
+
+    class Dialogs:
+        def count(self):
+            return 2
+
+        def nth(self, index):
+            return (outer, inner)[index]
+
+    class Page:
+        def get_by_role(self, role):
+            assert role == "dialog"
+            return Dialogs()
+
+    assert NotebookDomAdapter(Page())._visible_dialog() is inner
+
+
 def test_artifact_delete_refuses_notebook_confirmation():
     page = ArtifactDeletePage(confirmation="このノートブックを削除しますか？")
     diagnostics = []
@@ -458,6 +495,41 @@ def test_playwright_download_validates_before_atomic_publish(tmp_path):
     assert calls[-1] == (destination.resolve(), {})
 
 
+def test_chrome_cdp_download_survives_initiating_page_close(tmp_path):
+    class Client:
+        def __init__(self):
+            self.detached = False
+
+        def on(self, _event, _callback):
+            pass
+
+        def send(self, _method, params):
+            Path(params["downloadPath"], "video.mp4").write_bytes(b"mp4")
+
+        def detach(self):
+            self.detached = True
+
+    client = Client()
+
+    class Context:
+        def new_cdp_session(self, _page):
+            return client
+
+    class ClosedPage:
+        context = Context()
+
+        def is_closed(self):
+            return True
+
+    temporary = tmp_path / "download.mp4"
+    used = PlaywrightArtifactDownload(object())._download_with_chrome(
+        ClosedPage(), Locator(), temporary
+    )
+    assert used is True
+    assert temporary.read_bytes() == b"mp4"
+    assert client.detached is True
+
+
 def test_engine_submit_renames_before_source_and_generation(tmp_path):
     source = tmp_path / "SD001_仕事とは.txt"
     source.write_text("script", encoding="utf-8")
@@ -518,3 +590,77 @@ def test_engine_status_waits_for_delayed_artifact_dom():
         notebook_url="https://notebook.google.com/notebook/id",
     )
     assert NotebookEngineAdapter(DelayedDom()).inspect_status(job) == "READY"
+
+
+def test_engine_adopts_keeper_page_after_download_closed_origin():
+    from djd_maker.core.models import Job
+
+    class Keeper:
+        url = "about:blank"
+
+        def is_closed(self):
+            return False
+
+        def goto(self, url, *, wait_until):
+            assert wait_until == "domcontentloaded"
+            self.url = url
+
+    keeper = Keeper()
+
+    class Context:
+        pages = [keeper]
+
+    class ClosedPage:
+        context = Context()
+
+        def is_closed(self):
+            return True
+
+    dom = type("Dom", (), {"page": ClosedPage()})()
+    engine = NotebookEngineAdapter(dom)
+    job = Job(
+        "lesson.txt",
+        notebook_id="id",
+        notebook_url="https://notebook.google.com/notebook/id",
+    )
+    engine._open_job(job)
+    assert dom.page is keeper
+    assert keeper.url == job.notebook_url
+
+
+def test_engine_recovers_closed_context_with_browser_manager_callback():
+    from djd_maker.core.models import Job
+
+    class RecoveredPage:
+        url = "about:blank"
+
+        def is_closed(self):
+            return False
+
+        def goto(self, url, *, wait_until):
+            assert wait_until == "domcontentloaded"
+            self.url = url
+
+    recovered = RecoveredPage()
+
+    class Context:
+        pages = []
+
+    class ClosedPage:
+        context = Context()
+
+        def is_closed(self):
+            return True
+
+    dom = type("Dom", (), {"page": ClosedPage()})()
+    engine = NotebookEngineAdapter(dom, recover_page=lambda: recovered)
+    job = Job(
+        "lesson.txt",
+        notebook_id="id",
+        notebook_url="https://notebook.google.com/notebook/id",
+    )
+
+    engine._open_job(job)
+
+    assert dom.page is recovered
+    assert recovered.url == job.notebook_url

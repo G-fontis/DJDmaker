@@ -75,3 +75,22 @@ def test_manual_login_uses_normal_chrome_without_automation_flags(monkeypatch, t
     assert not any("remote-debugging" in value for value in arguments)
     assert not any("automation" in value.casefold() for value in arguments)
     assert captured["options"] == {"shell": False}
+
+
+def test_browser_manager_restart_reuses_the_same_profile(tmp_path: Path) -> None:
+    contexts = [Context(), Context()]
+    playwrights = [Playwright(context) for context in contexts]
+    starts = iter(playwrights)
+    manager = BrowserManager(
+        tmp_path / "profile",
+        playwright_factory=lambda: SimpleNamespace(start=lambda: next(starts)),
+        chrome_executable=tmp_path / "chrome.exe",
+    )
+
+    first = manager.start()
+    second = manager.restart()
+
+    assert first is contexts[0].pages[0]
+    assert second is contexts[1].pages[0]
+    assert contexts[0].closed and playwrights[0].stopped
+    assert playwrights[0].profile == playwrights[1].profile

@@ -65,7 +65,8 @@ def build_desktop(
             NotebookDomAdapter(
                 page,
                 download_handoff=PlaywrightArtifactDownload(validator),
-            )
+            ),
+            recover_page=browser.restart,
         )
         raw_directory = _resolved(root, current.raw_directory)
         return PipelineCoordinator(

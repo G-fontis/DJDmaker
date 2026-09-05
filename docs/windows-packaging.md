@@ -15,6 +15,7 @@ PyInstaller 6系のwindowed `onedir` を採用候補とします。`onefile` の
 - `config/default-settings.json` を同梱する。
 - 審査済み `ffmpeg.exe` と `ffprobe.exe` を `runtime/ffmpeg` に配置する。
 - runtime hookで `runtime/ffmpeg` を子processの`PATH`先頭へ追加する。current working directoryは変更しない。
+- PyInstaller収集時に`_internal`へ入るconfig、licenses、runtimeだけをbuild後にportable rootへ移し、root EXE＋`_internal`の構造を保つ。
 - consoleを表示しない。UPXは使用しない。
 
 FFmpeg binaryと対応licenseはrepositoryへコピーせず、ビルド時に以下を明示します。
@@ -54,3 +55,5 @@ python -m djd_maker.packaging.preflight --root . --json
 DJDmakerではこれらを統合し、PySide6固有のQt plugin検査、Playwrightと外部Chromeの分離、空profile、default JSON、Unicode/space path検査を追加しています。
 
 正式配布前には別途、第三者ライセンス一式、Windows 10/11 clean machine、Chrome未ログイン時の導線、Qt Multimedia再生、実NotebookLM、実FFmpeg E2E、署名、ハッシュ、ZIP allowlistをrelease承認工程で確認してください。
+
+実際の候補onedir buildとportable smokeの結果は `docs/unit4-packaging-verification.md` を参照してください。

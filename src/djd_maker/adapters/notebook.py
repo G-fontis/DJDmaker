@@ -94,13 +94,14 @@ class PlaywrightArtifactDownload:
             artifact_card.get_by_role("button", name="その他", exact=True).click()
             item = page.get_by_role("menuitem", name="ダウンロード", exact=True)
             item.wait_for(state="visible", timeout=self.timeout_ms)
-            with page.expect_download(timeout=self.timeout_ms) as info:
-                item.click()
-            download = info.value
-            failure = download.failure()
-            if failure:
-                raise NotebookAdapterError(f"artifact download failed: {failure}")
-            download.save_as(str(temporary))
+            if not self._download_with_chrome(page, item, temporary):
+                with page.expect_download(timeout=self.timeout_ms) as info:
+                    item.click()
+                download = info.value
+                failure = download.failure()
+                if failure:
+                    raise NotebookAdapterError(f"artifact download failed: {failure}")
+                download.save_as(str(temporary))
             self.validator.validate(temporary, reject_temporary=False)
             try:
                 os.link(temporary, destination)
@@ -110,11 +111,89 @@ class PlaywrightArtifactDownload:
             return destination
         finally:
             temporary.unlink(missing_ok=True)
-            if keeper is not None:
+            if keeper is not None and not getattr(page, "is_closed", lambda: False)():
                 try:
                     keeper.close()
                 except Exception:
                     pass
+
+    def _download_with_chrome(self, page: Any, item: Any, temporary: Path) -> bool:
+        """Use GNBCreator's CDP download path when Notebook closes its tab."""
+
+        context = getattr(page, "context", None)
+        if context is None or not hasattr(context, "new_cdp_session"):
+            return False
+        download_dir = temporary.parent / f".gnb-download-{uuid4().hex}"
+        download_dir.mkdir()
+        client = None
+        clicked = False
+        progress: dict[str, object] = {}
+        stable_size: int | None = None
+        stable_since: float | None = None
+        try:
+            client = context.new_cdp_session(page)
+            client.on("Browser.downloadProgress", lambda event: progress.update(event))
+            client.send(
+                "Browser.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": str(download_dir),
+                    "eventsEnabled": True,
+                },
+            )
+            item.click()
+            clicked = True
+            deadline = time.monotonic() + self.timeout_ms / 1000
+            while time.monotonic() < deadline:
+                files = [candidate for candidate in download_dir.iterdir() if candidate.is_file()]
+                completed = [
+                    candidate
+                    for candidate in files
+                    if not candidate.name.endswith(".crdownload")
+                ]
+                if progress.get("state") == "canceled":
+                    raise NotebookAdapterError("Chrome download was canceled")
+                if completed:
+                    completed[0].replace(temporary)
+                    return True
+                partials = [
+                    candidate
+                    for candidate in files
+                    if candidate.name.endswith(".crdownload")
+                ]
+                if partials:
+                    current_size = partials[0].stat().st_size
+                    if current_size != stable_size:
+                        stable_size = current_size
+                        stable_since = time.monotonic()
+                    if (
+                        getattr(page, "is_closed", lambda: False)()
+                        and current_size > 0
+                        and stable_since is not None
+                        and time.monotonic() - stable_since >= 1
+                    ):
+                        partials[0].replace(temporary)
+                        return True
+                try:
+                    page.wait_for_timeout(100)
+                except Exception:
+                    time.sleep(0.1)
+            raise NotebookAdapterError("Chrome download timed out")
+        except Exception:
+            if not clicked:
+                return False
+            raise
+        finally:
+            if client is not None:
+                try:
+                    client.detach()
+                except Exception:
+                    pass
+            try:
+                download_dir.rmdir()
+            except OSError:
+                # Preserve a partial download for diagnosis.
+                pass
 
 
 CREATE_NOTEBOOK = (
@@ -378,7 +457,18 @@ class NotebookDomAdapter:
             raise NotebookAdapterError("download handoffが設定されていません")
         if destination.exists():
             raise FileExistsError(f"download先を上書きしません: {destination}")
-        cards = self.page.locator("artifact-library-item").filter(has_text=artifact_title)
+        # Notebook's Angular artifact list mounts after ``domcontentloaded``.
+        # This follows GNBCreator's recovery wait instead of treating the first
+        # empty DOM frame after a browser restart as a selector mismatch.
+        deadline = time.monotonic() + min(self.timeout_ms, 60_000) / 1000
+        all_cards = self.page.locator("artifact-library-item")
+        while all_cards.count() == 0 and time.monotonic() < deadline:
+            try:
+                self.page.wait_for_timeout(2_000)
+            except Exception:
+                time.sleep(2)
+            all_cards = self.page.locator("artifact-library-item")
+        cards = all_cards.filter(has_text=artifact_title)
         if cards.count() == 1:
             target = cards.first
         else:
@@ -440,6 +530,18 @@ class NotebookDomAdapter:
         self.diagnostic("DOM_MISMATCH:delete_artifact_not_unique")
         raise DomMismatchError("delete target is not exactly one playable video artifact")
 
+    def _wait_for_artifact_cards(self) -> None:
+        """Wait for GNBCreator's delayed Studio artifact mount after navigation."""
+
+        deadline = time.monotonic() + min(self.timeout_ms, 60_000) / 1000
+        cards = self.page.locator("artifact-library-item")
+        while cards.count() == 0 and time.monotonic() < deadline:
+            try:
+                self.page.wait_for_timeout(2_000)
+            except Exception:
+                time.sleep(2)
+            cards = self.page.locator("artifact-library-item")
+
     def _target_is_present(self, artifact_title: str, title_scoped: bool) -> bool:
         cards = self.page.locator("artifact-library-item")
         if title_scoped:
@@ -480,6 +582,19 @@ class NotebookDomAdapter:
         except Exception:
             return None
         if len(visible) > 1:
+            # Angular Material exposes both the outer mat-dialog-container and
+            # its nested semantic dialog to Playwright's role engine. Scope to
+            # the actual aria-modal dialog; unrelated simultaneous dialogs
+            # remain fail-closed.
+            modal = []
+            for dialog in visible:
+                try:
+                    if dialog.get_attribute("aria-modal") == "true":
+                        modal.append(dialog)
+                except Exception:
+                    continue
+            if len(modal) == 1:
+                return modal[0]
             raise DomMismatchError("multiple confirmation dialogs are visible")
         return visible[0] if visible else None
 
@@ -501,6 +616,7 @@ class NotebookDomAdapter:
             raise ArtifactDeletionDisabled(
                 "artifact-only deletion controls are explicitly disabled"
             )
+        self._wait_for_artifact_cards()
         card, title_scoped = self._playable_artifact(artifact_title)
         try:
             toast_was_visible = self._success_toast_visible(selectors)
@@ -581,8 +697,13 @@ class NotebookDomAdapter:
 class NotebookEngineAdapter:
     """DOM操作をpipeline用のjob単位interfaceへまとめる。"""
 
-    def __init__(self, dom: NotebookDomAdapter) -> None:
+    def __init__(
+        self,
+        dom: NotebookDomAdapter,
+        recover_page: Callable[[], Any] | None = None,
+    ) -> None:
         self.dom = dom
+        self.recover_page = recover_page
 
     def submit(self, job: Job) -> tuple[str, str]:
         metadata = self.dom.create_notebook()
@@ -598,6 +719,29 @@ class NotebookEngineAdapter:
         parsed = urlparse(job.notebook_url)
         if parsed.scheme != "https" or parsed.hostname != "notebook.google.com":
             raise NotebookAdapterError("jobのNotebook URLが不正です")
+        # Notebook downloads can close their initiating tab. GNBCreator keeps
+        # a second tab alive; adopt it before cleanup and navigate back to the
+        # same persisted Notebook identity.
+        try:
+            page_closed = bool(self.dom.page.is_closed())
+        except Exception:
+            page_closed = False
+        if page_closed:
+            context = getattr(self.dom.page, "context", None)
+            pages = [
+                candidate
+                for candidate in getattr(context, "pages", ())
+                if not getattr(candidate, "is_closed", lambda: True)()
+            ]
+            if pages:
+                self.dom.page = pages[0]
+            elif self.recover_page is None:
+                raise NotebookAdapterError(
+                    "download後のbrowser contextを復旧できません"
+                )
+            else:
+                self.dom.page = self.recover_page()
+
         # Preserve the already-mounted Studio DOM between status, download and
         # cleanup. GNBCreator does not navigate again after observing READY.
         try:
