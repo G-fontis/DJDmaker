@@ -46,7 +46,19 @@ def test_gitignore_has_required_safety_patterns() -> None:
 
 def test_no_database_dependency_or_file_is_tracked_in_source_tree() -> None:
     forbidden_suffixes = {".db", ".sqlite", ".sqlite3"}
-    excluded_roots = {".git", ".test-tmp", ".pytest_cache"}
+    # Runtime trees are deliberately ignored and may contain Chrome's own
+    # internal cache databases during a real acceptance run. The application
+    # source and tracked fixtures must remain database-free.
+    excluded_roots = {
+        ".git",
+        ".test-tmp",
+        ".pytest_cache",
+        "browser",
+        "logs",
+        "output",
+        "raw_files",
+        "work",
+    }
     candidates = (
         path
         for path in ROOT.rglob("*")

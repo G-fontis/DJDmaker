@@ -18,6 +18,8 @@ class GuiControllerPort(Protocol):
 
     def stop(self) -> Any: ...
 
+    def login(self) -> Any: ...
+
     def retry(self, job_id: str, stage: str) -> Any: ...
 
     def shutdown(self) -> Any: ...
@@ -127,6 +129,9 @@ class AsyncControllerBridge(QObject):
 
     def stop(self) -> bool:
         return self._invoke("stop", self.controller.stop)
+
+    def login(self) -> bool:
+        return self._invoke("login", self.controller.login)
 
     def retry(self, job_id: str, stage: str) -> bool:
         return self._invoke(f"retry:{stage}", lambda: self.controller.retry(job_id, stage))

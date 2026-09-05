@@ -61,6 +61,9 @@ class FakeController:
     def stop(self):
         self.calls.append("stop")
 
+    def login(self):
+        self.calls.append("login")
+
     def retry(self, job_id: str, stage: str):
         self.calls.append(("retry", job_id, stage))
 

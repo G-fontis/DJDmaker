@@ -97,6 +97,7 @@ class PageMustNotBeUsedForDelete:
     ("text", "expected"),
     [
         ("ready", RemoteVideoStatus.READY),
+        ("ショート動画の概要を生成しています...", RemoteVideoStatus.GENERATING),
         ("動画解説を生成しています", RemoteVideoStatus.GENERATING),
         ("スケジュール設定されています", RemoteVideoStatus.WAITING),
         ("動画解説を生成できませんでした", RemoteVideoStatus.FAILED),
@@ -457,7 +458,7 @@ def test_playwright_download_validates_before_atomic_publish(tmp_path):
     assert calls[-1] == (destination.resolve(), {})
 
 
-def test_engine_submit_waits_for_source_before_rename_and_generation(tmp_path):
+def test_engine_submit_renames_before_source_and_generation(tmp_path):
     source = tmp_path / "SD001_仕事とは.txt"
     source.write_text("script", encoding="utf-8")
     events = []
@@ -485,8 +486,35 @@ def test_engine_submit_waits_for_source_before_rename_and_generation(tmp_path):
     assert result[0] == "id"
     assert events == [
         "create",
+        ("rename", "SD001_仕事とは"),
         ("upload", source),
         "source_ready",
-        ("rename", "SD001_仕事とは"),
         "generate",
     ]
+
+
+def test_engine_status_waits_for_delayed_artifact_dom():
+    from djd_maker.core.models import Job
+
+    class DelayedPage:
+        url = "https://notebook.google.com/notebook/id"
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 2_000
+
+    class DelayedDom:
+        timeout_ms = 60_000
+        page = DelayedPage()
+
+        def __init__(self):
+            self.states = [RemoteVideoStatus.UNKNOWN, RemoteVideoStatus.READY]
+
+        def inspect_status(self):
+            return self.states.pop(0)
+
+    job = Job(
+        "lesson.txt",
+        notebook_id="id",
+        notebook_url="https://notebook.google.com/notebook/id",
+    )
+    assert NotebookEngineAdapter(DelayedDom()).inspect_status(job) == "READY"

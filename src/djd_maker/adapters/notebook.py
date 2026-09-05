@@ -118,6 +118,7 @@ class PlaywrightArtifactDownload:
 
 
 CREATE_NOTEBOOK = (
+    ("role", "button", "新規作成"),
     ("role", "button", "ノートブックを新規作成"),
     ("role", "button", "Create new notebook"),
     ("css", "button[aria-label*='notebook' i]", ""),
@@ -130,6 +131,21 @@ FILE_INPUT = (
     ("label", "", "Upload sources"),
     ("label", "", "ソースをアップロード"),
     ("css", "input[type='file']", ""),
+)
+ADD_SOURCE = (
+    ("role", "button", "ソースを追加"),
+    ("role", "button", "Add source"),
+    ("css", "button[aria-label*='source' i]", ""),
+)
+INFORMATION_DIALOG_CLOSE = (
+    ("role", "button", "ダイアログを閉じる"),
+    ("role", "button", "Close dialog"),
+)
+UPLOAD_FILE_BUTTON = (
+    ("role", "button", "ファイルをアップロード"),
+    ("role", "button", "Upload file"),
+    ("text", "", "ファイルをアップロード"),
+    ("text", "", "Upload file"),
 )
 SOURCE_READY = (
     ("text", "", "1 件のソース"),
@@ -159,7 +175,15 @@ class NotebookDomAdapter:
     """NotebookLM DOM adapter。Notebookを削除するAPIは意図的に持たない。"""
 
     HOME_URL = "https://notebook.google.com/"
-    ACTIVE_MARKERS = ("動画解説を生成しています", "生成中", "generating", "preparing")
+    ACTIVE_MARKERS = (
+        "ショート動画の概要を生成しています",
+        "動画解説の概要を生成しています",
+        "動画解説を生成しています",
+        "生成中",
+        "生成しています",
+        "generating",
+        "preparing",
+    )
     WAITING_MARKERS = ("スケジュール設定されています", "scheduled for later")
     FAILED_MARKERS = ("動画解説を生成できませんでした", "failed to generate video")
 
@@ -194,6 +218,22 @@ class NotebookDomAdapter:
         raise ValueError(f"unsupported selector kind: {kind}")
 
     def _first_visible(self, candidates: Iterable[tuple[str, str, str]], name: str) -> Any:
+        # Keep the same delayed-DOM tolerance as GNBCreator.  Notebook's home
+        # shell reaches ``domcontentloaded`` before its Angular controls mount.
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while time.monotonic() < deadline:
+            for candidate in candidates:
+                try:
+                    locator = self._locator(*candidate)
+                    if locator.count() and locator.first.is_visible(timeout=300):
+                        return locator.first
+                except Exception:
+                    continue
+            self.page.wait_for_timeout(250)
+        self.diagnostic(f"DOM_MISMATCH:{name}")
+        raise DomMismatchError(f"{name}を特定できません")
+
+    def _try_first_visible(self, candidates: Iterable[tuple[str, str, str]]) -> Any | None:
         for candidate in candidates:
             try:
                 locator = self._locator(*candidate)
@@ -201,17 +241,48 @@ class NotebookDomAdapter:
                     return locator.first
             except Exception:
                 continue
-        self.diagnostic(f"DOM_MISMATCH:{name}")
-        raise DomMismatchError(f"{name}を特定できません")
+        return None
+
+    def _try_first_attached(self, candidates: Iterable[tuple[str, str, str]]) -> Any | None:
+        for candidate in candidates:
+            try:
+                locator = self._locator(*candidate)
+                if locator.count():
+                    return locator.first
+            except Exception:
+                continue
+        return None
+
+    def _dismiss_optional_dialogs(self, timeout_ms: int = 5_000) -> None:
+        deadline = time.monotonic() + timeout_ms / 1000
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            close = self._try_first_visible(INFORMATION_DIALOG_CLOSE)
+            if close is not None:
+                close.click()
+                quiet_since = time.monotonic()
+                self.page.wait_for_timeout(250)
+                continue
+            if time.monotonic() - quiet_since >= 2:
+                return
+            self.page.wait_for_timeout(250)
 
     def create_notebook(self) -> ResumeMetadata:
         self.page.goto(self.HOME_URL, wait_until="domcontentloaded")
         self._first_visible(CREATE_NOTEBOOK, "Notebook作成ボタン").click()
         self.page.wait_for_url("**/notebook/**", timeout=self.timeout_ms)
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        notebook_id = ""
         url = self.page.url
-        parsed = urlparse(url)
-        notebook_id = Path(parsed.path).name
-        if parsed.hostname != "notebook.google.com" or not notebook_id:
+        while time.monotonic() < deadline:
+            url = self.page.url
+            parsed = urlparse(url)
+            candidate = Path(parsed.path).name
+            if parsed.hostname == "notebook.google.com" and candidate not in {"", "creating"}:
+                notebook_id = candidate
+                break
+            self.page.wait_for_timeout(250)
+        if not notebook_id:
             raise DomMismatchError("作成後Notebook URLを確認できません")
         return ResumeMetadata(notebook_id, url, "")
 
@@ -234,7 +305,24 @@ class NotebookDomAdapter:
         source = source_path.resolve()
         if not source.is_file() or source.suffix.casefold() != ".txt":
             raise FileNotFoundError(f"有効なTXTではありません: {source}")
-        self._first_visible(FILE_INPUT, "TXT file input").set_input_files(str(source))
+        # Ported from GNBCreator: the input may already exist, or it may only
+        # mount after the explicit Add source action. Informational release
+        # dialogs are dismissed by their dedicated close control only.
+        self._dismiss_optional_dialogs()
+        file_input = self._try_first_attached(FILE_INPUT)
+        if file_input is None:
+            self._first_visible(ADD_SOURCE, "ソース追加ボタン").click()
+            self._dismiss_optional_dialogs()
+            file_input = self._try_first_attached(FILE_INPUT)
+        if file_input is None:
+            upload_button = self._first_visible(
+                UPLOAD_FILE_BUTTON, "ファイルをアップロードボタン"
+            )
+            with self.page.expect_file_chooser(timeout=self.timeout_ms) as chooser_info:
+                upload_button.click()
+            chooser_info.value.set_files(str(source))
+            return
+        file_input.set_input_files(str(source))
 
     def wait_for_source_ready(self) -> None:
         deadline = time.monotonic() + self.timeout_ms / 1000
@@ -291,10 +379,20 @@ class NotebookDomAdapter:
         if destination.exists():
             raise FileExistsError(f"download先を上書きしません: {destination}")
         cards = self.page.locator("artifact-library-item").filter(has_text=artifact_title)
-        if cards.count() != 1:
-            self.diagnostic("DOM_MISMATCH:download_artifact_not_unique")
-            raise DomMismatchError("download対象動画artifactを一意に特定できません")
-        return self.download_handoff(self.page, cards.first, destination)
+        if cards.count() == 1:
+            target = cards.first
+        else:
+            # GNBCreator's proven fallback: generated artifact titles do not
+            # necessarily equal the Notebook title, so accept only the sole
+            # card with a verified Play control.
+            try:
+                target, _title_scoped = self._playable_artifact(artifact_title)
+            except DomMismatchError:
+                self.diagnostic("DOM_MISMATCH:download_artifact_not_unique")
+                raise DomMismatchError(
+                    "download対象動画artifactを一意に特定できません"
+                ) from None
+        return self.download_handoff(self.page, target, destination)
 
     @staticmethod
     def _visible(locator: Any, timeout: int = 300) -> bool:
@@ -488,9 +586,9 @@ class NotebookEngineAdapter:
 
     def submit(self, job: Job) -> tuple[str, str]:
         metadata = self.dom.create_notebook()
+        self.dom.rename_notebook(job.script_name)
         self.dom.upload_txt(Path(job.source_path))
         self.dom.wait_for_source_ready()
-        self.dom.rename_notebook(job.script_name)
         self.dom.start_video_generation()
         return metadata.notebook_id, metadata.notebook_url
 
@@ -500,11 +598,31 @@ class NotebookEngineAdapter:
         parsed = urlparse(job.notebook_url)
         if parsed.scheme != "https" or parsed.hostname != "notebook.google.com":
             raise NotebookAdapterError("jobのNotebook URLが不正です")
-        self.dom.page.goto(job.notebook_url, wait_until="domcontentloaded")
+        # Preserve the already-mounted Studio DOM between status, download and
+        # cleanup. GNBCreator does not navigate again after observing READY.
+        try:
+            current = urlparse(self.dom.page.url)
+        except Exception:
+            current = urlparse("")
+        if current.hostname != parsed.hostname or current.path != parsed.path:
+            self.dom.page.goto(job.notebook_url, wait_until="domcontentloaded")
 
     def inspect_status(self, job: Job) -> str:
         self._open_job(job)
-        return self.dom.inspect_status().value
+        # GNBCreator's remote recovery observes every two seconds for up to
+        # sixty seconds after navigation. This is essential because Angular's
+        # artifact cards mount well after ``domcontentloaded``.
+        deadline = time.monotonic() + min(self.dom.timeout_ms, 60_000) / 1000
+        status = RemoteVideoStatus.UNKNOWN
+        while time.monotonic() < deadline:
+            status = self.dom.inspect_status()
+            if status not in {
+                RemoteVideoStatus.NOT_STARTED,
+                RemoteVideoStatus.UNKNOWN,
+            }:
+                return status.value
+            self.dom.page.wait_for_timeout(2_000)
+        return status.value
 
     def download_artifact(self, job: Job, destination: Path) -> Path:
         self._open_job(job)

@@ -26,6 +26,7 @@ class GuiPipelineController:
         pipeline_factory: Callable[[], PipelineCoordinator] | None = None,
         cleanup: Callable[[], None] | None = None,
         settings_provider: Callable[[], AppSettings] | None = None,
+        manual_login: Callable[[], int] | None = None,
         cycle_interval_seconds: float = 0.25,
     ) -> None:
         if cycle_interval_seconds <= 0:
@@ -39,6 +40,7 @@ class GuiPipelineController:
         self.pipeline_factory = pipeline_factory
         self.cleanup = cleanup or (lambda: None)
         self.settings_provider = settings_provider
+        self.manual_login = manual_login
         self.scheduler = scheduler
         if self.pipeline is not None:
             self.pipeline.scheduler = scheduler
@@ -85,6 +87,13 @@ class GuiPipelineController:
         self._jobs_callback(values)
         self._publish_status(values)
         return values
+
+    def login(self) -> int:
+        if self.status()["running"]:
+            raise RuntimeError("処理中はGoogleログイン用Chromeを別起動できません")
+        if self.manual_login is None:
+            raise RuntimeError("Googleログイン処理が構成されていません")
+        return self.manual_login()
 
     def start(self) -> dict[str, object]:
         with self._guard:

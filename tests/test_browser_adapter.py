@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from djd_maker.adapters.browser import BrowserManager
+from djd_maker.adapters.browser import BrowserManager, run_manual_login
 
 
 class Context:
@@ -50,3 +50,28 @@ def test_browser_manager_uses_dedicated_profile_without_reading_credentials(tmp_
     assert context.timeout == 30_000
     manager.stop()
     assert context.closed and playwright.stopped
+
+
+def test_manual_login_uses_normal_chrome_without_automation_flags(monkeypatch, tmp_path: Path) -> None:
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_bytes(b"exe")
+    captured = {}
+
+    class Process:
+        def wait(self):
+            return 0
+
+    def popen(arguments, **options):
+        captured["arguments"] = arguments
+        captured["options"] = options
+        return Process()
+
+    monkeypatch.setattr("djd_maker.adapters.browser.subprocess.Popen", popen)
+    profile = tmp_path / "専用 profile"
+    assert run_manual_login(profile, executable=chrome) == 0
+    arguments = captured["arguments"]
+    assert f"--user-data-dir={profile.resolve()}" in arguments
+    assert "--no-first-run" in arguments
+    assert not any("remote-debugging" in value for value in arguments)
+    assert not any("automation" in value.casefold() for value in arguments)
+    assert captured["options"] == {"shell": False}

@@ -72,6 +72,7 @@ def controller(tmp_path: Path, *jobs):
         app_root=tmp_path,
         pipeline=pipeline,
         scheduler=scheduler,
+        manual_login=lambda: 0,
         cycle_interval_seconds=0.01,
     )
     return instance, repository, pipeline, scheduler

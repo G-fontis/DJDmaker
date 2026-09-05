@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
@@ -91,3 +92,27 @@ class BrowserManager:
                 playwright.stop()
             except Exception:
                 pass
+
+
+def run_manual_login(
+    profile_dir: str | Path,
+    url: str = "https://notebook.google.com/",
+    *,
+    executable: str | Path | None = None,
+) -> int:
+    """Run ordinary Chrome without Playwright during the initial Google login.
+
+    This is the GNBCreator login handoff: Chrome owns the dedicated profile,
+    and the application neither reads nor copies credentials or cookies.
+    """
+
+    chrome = Path(executable).resolve() if executable else find_chrome()
+    if chrome is None or not chrome.is_file():
+        raise BrowserStartError("Google Chromeの実行ファイルが見つかりません")
+    profile = Path(profile_dir).resolve()
+    profile.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        [str(chrome), f"--user-data-dir={profile}", "--no-first-run", url],
+        shell=False,
+    )
+    return process.wait()

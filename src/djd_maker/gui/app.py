@@ -6,7 +6,7 @@ from typing import Any
 
 from PySide6.QtWidgets import QApplication
 
-from djd_maker.adapters.browser import BrowserManager
+from djd_maker.adapters.browser import BrowserManager, run_manual_login
 from djd_maker.adapters.ending import EndingEngineAdapter
 from djd_maker.adapters.hls import HlsAdapter
 from djd_maker.adapters.notebook import (
@@ -94,6 +94,9 @@ def build_desktop(
         pipeline_factory=pipeline_factory,
         cleanup=browser.stop,
         scheduler=scheduler,
+        manual_login=lambda: run_manual_login(
+            root / "browser" / "chrome-profile", "https://notebook.google.com/"
+        ),
     )
     bridge = AsyncControllerBridge(service)
     window = MainWindow(

@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("授業動画作成開始")
         self.pause_button = QPushButton("一時停止")
         self.stop_button = QPushButton("停止")
+        self.login_button = QPushButton("Googleログイン")
         self.details_button = QPushButton("ジョブ詳細")
         self.log_button = QPushButton("ログを見る")
         self.settings_button = QPushButton("設定")
@@ -123,6 +124,7 @@ class MainWindow(QMainWindow):
             self.start_button,
             self.pause_button,
             self.stop_button,
+            self.login_button,
             self.details_button,
             self.log_button,
             self.settings_button,
@@ -189,6 +191,7 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_processing)
         self.pause_button.clicked.connect(self.pause_processing)
         self.stop_button.clicked.connect(self.stop_processing)
+        self.login_button.clicked.connect(self.controller.login)
         self.details_button.clicked.connect(self.show_selected_job)
         self.log_button.clicked.connect(self.show_logs)
         self.settings_button.clicked.connect(self.show_settings)
@@ -401,6 +404,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(not self._running and self._ending_path() is not None)
         self.pause_button.setEnabled(self._running)
         self.stop_button.setEnabled(self._running)
+        self.login_button.setEnabled(not self._running)
         self.details_button.setEnabled(self._selected_job() is not None)
 
     def closeEvent(self, event: QCloseEvent) -> None:
