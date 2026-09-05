@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン v0.1.1
+# 台本から授業動画つくるマシーン v0.1.2
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 0.1.1。v0.1の機能を維持し、Windowsで設定保存を妨げていた旧`settings.json.lock`依存を廃止した修正版です。
+Version 0.1.2。v0.1.1の機能を維持し、Googleログイン用の専用Chromeを閉じずに、その同じprocess・profile・sessionを授業動画作成へ引き継ぐ修正版です。
 
 PySide6 GUI、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,7 +33,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_v0.1.1`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_v0.1.2`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 初回は設定画面でEnding動画を指定してください。Gemini Notebookへのログインが必要な場合は、アプリが開く専用Chrome profile上で人間が操作します。CAPTCHAや認証を自動回避しません。
 

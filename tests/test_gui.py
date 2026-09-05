@@ -116,7 +116,7 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.1"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.2"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION

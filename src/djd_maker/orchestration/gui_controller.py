@@ -26,7 +26,8 @@ class GuiPipelineController:
         pipeline_factory: Callable[[], PipelineCoordinator] | None = None,
         cleanup: Callable[[], None] | None = None,
         settings_provider: Callable[[], AppSettings] | None = None,
-        manual_login: Callable[[], int] | None = None,
+        manual_login: Callable[[], Any] | None = None,
+        browser_status_provider: Callable[[], dict[str, object]] | None = None,
         cycle_interval_seconds: float = 0.25,
     ) -> None:
         if cycle_interval_seconds <= 0:
@@ -41,6 +42,7 @@ class GuiPipelineController:
         self.cleanup = cleanup or (lambda: None)
         self.settings_provider = settings_provider
         self.manual_login = manual_login
+        self.browser_status_provider = browser_status_provider
         self.scheduler = scheduler
         if self.pipeline is not None:
             self.pipeline.scheduler = scheduler
@@ -88,12 +90,23 @@ class GuiPipelineController:
         self._publish_status(values)
         return values
 
-    def login(self) -> int:
+    def login(self) -> Any:
         if self.status()["running"]:
-            raise RuntimeError("処理中はGoogleログイン用Chromeを別起動できません")
+            raise RuntimeError("処理中はGoogleログイン画面へ移動できません")
         if self.manual_login is None:
             raise RuntimeError("Googleログイン処理が構成されていません")
-        return self.manual_login()
+        result = self.manual_login()
+        self._publish_browser_status("login")
+        return result
+
+    def _publish_browser_status(self, stage: str) -> None:
+        if self.browser_status_provider is None:
+            return
+        status = self.browser_status_provider()
+        summary = ", ".join(f"{key}={value}" for key, value in status.items())
+        self._log_callback(
+            {"level": "INFO", "stage": f"browser-{stage}", "message": summary}
+        )
 
     def start(self) -> dict[str, object]:
         with self._guard:
@@ -158,17 +171,22 @@ class GuiPipelineController:
         return result
 
     def _run_loop(self) -> None:
+        cleanup_browser = True
         try:
             if self.pipeline is None:
                 assert self.pipeline_factory is not None
                 try:
                     self.pipeline = self.pipeline_factory()
                 except Exception as exc:
+                    cleanup_browser = not bool(
+                        getattr(exc, "preserve_browser", False)
+                    )
                     self._log_callback(
                         {"level": "ERROR", "stage": "startup", "message": str(exc)}
                     )
                     self._error_callback("startup", str(exc))
                     return
+                self._publish_browser_status("start")
                 self.pipeline.scheduler = self.scheduler
             while not self._stop_event.is_set():
                 with self._guard:
@@ -215,12 +233,13 @@ class GuiPipelineController:
             # No terminal job can require another Notebook poll. Keep scheduler
             # state aligned with the stopped worker after natural completion too.
             self.scheduler.stop()
-            try:
-                self.cleanup()
-            except Exception as exc:
-                self._log_callback(
-                    {"level": "WARNING", "stage": "shutdown", "message": str(exc)}
-                )
+            if cleanup_browser:
+                try:
+                    self.cleanup()
+                except Exception as exc:
+                    self._log_callback(
+                        {"level": "WARNING", "stage": "shutdown", "message": str(exc)}
+                    )
             if self.pipeline_factory is not None:
                 self.pipeline = None
             with self._guard:

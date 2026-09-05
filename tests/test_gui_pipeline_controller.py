@@ -21,6 +21,7 @@ from djd_maker.orchestration.gui_controller import GuiPipelineController
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
 from djd_maker.orchestration.scheduler import PersistentPollScheduler, SchedulerMode
 from djd_maker.testing.fake_notebook import FakeNotebookAdapter
+from djd_maker.adapters.browser import BrowserAuthenticationRequired
 
 
 class MemoryJobs:
@@ -126,6 +127,67 @@ def test_pause_resume_stop_and_retry_mapping(tmp_path: Path) -> None:
     assert pipeline.retries[-1] == (failed.id, JobState.RAW_READY)
     instance.stop()
     assert scheduler.mode is SchedulerMode.STOPPED
+
+
+def test_unauthenticated_start_keeps_same_browser_for_login(tmp_path: Path) -> None:
+    repository = MemoryJobs(Job("lesson.txt"))
+    scheduler = PersistentPollScheduler(repository)
+    cleanup_calls: list[str] = []
+    errors: list[tuple[str, str]] = []
+
+    def pipeline_factory():
+        raise BrowserAuthenticationRequired("Googleへのログインが必要です")
+
+    instance = GuiPipelineController(
+        jobs=repository,
+        settings=AppSettings(),
+        app_root=tmp_path,
+        pipeline=None,
+        pipeline_factory=pipeline_factory,
+        cleanup=lambda: cleanup_calls.append("closed"),
+        scheduler=scheduler,
+        cycle_interval_seconds=0.01,
+    )
+    instance.bind(
+        jobs=lambda _value: None,
+        status=lambda _value: None,
+        log=lambda _value: None,
+        error=lambda operation, message: errors.append((operation, message)),
+    )
+    instance.start()
+    deadline = time.monotonic() + 2
+    while instance.status()["running"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert cleanup_calls == []
+    assert errors == [("startup", "Googleへのログインが必要です")]
+
+
+def test_browser_lifecycle_status_is_logged_without_credentials(tmp_path: Path) -> None:
+    instance, _repository, _pipeline, _scheduler = controller(tmp_path)
+    records: list[object] = []
+    instance.browser_status_provider = lambda: {
+        "profile_path": "C:/portable/browser/chrome-profile",
+        "process_alive": True,
+        "pid": 4321,
+        "browser_connected": True,
+        "context_count": 1,
+        "page_count": 2,
+        "gemini_page_count": 1,
+        "selected_page_url": "https://notebook.google.com/",
+        "navigation_result": "existing-gemini-page",
+        "authentication_result": "authenticated",
+    }
+    instance.bind(
+        jobs=lambda _value: None,
+        status=lambda _value: None,
+        log=records.append,
+        error=lambda _operation, _message: None,
+    )
+    instance.login()
+    message = records[0]["message"]
+    assert "pid=4321" in message and "authentication_result=authenticated" in message
+    assert "Cookie" not in message and "token" not in message
 
 
 class RawStore:

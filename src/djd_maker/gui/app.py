@@ -6,7 +6,7 @@ from typing import Any
 
 from PySide6.QtWidgets import QApplication
 
-from djd_maker.adapters.browser import BrowserManager, run_manual_login
+from djd_maker.adapters.browser import BrowserManager
 from djd_maker.adapters.ending import EndingEngineAdapter
 from djd_maker.adapters.hls import HlsAdapter
 from djd_maker.adapters.notebook import (
@@ -60,7 +60,7 @@ def build_desktop(
         scheduler.first_poll_seconds = current.first_notebook_check_seconds
         scheduler.subsequent_poll_seconds = current.notebook_poll_seconds
         validator = VideoValidator()
-        page = browser.start()
+        page = browser.prepare_for_processing()
         notebook = NotebookEngineAdapter(
             NotebookDomAdapter(
                 page,
@@ -95,9 +95,8 @@ def build_desktop(
         pipeline_factory=pipeline_factory,
         cleanup=browser.stop,
         scheduler=scheduler,
-        manual_login=lambda: run_manual_login(
-            root / "browser" / "chrome-profile", "https://notebook.google.com/"
-        ),
+        manual_login=browser.open_login,
+        browser_status_provider=browser.runtime_status,
     )
     bridge = AsyncControllerBridge(service)
     window = MainWindow(

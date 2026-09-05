@@ -22,6 +22,12 @@ class BrowserMustStayLazy:
     def stop(self):
         self.stopped = True
 
+    def open_login(self):
+        raise AssertionError("login must stay lazy while only opening GUI")
+
+    def runtime_status(self):
+        return {}
+
 
 def test_real_composition_opens_gui_before_browser_or_ending_configuration(tmp_path: Path) -> None:
     application = QApplication.instance() or QApplication([])
@@ -30,7 +36,7 @@ def test_real_composition_opens_gui_before_browser_or_ending_configuration(tmp_p
         tmp_path, qt_app=application, browser_manager=browser  # type: ignore[arg-type]
     )
 
-    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.1"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.2"
     assert not browser.started
     assert not window.start_button.isEnabled()
     window.close()

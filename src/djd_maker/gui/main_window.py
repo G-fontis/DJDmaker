@@ -43,7 +43,7 @@ class JobRepositoryPort(Protocol):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン v0.1.1"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン v0.1.2"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態")
@@ -380,7 +380,12 @@ class MainWindow(QMainWindow):
     def _operation_finished(self, operation: str, _result: object) -> None:
         if operation in {"stop", "pause"}:
             self._running = False
-        self.statusBar().showMessage(f"{operation} 完了")
+        if operation == "login":
+            self.statusBar().showMessage(
+                "ログイン後、このChromeは閉じずに［授業動画作成開始］を押してください"
+            )
+        else:
+            self.statusBar().showMessage(f"{operation} 完了")
         self._update_action_state()
         if operation != "reload":
             self.reload_jobs(local_only=True)
