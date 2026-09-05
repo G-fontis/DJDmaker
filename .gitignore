@@ -1,0 +1,91 @@
+# Python
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.test-tmp/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Build / packaging
+build/
+dist/
+*.spec.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets and authentication material
+.env
+.env.*
+!.env.example
+*cookie*
+*Cookie*
+*session*
+*Session*
+*token*
+*Token*
+*credential*
+*Credential*
+*secret*
+*Secret*
+*.pem
+*.key
+
+# Runtime state (DB files are forbidden, but exclude them defensively)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+system/*.json
+system/jobs/**
+!system/.gitkeep
+!system/jobs/.gitkeep
+
+# Browser profiles, diagnostics and logs
+browser/**
+!browser/.gitkeep
+logs/**
+!logs/.gitkeep
+diagnostics/
+screenshots/
+
+# Input may contain private scripts
+input/**
+!input/.gitkeep
+
+# Original and generated media
+raw_files/**
+!raw_files/.gitkeep
+output/**
+!output/.gitkeep
+work/**
+!work/.gitkeep
+*.mp4
+*.m4v
+*.mov
+*.ts
+*.m3u8
+*.zip
+*.part
+*.partial
+*.download
+*.crdownload
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/

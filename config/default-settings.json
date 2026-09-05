@@ -1,0 +1,10 @@
+{
+  "input_directory": "input",
+  "raw_directory": "raw_files",
+  "output_directory": "output",
+  "ending_video": "",
+  "first_notebook_check_seconds": 600,
+  "notebook_poll_seconds": 120,
+  "audio_tail_padding_seconds": 0.5,
+  "ffmpeg_concurrency": 1
+}
