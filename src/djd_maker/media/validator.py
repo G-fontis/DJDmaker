@@ -32,6 +32,8 @@ class VideoMetadata:
     audio_stream_count: int
     width: int | None = None
     height: int | None = None
+    video_codec: str | None = None
+    audio_codec: str | None = None
 
     @property
     def has_video(self) -> bool:
@@ -150,6 +152,10 @@ class VideoValidator:
             audio_stream_count=len(audios),
             width=int(first_video["width"]) if first_video.get("width") else None,
             height=int(first_video["height"]) if first_video.get("height") else None,
+            video_codec=str(first_video.get("codec_name") or "") or None,
+            audio_codec=(
+                str(audios[0].get("codec_name") or "") or None if audios else None
+            ),
         )
 
     def validate(

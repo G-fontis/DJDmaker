@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from djd_maker.adapters.notebook import (
+    ArtifactDeleteSelectors,
     ArtifactDeletionDisabled,
+    ArtifactDeletionRetryableError,
+    DomMismatchError,
     NotebookDomAdapter,
     NotebookEngineAdapter,
     PlaywrightArtifactDownload,
@@ -64,6 +67,11 @@ def complete_gate():
     return DownloadSafetyGate(**{item.name: True for item in fields(DownloadSafetyGate)})
 
 
+class PageMustNotBeUsedForDelete:
+    def __getattr__(self, name):
+        raise AssertionError(f"page must not be used before safety gate: {name}")
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -83,8 +91,21 @@ def test_delete_is_rejected_before_safety_gate():
         adapter.delete_video_artifact("lecture", DownloadSafetyGate())
 
 
+@pytest.mark.parametrize("failed_field", [field.name for field in fields(DownloadSafetyGate)])
+def test_each_of_twelve_safety_checks_blocks_artifact_delete(failed_field):
+    values = {field.name: True for field in fields(DownloadSafetyGate)}
+    values[failed_field] = False
+    page = PageMustNotBeUsedForDelete()
+    with pytest.raises(RemoteDeletionDenied):
+        NotebookDomAdapter(page).delete_video_artifact(
+            "lecture", DownloadSafetyGate(**values)
+        )
+
+
 def test_delete_is_disabled_until_artifact_only_controls_are_verified():
-    adapter = NotebookDomAdapter(Page(Locator(text="ready")))
+    adapter = NotebookDomAdapter(
+        Page(Locator(text="ready")), artifact_delete_selectors=None
+    )
     with pytest.raises(ArtifactDeletionDisabled):
         adapter.delete_video_artifact("lecture", complete_gate())
 
@@ -92,6 +113,207 @@ def test_delete_is_disabled_until_artifact_only_controls_are_verified():
 def test_adapter_exposes_no_notebook_delete_api():
     adapter = NotebookDomAdapter(Page(Locator()))
     assert not hasattr(adapter, "delete_notebook")
+
+
+class DeleteNode:
+    def __init__(self, *, visible=True, text="", on_click=None):
+        self.visible = visible
+        self.text = text
+        self.on_click = on_click
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, _index):
+        return self
+
+    def count(self):
+        return int(self.visible)
+
+    def is_visible(self, **_kwargs):
+        return self.visible
+
+    def inner_text(self):
+        return self.text
+
+    def click(self):
+        if self.on_click:
+            self.on_click()
+
+
+class DeleteCard(DeleteNode):
+    def __init__(self, page, title, *, playable=True):
+        super().__init__(text=title)
+        self.page = page
+        self.title = title
+        self.playable = playable
+
+    def get_by_role(self, role, *, name, exact):
+        assert exact
+        if role == "button" and name in ("再生", "Play"):
+            return DeleteNode(visible=self.visible and self.playable)
+        if role == "button" and name in ("その他", "More"):
+            return DeleteNode(
+                visible=self.visible and name == self.page.more_name,
+                on_click=lambda: self.page.events.append("more"),
+            )
+        return DeleteNode(visible=False)
+
+
+class DeleteCards(DeleteNode):
+    def __init__(self, page, cards):
+        self.page = page
+        self.cards = cards
+
+    @property
+    def first(self):
+        return self.cards[0]
+
+    def nth(self, index):
+        return self.cards[index]
+
+    def count(self):
+        return len(self.cards)
+
+    def filter(self, *, has_text):
+        self.page.events.append(("scope", has_text))
+        return DeleteCards(
+            self.page,
+            [card for card in self.cards if has_text in card.title],
+        )
+
+
+class ArtifactDeletePage:
+    def __init__(
+        self,
+        titles=("lecture",),
+        *,
+        confirmation=None,
+        more_name="その他",
+        delete_name="削除",
+        toast=False,
+    ):
+        self.events = []
+        self.more_name = more_name
+        self.delete_name = delete_name
+        self.confirmation = confirmation
+        self.dialog_visible = False
+        self.toast = toast
+        self.cards = [DeleteCard(self, title) for title in titles]
+
+    def locator(self, selector):
+        assert selector == "artifact-library-item"
+        return DeleteCards(self, self.cards)
+
+    def _remove(self):
+        self.events.append("removed")
+        for card in self.cards:
+            card.visible = False
+
+    def get_by_role(self, role, **_kwargs):
+        if role == "menu":
+            page = self
+
+            class Menu(DeleteNode):
+                def get_by_role(self, item_role, *, name, exact):
+                    assert item_role == "menuitem" and exact
+                    return DeleteNode(
+                        visible=name == page.delete_name,
+                        on_click=page._delete_clicked,
+                    )
+
+            return Menu()
+        if role == "dialog":
+            page = self
+
+            class Dialog(DeleteNode):
+                def count(self): return int(page.dialog_visible)
+                def is_visible(self, **_kwargs): return page.dialog_visible
+                def inner_text(self): return page.confirmation or ""
+                def get_by_role(self, item_role, *, name, exact):
+                    assert item_role == "button" and exact
+                    return DeleteNode(
+                        visible=name == page.delete_name,
+                        on_click=page._remove,
+                    )
+
+            return Dialog()
+        return DeleteNode(visible=False)
+
+    def _delete_clicked(self):
+        self.events.append("delete")
+        if self.confirmation is None:
+            self._remove()
+        else:
+            self.dialog_visible = True
+
+    def get_by_text(self, _marker, *, exact):
+        assert not exact
+        return DeleteNode(visible=self.toast)
+
+    def wait_for_timeout(self, _milliseconds):
+        pass
+
+
+def test_artifact_delete_uses_verified_scoped_sequence_without_dialog():
+    page = ArtifactDeletePage()
+    NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
+    assert page.events == [("scope", "lecture"), "more", "delete", "removed"]
+
+
+def test_artifact_delete_supports_fallback_names_and_optional_confirmation():
+    page = ArtifactDeletePage(
+        confirmation="Delete this video?", more_name="More", delete_name="Delete"
+    )
+    NotebookDomAdapter(page).delete_video_artifact("lecture", complete_gate())
+    assert page.events[-3:] == ["more", "delete", "removed"]
+
+
+def test_artifact_delete_refuses_notebook_confirmation():
+    page = ArtifactDeletePage(confirmation="このノートブックを削除しますか？")
+    diagnostics = []
+    adapter = NotebookDomAdapter(page, diagnostic=diagnostics.append)
+    with pytest.raises(DomMismatchError, match="Notebook"):
+        adapter.delete_video_artifact("lecture", complete_gate())
+    assert "removed" not in page.events
+    assert diagnostics == ["DELETE_ABORTED:notebook_confirmation"]
+
+
+def test_artifact_delete_requires_one_playable_target():
+    page = ArtifactDeletePage(("lecture", "lecture old"))
+    diagnostics = []
+    with pytest.raises(DomMismatchError, match="exactly one playable"):
+        NotebookDomAdapter(page, diagnostic=diagnostics.append).delete_video_artifact(
+            "missing title", complete_gate()
+        )
+    assert "more" not in page.events
+    assert diagnostics == ["DOM_MISMATCH:delete_artifact_not_unique"]
+
+
+def test_artifact_delete_can_confirm_by_explicitly_configured_toast():
+    page = ArtifactDeletePage(toast=False)
+    # Simulate a stale card locator despite a successful server-side action.
+    def server_delete():
+        page.events.append("server-delete")
+        page.toast = True
+    page._remove = server_delete
+    selectors = ArtifactDeleteSelectors(success_toast_markers=("動画を削除しました",))
+    NotebookDomAdapter(
+        page, artifact_delete_selectors=selectors
+    ).delete_video_artifact("lecture", complete_gate())
+    assert "server-delete" in page.events
+
+
+def test_unobserved_delete_result_is_retryable():
+    page = ArtifactDeletePage()
+    page._remove = lambda: page.events.append("server-result-unknown")
+    diagnostics = []
+    with pytest.raises(ArtifactDeletionRetryableError):
+        NotebookDomAdapter(
+            page, timeout_ms=1, diagnostic=diagnostics.append
+        ).delete_video_artifact("lecture", complete_gate())
+    assert diagnostics[-1] == "DELETE_RETRYABLE:success_not_observed"
 
 
 def test_playwright_download_validates_before_atomic_publish(tmp_path):

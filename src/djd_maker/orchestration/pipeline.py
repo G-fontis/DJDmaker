@@ -28,6 +28,14 @@ class ValidatorPort(Protocol):
     def validate(self, path: Path) -> Any: ...
 
 
+class PollSchedulerPort(Protocol):
+    def schedule_generation(self, job: Job, *, force: bool = False) -> Job: ...
+
+    def ensure_scheduled(self, job: Job) -> Job: ...
+
+    def poll_due(self, poll: Any) -> list[str]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class PipelinePaths:
     raw_directory: Path
@@ -64,6 +72,7 @@ class PipelineCoordinator:
         validator: ValidatorPort,
         paths: PipelinePaths,
         ffmpeg_concurrency: int = 1,
+        scheduler: PollSchedulerPort | None = None,
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
@@ -77,6 +86,7 @@ class PipelineCoordinator:
         self.validator = validator
         self.paths = paths
         self.ffmpeg_concurrency = ffmpeg_concurrency
+        self.scheduler = scheduler
 
     def _save(self, job: Job) -> None:
         self.jobs.save(job)
@@ -89,8 +99,13 @@ class PipelineCoordinator:
         # Browser automation remains serialized. Waiting in this lane never
         # prevents already downloaded jobs from entering the media pool below.
         for job in self.jobs.list():
-            if job.state in self.NOTEBOOK_STATES:
+            if job.state in self.NOTEBOOK_STATES and not (
+                self.scheduler is not None and job.state is JobState.WAITING_VIDEO
+            ):
                 self._run_notebook_job(job)
+
+        if self.scheduler is not None:
+            self.scheduler.poll_due(self._run_notebook_job)
 
         media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
         with ThreadPoolExecutor(
@@ -120,6 +135,8 @@ class PipelineCoordinator:
                 job.notebook_id = notebook_id
                 job.notebook_url = notebook_url
                 self._transition(job, JobState.GENERATING)
+                if self.scheduler is not None:
+                    self.scheduler.schedule_generation(job)
 
             if job.state is JobState.UPLOADING:
                 # A crash without persisted remote identity cannot safely retry:
@@ -133,6 +150,9 @@ class PipelineCoordinator:
                 if not job.notebook_id or not job.notebook_url:
                     raise RuntimeError("Notebook resume metadata is missing")
                 self._transition(job, JobState.WAITING_VIDEO)
+                if self.scheduler is not None:
+                    self.scheduler.ensure_scheduled(job)
+                    return
 
             if job.state is JobState.WAITING_VIDEO:
                 status = self.notebook.inspect_status(job)
@@ -161,6 +181,12 @@ class PipelineCoordinator:
                 if gate is None:
                     raise RuntimeError("RAW store did not return a deletion safety gate")
                 job.raw_path = str(getattr(media, "path", raw_path))
+                job.raw_size_bytes = getattr(media, "size_bytes", None)
+                job.duration_seconds = getattr(media, "duration_seconds", None)
+                raw_validation = getattr(stored, "raw_validation", None)
+                metadata = getattr(raw_validation, "metadata", None)
+                job.video_codec = getattr(metadata, "video_codec", None)
+                job.audio_codec = getattr(metadata, "audio_codec", None)
                 job.safety_gate = gate
                 self._transition(job, JobState.RAW_READY)
                 try:
@@ -206,8 +232,14 @@ class PipelineCoordinator:
                         raw, self.paths.ending_video, edited, padding_seconds=0.5
                     )
                     job.edited_path = str(result.path)
+                    job.last_audio_position_seconds = getattr(
+                        result, "last_audio_end_seconds", None
+                    )
+                    job.cut_position_seconds = getattr(result, "cut_at_seconds", None)
+                    job.ending_result = "PASS"
                 else:
                     job.edited_path = str(edited)
+                    job.ending_result = "PASS (checkpoint)"
                 self._transition(job, JobState.HLS_ENCODING)
 
             if job.state in {JobState.HLS_ENCODING, JobState.ZIPPING}:
@@ -222,6 +254,7 @@ class PipelineCoordinator:
                         Path(job.edited_path or edited), output_zip
                     )
                     job.zip_path = str(result.zip_path)
+                job.hls_result = "PASS"
                 self._transition(job, JobState.COMPLETED)
         except Exception as exc:
             job.error_code = "MEDIA_STAGE_FAILED"

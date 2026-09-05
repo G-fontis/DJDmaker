@@ -12,6 +12,8 @@ class MediaResult:
     path: Path
     duration_seconds: float
     size_bytes: int
+    last_audio_end_seconds: float | None = None
+    cut_at_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

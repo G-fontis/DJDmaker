@@ -1,4 +1,5 @@
 from dataclasses import dataclass, fields
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
@@ -6,6 +7,7 @@ from zipfile import ZIP_STORED, ZipFile
 from djd_maker.core.interfaces import HlsResult, MediaResult
 from djd_maker.core.models import DownloadSafetyGate, Job, JobState
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
+from djd_maker.orchestration.scheduler import PersistentPollScheduler
 from djd_maker.testing.fake_notebook import FakeNotebookAdapter
 
 
@@ -101,6 +103,54 @@ def coordinator(tmp_path, jobs, notebook, ending=None):
         ),
         ffmpeg_concurrency=2,
     )
+
+
+class SchedulerClock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 9, 6, tzinfo=UTC)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+class InspectTrackingNotebook(FakeNotebookAdapter):
+    def __init__(self, fixture_by_source):
+        super().__init__(fixture_by_source)
+        self.inspect_calls = []
+
+    def inspect_status(self, job):
+        self.inspect_calls.append(job.id)
+        return super().inspect_status(job)
+
+
+def test_pipeline_uses_persisted_scheduler_deadline(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    job = Job("scheduled.txt")
+    jobs = MemoryJobs(job)
+    clock = SchedulerClock()
+    scheduler = PersistentPollScheduler(jobs, clock=clock)
+    notebook = InspectTrackingNotebook({job.source_path: fixture})
+    instance = coordinator(tmp_path, jobs, notebook)
+    instance.scheduler = scheduler
+
+    instance.run_cycle()
+    waiting = jobs.get(job.id)
+    assert waiting.state is JobState.WAITING_VIDEO
+    assert waiting.generation_started_at == "2026-09-06T00:00:00+00:00"
+    assert scheduler.remaining_seconds(waiting) == 600
+    assert notebook.inspect_calls == []
+
+    clock.advance(599)
+    instance.run_cycle()
+    assert notebook.inspect_calls == []
+    clock.advance(1)
+    instance.run_cycle()
+    assert notebook.inspect_calls == [job.id]
+    assert jobs.get(job.id).state is JobState.COMPLETED
 
 
 def test_fake_notebook_pipeline_completes_headlessly(tmp_path):

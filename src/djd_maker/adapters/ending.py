@@ -167,6 +167,8 @@ class EndingEngineAdapter:
                 path=output_path,
                 duration_seconds=published.metadata.duration_seconds,
                 size_bytes=published.size_bytes,
+                last_audio_end_seconds=last_audio_end,
+                cut_at_seconds=cut,
             )
         finally:
             staging.unlink(missing_ok=True)

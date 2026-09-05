@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## 現在の開発段階
 
-Unit 1（GUI非依存の実処理コア）まで実装済みです。JSON永続化、動画検証、RAW安全保存、Ending、HLS/ZIP、Notebook adapter骨格、並列lane pipeline、Fake Notebookによるheadless E2Eを含みます。実NotebookLMの動画artifact削除は、専用DOMを実画面確認するまでfail-closedで無効です。
+Unit 2まで実装済みです。PySide6 GUI、永続Notebook scheduler、非同期Pipeline接続、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除adapter、Fake Notebook GUI E2Eを含みます。動画artifact削除はGNB_Creatorの保存済みlive DOMを根拠に移植済みですが、現行Gemini Notebookでの再確認はブラウザセッション未接続のためpendingです。DOM不一致やNotebook削除dialogを検出した場合はfail-closedで停止します。
 
 このリポジトリではDBを使用しません。設定、キュー、状態、ジョブはアプリ配置フォルダ内のJSONへ原子的に保存する設計です。生成動画、ブラウザプロファイル、Cookie、ログ、秘密情報はGit管理対象外です。
 
@@ -24,6 +24,14 @@ py -m venv .venv
 py -m pip install -e ".[dev]"
 py -m pytest
 ```
+
+GUI起動:
+
+```powershell
+.\.venv\Scripts\djd-maker.exe
+```
+
+初回は設定画面でEnding動画を指定してください。Gemini Notebookへのログインが必要な場合は、アプリが開く専用Chrome profile上で人間が操作します。CAPTCHAや認証を自動回避しません。
 
 ## ディレクトリ
 
@@ -51,6 +59,8 @@ docs/        調査・設計資料
 - [テスト戦略](docs/test-strategy.md)
 - [次Unitの推奨分割](docs/unit1-plan.md)
 - [Unit 1実装記録](docs/unit1-implementation.md)
+- [Unit 2実装記録](docs/unit2-implementation.md)
+- [Unit 2エンジン忠実性補正](docs/unit2-engine-fidelity-patch.md)
 
 ## 安全原則
 

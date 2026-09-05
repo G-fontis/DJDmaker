@@ -18,7 +18,11 @@ class NotebookAdapterError(RuntimeError):
     pass
 
 
-class DomMismatchError(NotebookAdapterError):
+class ArtifactDeletionRetryableError(NotebookAdapterError):
+    """Deletion was not confirmed; the job may safely be retried later."""
+
+
+class DomMismatchError(ArtifactDeletionRetryableError):
     pass
 
 
@@ -44,12 +48,22 @@ class ResumeMetadata:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactDeleteSelectors:
-    """実画面で動画artifact専用と確認できたselectorだけを設定する。"""
+    """Artifact-only controls ordered from verified names to fallbacks.
 
-    more_button_name: str
-    delete_menu_name: str
-    confirmation_dialog_name: str
-    confirm_button_name: str
+    Japanese ``その他`` and the artifact menu's ``削除`` were captured on the
+    live NotebookLM UI on 2026-09-05 in GNBCreator's STATE_10_VIDEO_MENU.
+    No artifact-delete confirmation dialog was captured, so dialogs are treated
+    as optional and are rejected if they mention deletion of a Notebook.
+    """
+
+    more_button_names: tuple[str, ...] = ("その他", "More")
+    delete_menu_names: tuple[str, ...] = ("削除", "Delete")
+    confirm_button_names: tuple[str, ...] = ("削除", "Delete")
+    success_toast_markers: tuple[str, ...] = ()
+
+
+VERIFIED_ARTIFACT_DELETE_SELECTORS = ArtifactDeleteSelectors()
+_USE_VERIFIED_DELETE_SELECTORS = object()
 
 
 class DownloadHandoff(Protocol):
@@ -153,13 +167,17 @@ class NotebookDomAdapter:
         page: Any,
         *,
         download_handoff: DownloadHandoff | None = None,
-        artifact_delete_selectors: ArtifactDeleteSelectors | None = None,
+        artifact_delete_selectors: ArtifactDeleteSelectors | None | object = _USE_VERIFIED_DELETE_SELECTORS,
         timeout_ms: int = 30_000,
         diagnostic: Callable[[str], None] | None = None,
     ) -> None:
         self.page = page
         self.download_handoff = download_handoff
-        self.artifact_delete_selectors = artifact_delete_selectors
+        self.artifact_delete_selectors = (
+            VERIFIED_ARTIFACT_DELETE_SELECTORS
+            if artifact_delete_selectors is _USE_VERIFIED_DELETE_SELECTORS
+            else artifact_delete_selectors
+        )
         self.timeout_ms = timeout_ms
         self.diagnostic = diagnostic or (lambda _reason: None)
 
@@ -277,33 +295,145 @@ class NotebookDomAdapter:
             raise DomMismatchError("download対象動画artifactを一意に特定できません")
         return self.download_handoff(self.page, cards.first, destination)
 
+    @staticmethod
+    def _visible(locator: Any, timeout: int = 300) -> bool:
+        try:
+            return bool(locator.count()) and locator.first.is_visible(timeout=timeout)
+        except Exception:
+            return False
+
+    def _first_role(self, root: Any, role: str, names: tuple[str, ...]) -> Any:
+        for name in names:
+            try:
+                locator = root.get_by_role(role, name=name, exact=True)
+                if self._visible(locator):
+                    return locator.first
+            except Exception:
+                continue
+        raise DomMismatchError(
+            f"visible {role} was not found for candidates: {', '.join(names)}"
+        )
+
+    def _playable_artifact(self, artifact_title: str) -> Any:
+        cards = self.page.locator("artifact-library-item")
+        try:
+            matching = cards.filter(has_text=artifact_title)
+            if matching.count() == 1:
+                candidate = matching.first
+                if any(
+                    self._visible(candidate.get_by_role("button", name=name, exact=True))
+                    for name in ("再生", "Play")
+                ):
+                    return candidate
+            playable = []
+            for index in range(cards.count()):
+                card = cards.nth(index)
+                if any(
+                    self._visible(card.get_by_role("button", name=name, exact=True))
+                    for name in ("再生", "Play")
+                ):
+                    playable.append(card)
+            if len(playable) == 1:
+                return playable[0]
+        except Exception as exc:
+            self.diagnostic("DOM_MISMATCH:artifact_scope_inspection")
+            raise DomMismatchError("video artifact scope could not be inspected") from exc
+        self.diagnostic("DOM_MISMATCH:delete_artifact_not_unique")
+        raise DomMismatchError("delete target is not exactly one playable video artifact")
+
+    def _visible_dialog(self) -> Any | None:
+        try:
+            dialogs = self.page.get_by_role("dialog")
+            visible = [
+                dialogs.nth(index)
+                for index in range(dialogs.count())
+                if self._visible(dialogs.nth(index))
+            ]
+        except Exception:
+            return None
+        if len(visible) > 1:
+            raise DomMismatchError("multiple confirmation dialogs are visible")
+        return visible[0] if visible else None
+
+    def _success_toast_visible(self, selectors: ArtifactDeleteSelectors) -> bool:
+        for marker in selectors.success_toast_markers:
+            try:
+                if self._visible(self.page.get_by_text(marker, exact=False)):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def delete_video_artifact(
         self, artifact_title: str, gate: DownloadSafetyGate
     ) -> None:
         require_remote_deletion_gate(gate)
         selectors = self.artifact_delete_selectors
-        if selectors is None:
+        if not isinstance(selectors, ArtifactDeleteSelectors):
             raise ArtifactDeletionDisabled(
-                "動画artifact専用削除selectorが実画面で未確認のため削除しません"
+                "artifact-only deletion controls are explicitly disabled"
             )
-        cards = self.page.locator("artifact-library-item").filter(has_text=artifact_title)
-        if cards.count() != 1:
-            raise DomMismatchError("削除対象動画artifactを一意に特定できません")
-        card = cards.first
-        card.get_by_role(
-            "button", name=selectors.more_button_name, exact=True
-        ).click()
-        self.page.get_by_role(
-            "menuitem", name=selectors.delete_menu_name, exact=True
-        ).click()
-        dialog = self.page.get_by_role(
-            "dialog", name=selectors.confirmation_dialog_name, exact=True
+        card = self._playable_artifact(artifact_title)
+        try:
+            toast_was_visible = self._success_toast_visible(selectors)
+            self._first_role(card, "button", selectors.more_button_names).click()
+            menus = self.page.get_by_role("menu")
+            if menus.count() != 1 or not self._visible(menus.first):
+                raise DomMismatchError("exactly one artifact action menu is required")
+            self._first_role(
+                menus.first, "menuitem", selectors.delete_menu_names
+            ).click()
+
+            # Evidence proves the artifact menu item, but not whether the
+            # current UI always asks for confirmation. Briefly observe both
+            # variants; a late dialog remains fail-closed instead of being
+            # clicked through speculatively.
+            dialog = None
+            probe_deadline = time.monotonic() + min(
+                1.0, self.timeout_ms / 1000
+            )
+            while time.monotonic() < probe_deadline:
+                if not self._visible(card):
+                    return
+                if (
+                    not toast_was_visible
+                    and self._success_toast_visible(selectors)
+                ):
+                    return
+                dialog = self._visible_dialog()
+                if dialog is not None:
+                    break
+                self.page.wait_for_timeout(50)
+            if dialog is not None:
+                text = " ".join(dialog.inner_text().split()).casefold()
+                if "notebook" in text or "ノートブック" in text:
+                    self.diagnostic("DELETE_ABORTED:notebook_confirmation")
+                    raise DomMismatchError(
+                        "refusing a dialog that could delete the Notebook"
+                    )
+                self._first_role(
+                    dialog, "button", selectors.confirm_button_names
+                ).click()
+
+            deadline = time.monotonic() + self.timeout_ms / 1000
+            while time.monotonic() < deadline:
+                new_success_toast = (
+                    not toast_was_visible and self._success_toast_visible(selectors)
+                )
+                if not self._visible(card) or new_success_toast:
+                    return
+                self.page.wait_for_timeout(100)
+        except (DomMismatchError, ArtifactDeletionRetryableError):
+            raise
+        except Exception as exc:
+            self.diagnostic(f"DELETE_RETRYABLE:{type(exc).__name__}")
+            raise ArtifactDeletionRetryableError(
+                "artifact deletion interaction failed and may be retried"
+            ) from exc
+        self.diagnostic("DELETE_RETRYABLE:success_not_observed")
+        raise ArtifactDeletionRetryableError(
+            "artifact deletion was not confirmed by card disappearance or configured toast"
         )
-        dialog.wait_for(state="visible", timeout=self.timeout_ms)
-        dialog.get_by_role(
-            "button", name=selectors.confirm_button_name, exact=True
-        ).click()
-        cards.wait_for(state="detached", timeout=self.timeout_ms)
 
 
 class NotebookEngineAdapter:
