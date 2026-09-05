@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 
-EXPECTED_TITLE = "台本から授業動画つくるマシーン v0.1"
+EXPECTED_TITLE = "台本から授業動画つくるマシーン v0.1.1"
 
 
 def _wait_for_window(process_id: int, timeout: float = 20) -> tuple[int, str]:

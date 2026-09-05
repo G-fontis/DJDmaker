@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 
-def _settings_smoke(mode: str, report_path: Path) -> int:
+def _settings_smoke(mode: str, report_path: Path, expected_value: int = 137) -> int:
     """Exercise packaged JSON persistence only when the build verifier opts in."""
     if os.environ.get("DJD_PACKAGING_SMOKE") != "1":
         return 3
@@ -16,15 +16,18 @@ def _settings_smoke(mode: str, report_path: Path) -> int:
 
     repository = SettingsRepository(application_root() / "system" / "settings.json")
     if mode == "write":
-        saved = replace(repository.load(), notebook_poll_seconds=137)
+        saved = replace(repository.load(), notebook_poll_seconds=expected_value)
         repository.save(saved)
-        passed = repository.load().notebook_poll_seconds == 137
+        passed = repository.load().notebook_poll_seconds == expected_value
     elif mode == "read":
-        passed = repository.load().notebook_poll_seconds == 137
+        passed = repository.load().notebook_poll_seconds == expected_value
     else:
         return 4
     report_path.write_text(
-        json.dumps({"mode": mode, "passed": passed}, ensure_ascii=False),
+        json.dumps(
+            {"mode": mode, "passed": passed, "expected_value": expected_value},
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     return 0 if passed else 5
@@ -54,8 +57,9 @@ def _browser_smoke(report_path: Path) -> int:
 
 
 def _dispatch() -> int:
-    if len(sys.argv) == 4 and sys.argv[1] == "--packaging-settings-smoke":
-        return _settings_smoke(sys.argv[2], Path(sys.argv[3]))
+    if len(sys.argv) in {4, 5} and sys.argv[1] == "--packaging-settings-smoke":
+        expected_value = int(sys.argv[4]) if len(sys.argv) == 5 else 137
+        return _settings_smoke(sys.argv[2], Path(sys.argv[3]), expected_value)
     if len(sys.argv) == 3 and sys.argv[1] == "--packaging-fake-e2e":
         if os.environ.get("DJD_PACKAGING_SMOKE") != "1":
             return 3

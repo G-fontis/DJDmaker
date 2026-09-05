@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from djd_maker.core.models import Job, JobState
 from djd_maker.core.settings import AppSettings
+from djd_maker.core.repositories import SettingsRepository, SettingsSaveError
 from djd_maker.gui.controller import AsyncControllerBridge
 from djd_maker.gui.dialogs import JobDetailDialog, LogDialog
 from djd_maker.gui.main_window import MainWindow
@@ -115,7 +116,7 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.1"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
@@ -213,4 +214,61 @@ def test_settings_are_bound_to_resolved_unicode_paths(tmp_path: Path) -> None:
     assert window.output_path_edit.text() == str((tmp_path / "出力").resolve())
     assert window.ending_path_edit.text().endswith("エンディング.mp4")
     assert settings.saved == []
+    window.close()
+
+
+def test_gui_rapid_ending_changes_save_without_error(tmp_path: Path, monkeypatch) -> None:
+    window, _settings, _controller, _bridge = _window(tmp_path, [])
+    repository = SettingsRepository(tmp_path / "system" / "settings.json")
+    repository.save(window.settings)
+    window.settings_repository = repository
+    endings = []
+    for index in range(20):
+        ending = tmp_path / f"Ending {index}.mp4"
+        ending.write_bytes(b"video")
+        endings.append(ending)
+    selected = iter(endings)
+    monkeypatch.setattr(
+        "djd_maker.gui.main_window.QFileDialog.getOpenFileName",
+        lambda *_args, **_kwargs: (str(next(selected)), ""),
+    )
+    critical: list[str] = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: critical.append(str(args[2])))
+
+    for _ in endings:
+        window.change_ending()
+
+    assert critical == []
+    assert repository.load().ending_video == str(endings[-1])
+    window.close()
+
+
+def test_gui_reports_only_final_settings_failure_as_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    window, _settings, _controller, _bridge = _window(tmp_path, [])
+    ending = tmp_path / "Ending.mp4"
+    ending.write_bytes(b"video")
+
+    class FailingSettings:
+        def save(self, _settings):
+            raise SettingsSaveError(
+                "設定をsettings.jsonへ保存できませんでした。既存の設定ファイルは"
+                "破損していません。ほかの同期処理が終わってから再試行してください。"
+            )
+
+    window.settings_repository = FailingSettings()
+    monkeypatch.setattr(
+        "djd_maker.gui.main_window.QFileDialog.getOpenFileName",
+        lambda *_args, **_kwargs: (str(ending), ""),
+    )
+    critical: list[str] = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: critical.append(str(args[2])))
+
+    window.change_ending()
+
+    assert len(critical) == 1
+    assert "settings.json" in critical[0]
+    assert "破損していません" in critical[0]
+    assert "再試行" in critical[0]
     window.close()

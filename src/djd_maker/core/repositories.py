@@ -34,6 +34,10 @@ class RepositoryLockTimeout(RepositoryError):
     """Another process kept a repository document locked for too long."""
 
 
+class SettingsSaveError(RepositoryError):
+    """Settings publish failed after bounded transient retries."""
+
+
 _thread_locks_guard = threading.Lock()
 _thread_locks: dict[str, threading.RLock] = {}
 
@@ -92,10 +96,33 @@ def _document_lock(
 class _VersionedDocument:
     """Atomic, recoverable storage for one versioned JSON document."""
 
-    def __init__(self, path: str | Path, kind: str) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        kind: str,
+        *,
+        use_file_lock: bool = True,
+        replace_retry_delays: tuple[float, ...] = (),
+    ) -> None:
         self.path = Path(path)
         self.kind = kind
         self.backup_path = self.path.with_suffix(self.path.suffix + ".bak")
+        self.use_file_lock = use_file_lock
+        self.replace_retry_delays = replace_retry_delays
+
+    @contextmanager
+    def _operation_lock(self) -> Iterator[None]:
+        if self.use_file_lock:
+            with _document_lock(self.path):
+                yield
+            return
+        # Settings are application-local state. Serialize every repository
+        # instance in this process by resolved path, without a filesystem lock.
+        with _thread_lock(self.path):
+            yield
+
+    def _store(self, path: Path) -> JsonStore:
+        return JsonStore(path, replace_retry_delays=self.replace_retry_delays)
 
     def _validate(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -121,7 +148,7 @@ class _VersionedDocument:
             quarantine = path.with_name(
                 f"{path.name}.corrupt-{time.time_ns()}-{uuid4().hex[:8]}"
             )
-            os.replace(path, quarantine)
+            self._store(path)._replace(path, quarantine)
 
     def _temporary_candidates(self) -> list[Path]:
         return sorted(
@@ -129,6 +156,19 @@ class _VersionedDocument:
             key=lambda candidate: candidate.stat().st_mtime_ns,
             reverse=True,
         )
+
+    def _cleanup_temporaries(self) -> None:
+        candidates = [
+            *self._temporary_candidates(),
+            *self.backup_path.parent.glob(f".{self.backup_path.name}.*.tmp"),
+        ]
+        for temporary in candidates:
+            try:
+                temporary.unlink(missing_ok=True)
+            except PermissionError:
+                # A sync/index process may still observe a stale temporary.
+                # It is not an active lock and must not fail settings I/O.
+                pass
 
     def _load_locked(self, default: dict[str, Any] | None) -> dict[str, Any]:
         primary_error: Exception | None = None
@@ -154,9 +194,8 @@ class _VersionedDocument:
                 continue
             if self.path.exists():
                 self._quarantine(self.path)
-            JsonStore(self.path).save(recovered)
-            for temporary in self._temporary_candidates():
-                temporary.unlink(missing_ok=True)
+            self._store(self.path).save(recovered)
+            self._cleanup_temporaries()
             return recovered
 
         if primary_error is not None:
@@ -168,23 +207,24 @@ class _VersionedDocument:
         return default
 
     def load(self, default: dict[str, Any] | None = None) -> dict[str, Any]:
-        with _document_lock(self.path):
+        with self._operation_lock():
             return self._load_locked(default)
 
     def save(self, value: Mapping[str, Any]) -> None:
         document = self._validate(dict(value))
-        with _document_lock(self.path):
+        with self._operation_lock():
             if self.path.exists():
                 try:
                     previous = self._validate(self._read(self.path))
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError, RepositoryError):
                     previous = None
                 if previous is not None:
-                    JsonStore(self.backup_path).save(previous)
-            JsonStore(self.path).save(document)
+                    self._store(self.backup_path).save(previous)
+            self._store(self.path).save(document)
+            self._cleanup_temporaries()
 
     def update(self, default: dict[str, Any], change) -> dict[str, Any]:
-        with _document_lock(self.path):
+        with self._operation_lock():
             current = self._load_locked(default)
             updated = change(current)
             document = self._validate(updated)
@@ -194,14 +234,22 @@ class _VersionedDocument:
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError, RepositoryError):
                     previous = None
                 if previous is not None:
-                    JsonStore(self.backup_path).save(previous)
-            JsonStore(self.path).save(document)
+                    self._store(self.backup_path).save(previous)
+            self._store(self.path).save(document)
+            self._cleanup_temporaries()
             return document
 
 
 class SettingsRepository:
+    REPLACE_RETRY_DELAYS = (0.1, 0.2, 0.4, 0.8)
+
     def __init__(self, path: str | Path) -> None:
-        self._document = _VersionedDocument(path, "settings")
+        self._document = _VersionedDocument(
+            path,
+            "settings",
+            use_file_lock=False,
+            replace_retry_delays=self.REPLACE_RETRY_DELAYS,
+        )
 
     @staticmethod
     def _default() -> dict[str, Any]:
@@ -222,13 +270,19 @@ class SettingsRepository:
 
     def save(self, settings: AppSettings) -> None:
         settings.validate()
-        self._document.save(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "kind": "settings",
-                "settings": settings.to_dict(),
-            }
-        )
+        try:
+            self._document.save(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "kind": "settings",
+                    "settings": settings.to_dict(),
+                }
+            )
+        except PermissionError as error:
+            raise SettingsSaveError(
+                "設定をsettings.jsonへ保存できませんでした。既存の設定ファイルは"
+                "破損していません。ほかの同期処理が終わってから再試行してください。"
+            ) from error
 
 
 class JobRepository:
