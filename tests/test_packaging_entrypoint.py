@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import importlib.util
 from pathlib import Path
+import sys
 
 
 ENTRYPOINT_PATH = Path(__file__).resolve().parents[1] / "packaging" / "entrypoint.py"
@@ -47,3 +48,24 @@ def test_preset_smoke_starts_unselected_after_repository_restart(
         "selected_preset": None,
         "selection_reset_on_restart": True,
     }
+
+
+def test_hud_smoke_dispatch_is_gated_and_uses_two_paths(tmp_path, monkeypatch) -> None:
+    output = tmp_path / "screens"
+    report = tmp_path / "report.json"
+    monkeypatch.delenv("DJD_PACKAGING_SMOKE", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["DJDmaker.exe", "--packaging-hud-smoke", str(output), str(report)],
+    )
+    assert ENTRYPOINT._dispatch() == 3
+    assert not output.exists()
+    assert not report.exists()
+
+
+def test_auth_browser_smoke_is_gated(tmp_path, monkeypatch) -> None:
+    report = tmp_path / "auth.json"
+    monkeypatch.delenv("DJD_PACKAGING_SMOKE", raising=False)
+    assert ENTRYPOINT._auth_browser_smoke(report) == 3
+    assert not report.exists()
