@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from uuid import uuid4
 
 from djd_maker.core.interfaces import require_remote_deletion_gate
 from djd_maker.core.models import DownloadSafetyGate, Job, preset_body_sha256
+from djd_maker.adapters.credit import CreditDetector, CreditSnapshot, CreditState
 from djd_maker.media.validator import VideoValidator
 
 
@@ -43,6 +45,14 @@ class ArtifactDeletionDisabled(NotebookAdapterError):
     pass
 
 
+class ReservationUnavailableError(NotebookAdapterError):
+    """Credit is exhausted but NotebookLM exposes no verified schedule action."""
+
+
+class ReservationFailedError(NotebookAdapterError):
+    """A schedule action was requested but its waiting state was not observed."""
+
+
 class RemoteVideoStatus(StrEnum):
     NOT_STARTED = "NOT_STARTED"
     GENERATING = "GENERATING"
@@ -57,6 +67,47 @@ class ResumeMetadata:
     notebook_id: str
     notebook_url: str
     artifact_title: str
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationOutcome:
+    remote_status: RemoteVideoStatus
+    reserved: bool
+    credit: CreditSnapshot
+    reservation_created_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NotebookSubmissionResult:
+    """Structured result with two-value tuple compatibility for older callers."""
+
+    notebook_id: str
+    notebook_url: str
+    generation: GenerationOutcome
+
+    @property
+    def reserved(self) -> bool:
+        return self.generation.reserved
+
+    @property
+    def credit(self) -> CreditSnapshot:
+        return self.generation.credit
+
+    @property
+    def reservation_created_at(self) -> str | None:
+        value = self.generation.reservation_created_at
+        return value.isoformat() if value else None
+
+    @property
+    def remote_status(self) -> RemoteVideoStatus:
+        return self.generation.remote_status
+
+    def __iter__(self):
+        yield self.notebook_id
+        yield self.notebook_url
+
+    def __getitem__(self, index: int) -> str:
+        return (self.notebook_id, self.notebook_url)[index]
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +327,17 @@ VIDEO_GENERATE = (
     ("role", "button", "生成"),
     ("role", "button", "Generate"),
 )
+VIDEO_SCHEDULE = tuple(
+    ("role", "button", label)
+    for label in (
+        "予約して生成",
+        "後で生成",
+        "スケジュール設定",
+        "Schedule",
+        "Generate later",
+        "Schedule generation",
+    )
+)
 CHAT_INPUT = (
     ("role", "textbox", "クエリボックス"),
     ("label", "", "クエリボックス"),
@@ -329,6 +391,8 @@ class NotebookDomAdapter:
         artifact_delete_selectors: ArtifactDeleteSelectors | None | object = _USE_VERIFIED_DELETE_SELECTORS,
         timeout_ms: int = 30_000,
         diagnostic: Callable[[str], None] | None = None,
+        credit_detector: Any | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.page = page
         self.download_handoff = download_handoff
@@ -339,6 +403,15 @@ class NotebookDomAdapter:
         )
         self.timeout_ms = timeout_ms
         self.diagnostic = diagnostic or (lambda _reason: None)
+        self.clock = clock or (lambda: datetime.now().astimezone())
+        self._injected_credit_detector = credit_detector
+        self._generation_prompt_for_fallback: str | None = None
+
+    def inspect_credit(self) -> CreditSnapshot:
+        detector = self._injected_credit_detector or CreditDetector(
+            self.page, clock=self.clock
+        )
+        return detector.detect()
 
     def _locator(self, kind: str, role: str, value: str) -> Any:
         if kind == "role":
@@ -634,10 +707,13 @@ class NotebookDomAdapter:
         self.diagnostic("SOURCE_READY_TIMEOUT:300s")
         raise SourceReadyTimeoutError("TXT sourceの解析が5分以内に完了しませんでした")
 
-    def start_video_generation(self, prompt: str) -> None:
+    def start_video_generation(self, prompt: str) -> GenerationOutcome | None:
         """Legacy diagnostic path; production submission uses chat instead."""
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
+        credit = self.inspect_credit()
+        if credit.state is CreditState.EXHAUSTED:
+            return self.request_scheduled_video_generation(prompt, credit)
         self._first_visible(VIDEO_CREATE, "Video Overview作成").click()
         topic = self._first_visible(
             VIDEO_CUSTOM_TOPIC, "動画解説のカスタムトピック欄"
@@ -664,6 +740,56 @@ class NotebookDomAdapter:
                 "PRESET_APPLY_MISMATCH: preset snapshot and DOM readback differ"
             )
         self._first_visible(VIDEO_GENERATE, "動画生成ボタン").click()
+
+    def request_scheduled_video_generation(
+        self,
+        prompt: str,
+        credit: CreditSnapshot,
+        *,
+        timeout_ms: int = 120_000,
+    ) -> GenerationOutcome:
+        """Use only a verified schedule action and require its remote status."""
+        if credit.state is not CreditState.EXHAUSTED:
+            raise ReservationFailedError(
+                "明示的なクレジット枯渇根拠なしでは予約生成しません"
+            )
+        if self.page.locator("artifact-library-item").count():
+            raise ReservationFailedError(
+                "予約操作前に動画artifactが存在するため重複生成を停止しました"
+            )
+        self._first_visible(VIDEO_CREATE, "Video Overview作成").click()
+        topic = self._first_visible(
+            VIDEO_CUSTOM_TOPIC, "動画解説のカスタムトピック欄"
+        )
+        topic.fill(prompt)
+        if self._input_text(topic) != prompt:
+            raise PresetApplyMismatchError(
+                "PRESET_APPLY_MISMATCH: scheduled preset and DOM readback differ"
+            )
+        try:
+            schedule = self._first_enabled_visible(
+                VIDEO_SCHEDULE, "クレジット不足時の予約生成ボタン"
+            )
+        except DomMismatchError as exc:
+            raise ReservationUnavailableError(
+                "クレジット不足を検出しましたが予約生成UIを確認できません"
+            ) from exc
+        created_at = self.clock()
+        schedule.click()
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            status = self.inspect_status()
+            if status is RemoteVideoStatus.WAITING:
+                self.diagnostic("CREDIT_RESERVATION_CONFIRMED:SCHEDULED_REMOTE")
+                return GenerationOutcome(status, True, credit, created_at)
+            if status is RemoteVideoStatus.FAILED:
+                raise ReservationFailedError(
+                    "NotebookLMが予約生成の失敗を表示しました"
+                )
+            self.page.wait_for_timeout(2_000)
+        raise ReservationFailedError(
+            "予約生成操作後にSCHEDULED_REMOTEを確認できませんでした"
+        )
 
     @staticmethod
     def _input_text(control: Any) -> str:
@@ -743,7 +869,7 @@ class NotebookDomAdapter:
         self,
         *,
         timeout_ms: int = 120_000,
-    ) -> None:
+    ) -> GenerationOutcome:
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
             status = self.inspect_status()
@@ -752,6 +878,14 @@ class NotebookDomAdapter:
                 RemoteVideoStatus.WAITING,
                 RemoteVideoStatus.READY,
             }:
+                credit = self.inspect_credit()
+                if (
+                    status is RemoteVideoStatus.WAITING
+                    and credit.state is not CreditState.EXHAUSTED
+                ):
+                    raise ReservationFailedError(
+                        "クレジット不足の明示表示なしで予約状態を検出しました"
+                    )
                 card = self.page.locator("artifact-library-item").first
                 text = ""
                 try:
@@ -763,13 +897,27 @@ class NotebookDomAdapter:
                         "SHORT_DEFAULT_USED: Notebookが短め動画として生成を開始しました"
                     )
                 self.diagnostic(f"NOTEBOOK_AUTO_GENERATION_STARTED:{status.value}")
-                return
+                return GenerationOutcome(
+                    status,
+                    status is RemoteVideoStatus.WAITING
+                    and credit.state is CreditState.EXHAUSTED,
+                    credit,
+                    self.clock() if status is RemoteVideoStatus.WAITING else None,
+                )
             if status is RemoteVideoStatus.FAILED:
                 raise NotebookAdapterError("Notebookの自動動画生成開始に失敗しました")
+            credit = self.inspect_credit()
+            if credit.state is CreditState.EXHAUSTED:
+                prompt = self._generation_prompt_for_fallback
+                if not prompt:
+                    raise ReservationFailedError(
+                        "クレジット不足を検出しましたが予約用promptがありません"
+                    )
+                return self.request_scheduled_video_generation(prompt, credit)
             self.page.wait_for_timeout(500)
         raise NotebookAdapterError("Notebookの自動動画生成開始を確認できませんでした")
 
-    def start_video_generation_from_chat(self, prompt: str) -> None:
+    def start_video_generation_from_chat(self, prompt: str) -> GenerationOutcome:
         """Send the exact job snapshot to main chat and let Notebook generate."""
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
@@ -777,6 +925,9 @@ class NotebookDomAdapter:
             raise NotebookAdapterError(
                 "チャット送信前に動画artifactが存在するため重複生成を停止しました"
             )
+        credit = self.inspect_credit()
+        if credit.state is CreditState.EXHAUSTED:
+            return self.request_scheduled_video_generation(prompt, credit)
         textbox = self._wait_for_generation_chat_ready()
         self.diagnostic(
             "PRESET_CHAT_EXPECTED:"
@@ -795,7 +946,16 @@ class NotebookDomAdapter:
         send = self._first_enabled_visible(CHAT_SEND, "Notebookメインチャット送信ボタン")
         send.click()
         self._wait_for_chat_message_sent(prompt, textbox)
-        self._wait_for_notebook_auto_generation()
+        self._generation_prompt_for_fallback = prompt
+        try:
+            outcome = self._wait_for_notebook_auto_generation()
+        finally:
+            self._generation_prompt_for_fallback = None
+        if isinstance(outcome, GenerationOutcome):
+            return outcome
+        # Compatibility with diagnostic/test doubles written before outcomes
+        # were structured. Production always returns the branch above.
+        return GenerationOutcome(RemoteVideoStatus.UNKNOWN, False, credit)
 
     def inspect_status(self) -> RemoteVideoStatus:
         cards = self.page.locator("artifact-library-item")
@@ -1077,11 +1237,49 @@ class NotebookEngineAdapter:
         self,
         dom: NotebookDomAdapter,
         recover_page: Callable[[], Any] | None = None,
+        persist_identity: Callable[[Job], None] | None = None,
     ) -> None:
         self.dom = dom
         self.recover_page = recover_page
+        self.persist_identity = persist_identity
 
-    def submit(self, job: Job) -> tuple[str, str]:
+    @staticmethod
+    def _set_if_available(job: Job, name: str, value: Any) -> None:
+        if hasattr(job, name):
+            setattr(job, name, value)
+
+    def _record_submission(
+        self,
+        job: Job,
+        metadata: ResumeMetadata,
+        outcome: GenerationOutcome,
+    ) -> None:
+        job.notebook_id = metadata.notebook_id
+        job.notebook_url = metadata.notebook_url
+        self._set_if_available(job, "credit_state", outcome.credit.state.value)
+        self._set_if_available(job, "credit_percent", outcome.credit.percent)
+        self._set_if_available(
+            job,
+            "credit_reset_at",
+            outcome.credit.reset_at.isoformat() if outcome.credit.reset_at else None,
+        )
+        if outcome.reserved:
+            created = outcome.reservation_created_at or datetime.now().astimezone()
+            self._set_if_available(job, "reservation_created_at", created.isoformat())
+            self._set_if_available(
+                job,
+                "expected_generation_after",
+                outcome.credit.reset_at.isoformat() if outcome.credit.reset_at else None,
+            )
+            self._set_if_available(job, "last_checked_at", created.isoformat())
+            self._set_if_available(job, "artifact_status", "RESERVED")
+            self._set_if_available(job, "download_status", "PENDING")
+            self._set_if_available(job, "raw_status", "PENDING")
+            self._set_if_available(job, "recovery_retry_count", 0)
+        if self.persist_identity is not None:
+            self.persist_identity(job)
+
+    def submit(self, job: Job) -> NotebookSubmissionResult:
         try:
             prompt = job.require_preset_body_snapshot()
         except ValueError as exc:
@@ -1102,8 +1300,25 @@ class NotebookEngineAdapter:
             except SourceReadyTimeoutError:
                 self.dom.rename_notebook(f"FAILED_{job.script_name}")
                 raise
-        self.dom.start_video_generation_from_chat(prompt)
-        return metadata.notebook_id, metadata.notebook_url
+        # Persist/adopt the remote identity before the irreversible generation
+        # action when the caller supplied a repository callback.
+        job.notebook_id = metadata.notebook_id
+        job.notebook_url = metadata.notebook_url
+        if self.persist_identity is not None:
+            self.persist_identity(job)
+        outcome = self.dom.start_video_generation_from_chat(prompt)
+        if not isinstance(outcome, GenerationOutcome):
+            outcome = GenerationOutcome(
+                RemoteVideoStatus.UNKNOWN,
+                False,
+                CreditSnapshot(),
+            )
+        self._record_submission(job, metadata, outcome)
+        return NotebookSubmissionResult(
+            metadata.notebook_id,
+            metadata.notebook_url,
+            outcome,
+        )
 
     def _open_job(self, job: Job) -> None:
         if not job.notebook_url:

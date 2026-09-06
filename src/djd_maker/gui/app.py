@@ -55,10 +55,12 @@ def build_desktop(
         subsequent_poll_seconds=settings.notebook_poll_seconds,
     )
 
-    def pipeline_factory() -> PipelineCoordinator:
+    def make_pipeline(*, require_preset: bool) -> PipelineCoordinator:
         current = settings_repository.load()
         current.validate()
-        selected_preset = preset_repository.require_selected()
+        selected_preset = (
+            preset_repository.require_selected() if require_preset else None
+        )
         ending_path = _resolved(root, current.ending_video) if current.ending_video else Path("")
         if not current.ending_video or not ending_path.is_file():
             raise FileNotFoundError("Ending動画が未設定または存在しません")
@@ -72,6 +74,7 @@ def build_desktop(
                 download_handoff=PlaywrightArtifactDownload(validator),
             ),
             recover_page=browser.restart,
+            persist_identity=job_repository.save,
         )
         raw_directory = _resolved(root, current.raw_directory)
         return PipelineCoordinator(
@@ -92,6 +95,12 @@ def build_desktop(
             generation_preset=selected_preset,
         )
 
+    def pipeline_factory() -> PipelineCoordinator:
+        return make_pipeline(require_preset=True)
+
+    def recovery_pipeline_factory() -> PipelineCoordinator:
+        return make_pipeline(require_preset=False)
+
     service = GuiPipelineController(
         jobs=job_repository,
         settings=settings,
@@ -99,6 +108,7 @@ def build_desktop(
         app_root=root,
         pipeline=None,
         pipeline_factory=pipeline_factory,
+        recovery_pipeline_factory=recovery_pipeline_factory,
         cleanup=browser.stop,
         scheduler=scheduler,
         manual_login=browser.open_login,

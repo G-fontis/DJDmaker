@@ -12,10 +12,15 @@ from uuid import uuid4
 
 from .models import Job, JobState, Preset, utc_now
 from .settings import AppSettings
-from .storage import JsonStore
+from .storage import JsonStore, RetryObserver, is_transient_replace_error
 
 
 SCHEMA_VERSION = 1
+TRANSIENT_REPLACE_RETRY_DELAYS = (0.1, 0.2, 0.4, 0.8)
+# Job transitions can be much more frequent than settings writes. Keep retries
+# bounded, but cover the real 1.5s+ Defender/Dropbox sharing window observed
+# while many worker threads published the same job state.
+JOB_REPLACE_RETRY_DELAYS = (*TRANSIENT_REPLACE_RETRY_DELAYS, 1.6, 3.2)
 
 
 class RepositoryError(RuntimeError):
@@ -36,6 +41,10 @@ class RepositoryLockTimeout(RepositoryError):
 
 class SettingsSaveError(RepositoryError):
     """Settings publish failed after bounded transient retries."""
+
+
+class JobStateSaveError(RepositoryError):
+    """Job-state publish failed after bounded transient retries."""
 
 
 class PresetNotFoundError(LookupError):
@@ -111,12 +120,14 @@ class _VersionedDocument:
         *,
         use_file_lock: bool = True,
         replace_retry_delays: tuple[float, ...] = (),
+        retry_observer: RetryObserver | None = None,
     ) -> None:
         self.path = Path(path)
         self.kind = kind
         self.backup_path = self.path.with_suffix(self.path.suffix + ".bak")
         self.use_file_lock = use_file_lock
         self.replace_retry_delays = replace_retry_delays
+        self.retry_observer = retry_observer
 
     @contextmanager
     def _operation_lock(self) -> Iterator[None]:
@@ -130,7 +141,11 @@ class _VersionedDocument:
             yield
 
     def _store(self, path: Path) -> JsonStore:
-        return JsonStore(path, replace_retry_delays=self.replace_retry_delays)
+        return JsonStore(
+            path,
+            replace_retry_delays=self.replace_retry_delays,
+            retry_observer=self.retry_observer,
+        )
 
     def _validate(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -159,11 +174,21 @@ class _VersionedDocument:
             self._store(path)._replace(path, quarantine)
 
     def _temporary_candidates(self) -> list[Path]:
-        return sorted(
-            self.path.parent.glob(f".{self.path.name}.*.tmp"),
-            key=lambda candidate: candidate.stat().st_mtime_ns,
-            reverse=True,
-        )
+        candidates: list[tuple[int, Path]] = []
+        for candidate in self.path.parent.glob(f".{self.path.name}.*.tmp"):
+            try:
+                modified = candidate.stat().st_mtime_ns
+            except FileNotFoundError:
+                # Windows directory enumeration can briefly retain a temporary
+                # that was just atomically published. It is already cleaned.
+                continue
+            candidates.append((modified, candidate))
+        return [
+            candidate
+            for _modified, candidate in sorted(
+                candidates, key=lambda item: item[0], reverse=True
+            )
+        ]
 
     def _cleanup_temporaries(self) -> None:
         candidates = [
@@ -249,7 +274,7 @@ class _VersionedDocument:
 
 
 class SettingsRepository:
-    REPLACE_RETRY_DELAYS = (0.1, 0.2, 0.4, 0.8)
+    REPLACE_RETRY_DELAYS = TRANSIENT_REPLACE_RETRY_DELAYS
 
     def __init__(self, path: str | Path) -> None:
         self._document = _VersionedDocument(
@@ -456,13 +481,34 @@ class PresetRepository:
 
 
 class JobRepository:
-    def __init__(self, directory: str | Path) -> None:
+    REPLACE_RETRY_DELAYS = JOB_REPLACE_RETRY_DELAYS
+
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        retry_observer: RetryObserver | None = None,
+    ) -> None:
         self.directory = Path(directory)
+        self.retry_observer = retry_observer
 
     def _document(self, job_id: str) -> _VersionedDocument:
         if not job_id or Path(job_id).name != job_id or job_id in {".", ".."}:
             raise ValueError("job_id must be a plain file name")
-        return _VersionedDocument(self.directory / f"{job_id}.json", "job")
+        return _VersionedDocument(
+            self.directory / f"{job_id}.json",
+            "job",
+            use_file_lock=False,
+            replace_retry_delays=self.REPLACE_RETRY_DELAYS,
+            retry_observer=self.retry_observer,
+        )
+
+    @staticmethod
+    def _save_error() -> JobStateSaveError:
+        return JobStateSaveError(
+            "ジョブ状態を保存できませんでした。既存のジョブ状態ファイルは破損していません。"
+            "ほかの同期処理が終わってから再試行してください。"
+        )
 
     @staticmethod
     def _envelope(job: Job) -> dict[str, Any]:
@@ -476,7 +522,12 @@ class JobRepository:
             raise MalformedJsonError(f"invalid job in {path}: {error}") from error
 
     def save(self, job: Job) -> None:
-        self._document(job.id).save(self._envelope(job))
+        try:
+            self._document(job.id).save(self._envelope(job))
+        except OSError as error:
+            if not is_transient_replace_error(error):
+                raise
+            raise self._save_error() from error
 
     def get(self, job_id: str) -> Job | None:
         document = self._document(job_id)
@@ -506,7 +557,7 @@ class JobRepository:
         jobs: list[Job] = []
         errors: dict[str, str] = {}
         for path in sorted(self.directory.glob("*.json")):
-            document = _VersionedDocument(path, "job")
+            document = self._document(path.stem)
             try:
                 jobs.append(self._decode(document.load(), path))
             except (RepositoryError, OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -527,6 +578,10 @@ class JobRepository:
             updated = document.update({}, apply)
         except (FileNotFoundError, KeyError):
             raise KeyError(job_id) from None
+        except OSError as error:
+            if not is_transient_replace_error(error):
+                raise
+            raise self._save_error() from error
         return self._decode(updated, document.path)
 
     def recover_interrupted(self) -> list[Job]:
@@ -537,10 +592,6 @@ class JobRepository:
         """
 
         checkpoints = {
-            # UPLOADING is intentionally handled below: the process may have
-            # created a remote Notebook just before crashing, so resubmission
-            # could duplicate it.
-            JobState.UPLOADING: JobState.FAILED,
             # submit() persists the remote identity before entering GENERATING;
             # resume monitoring instead of submitting the TXT again.
             JobState.GENERATING: JobState.WAITING_VIDEO,
@@ -551,7 +602,17 @@ class JobRepository:
         }
         recovered: list[Job] = []
         for snapshot in self.list():
-            target = checkpoints.get(snapshot.state)
+            if snapshot.state is JobState.UPLOADING:
+                # A persisted remote identity proves submission may already have
+                # happened. Recover through the inspection-only lane so restart
+                # can never create a duplicate Notebook or video.
+                target = (
+                    JobState.RECOVERY_PENDING
+                    if snapshot.notebook_id and snapshot.notebook_url
+                    else JobState.FAILED
+                )
+            else:
+                target = checkpoints.get(snapshot.state)
             if target is None:
                 continue
             document = self._document(snapshot.id)
@@ -561,7 +622,7 @@ class JobRepository:
                 if job.state == expected:
                     # Crash recovery is deliberately not a normal forward transition.
                     job.state = new
-                    if expected is JobState.UPLOADING:
+                    if expected is JobState.UPLOADING and new is JobState.FAILED:
                         job.error_code = "SUBMISSION_STATE_UNCERTAIN"
                         job.error_message = (
                             "Crash occurred while submitting; verify the remote Notebook "
@@ -577,7 +638,13 @@ class JobRepository:
                     return self._envelope(job)
                 return value
 
-            recovered.append(self._decode(document.update({}, apply), document.path))
+            try:
+                updated = document.update({}, apply)
+            except OSError as error:
+                if not is_transient_replace_error(error):
+                    raise
+                raise self._save_error() from error
+            recovered.append(self._decode(updated, document.path))
         return recovered
 
     def load_recoverable(self) -> list[Job]:
@@ -589,6 +656,17 @@ class JobRepository:
             for job in self.list()
             if job.state not in {JobState.COMPLETED, JobState.FAILED}
         ]
+
+    def pending_recovery(self) -> list[Job]:
+        """Return each persisted inspection/download recovery job exactly once."""
+
+        pending_states = {
+            JobState.RESERVED_WAITING_CREDIT_RESET,
+            JobState.RECOVERY_PENDING,
+            JobState.WAITING_VIDEO,
+            JobState.DOWNLOAD_PENDING,
+        }
+        return list({job.id: job for job in self.list() if job.state in pending_states}.values())
 
 
 class QueueRepository:

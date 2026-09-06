@@ -116,7 +116,7 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.0"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.1"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
@@ -129,10 +129,11 @@ def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path
     assert window.completion_group.isVisibleTo(window)
     root_layout = window.centralWidget().layout()
     controls_layout = root_layout.itemAt(4).layout()
-    assert [controls_layout.itemAt(index).widget() for index in range(8)] == [
+    assert [controls_layout.itemAt(index).widget() for index in range(9)] == [
         window.settings_button,
         window.login_button,
         window.start_button,
+        window.recover_button,
         window.reload_button,
         window.pause_button,
         window.stop_button,

@@ -49,7 +49,7 @@ class PresetRepositoryPort(Protocol):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.0"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.1"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態")
@@ -83,6 +83,10 @@ class MainWindow(QMainWindow):
         self._connect_controller()
         self.apply_settings(self.settings)
         self.reload_jobs(local_only=True)
+        service = getattr(self.controller, "controller", None)
+        refresh_credit = getattr(self.controller, "refresh_credit", None)
+        if callable(getattr(service, "refresh_credit", None)) and callable(refresh_credit):
+            refresh_credit()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -121,6 +125,7 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         self.reload_button = QPushButton("台本再読込")
         self.start_button = QPushButton("授業動画作成開始")
+        self.recover_button = QPushButton("未回収動画のチェックから続ける")
         self.pause_button = QPushButton("一時停止")
         self.stop_button = QPushButton("停止")
         self.login_button = QPushButton("Googleログイン")
@@ -131,6 +136,7 @@ class MainWindow(QMainWindow):
             self.settings_button,
             self.login_button,
             self.start_button,
+            self.recover_button,
             self.reload_button,
             self.pause_button,
             self.stop_button,
@@ -151,6 +157,9 @@ class MainWindow(QMainWindow):
         self.zip_complete_label = QLabel()
         self.error_label = QLabel()
         self.next_check_label = QLabel("次回確認: －")
+        self.credit_state_label = QLabel("クレジット状態: 取得不可")
+        self.credit_percent_label = QLabel("クレジット残量: 取得不可")
+        self.credit_reset_label = QLabel("リセット時刻: －")
         for label in (
             self.total_label,
             self.current_job_label,
@@ -161,6 +170,9 @@ class MainWindow(QMainWindow):
             self.zip_complete_label,
             self.error_label,
             self.next_check_label,
+            self.credit_state_label,
+            self.credit_percent_label,
+            self.credit_reset_label,
         ):
             summary_layout.addWidget(label)
         root.addWidget(summary)
@@ -197,6 +209,7 @@ class MainWindow(QMainWindow):
         self.preview_ending_button.clicked.connect(self.preview_ending)
         self.reload_button.clicked.connect(self.reload_jobs)
         self.start_button.clicked.connect(self.start_processing)
+        self.recover_button.clicked.connect(self.recover_pending)
         self.pause_button.clicked.connect(self.pause_processing)
         self.stop_button.clicked.connect(self.stop_processing)
         self.login_button.clicked.connect(self.start_login)
@@ -390,6 +403,19 @@ class MainWindow(QMainWindow):
         )
         self.controller.login()
 
+    def recover_pending(self) -> None:
+        if self._ending_path() is None:
+            QMessageBox.warning(
+                self,
+                "Ending未設定",
+                "未回収動画の後工程を続ける前に、有効なEnding動画を設定してください。",
+            )
+            return
+        if self.controller.recover_pending():
+            self._running = True
+            self.statusBar().showMessage("未回収動画を確認中...")
+            self._update_action_state()
+
     def pause_processing(self) -> None:
         if self._running:
             self.controller.pause()
@@ -407,16 +433,21 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Googleログイン用Chromeでログインし、完了後にChromeを閉じてください"
             )
+        elif operation == "recover":
+            self._running = True
+            self.statusBar().showMessage("未回収動画を確認中...")
         else:
             self.statusBar().showMessage(f"{operation} 実行中")
 
     def _operation_finished(self, operation: str, _result: object) -> None:
-        if operation in {"stop", "pause"}:
+        if operation in {"stop", "pause", "recover"}:
             self._running = False
         if operation == "login":
             self.statusBar().showMessage("ログイン確認待ち。［授業動画作成開始］で自動確認します")
         elif operation == "start":
             self.statusBar().showMessage("準備確認中...")
+        elif operation == "recover":
+            self.statusBar().showMessage("未回収動画の確認が完了しました")
         else:
             self.statusBar().showMessage(f"{operation} 完了")
         self._update_action_state()
@@ -424,7 +455,7 @@ class MainWindow(QMainWindow):
             self.reload_jobs(local_only=True)
 
     def _operation_failed(self, operation: str, message: str) -> None:
-        if operation == "start":
+        if operation in {"start", "recover"}:
             self._running = False
         self.statusBar().showMessage(f"{operation} 失敗")
         self._log_dialog.append_record({"level": "ERROR", "stage": operation, "message": message})
@@ -436,10 +467,36 @@ class MainWindow(QMainWindow):
             self._running = bool(status.get("running", self._running))
             next_check = status.get("next_check", "－")
             self.next_check_label.setText(f"次回確認: {next_check}")
+            credit_state = str(status.get("credit_state", "CREDIT_UNKNOWN"))
+            credit_percent = status.get("credit_percent")
+            credit_reset_at = status.get("credit_reset_at")
+            self.credit_state_label.setText(f"クレジット状態: {credit_state}")
+            self.credit_percent_label.setText(
+                "クレジット残量: 取得不可"
+                if credit_percent is None
+                else f"クレジット残量: {credit_percent}%"
+            )
+            self.credit_reset_label.setText(
+                f"リセット時刻: {credit_reset_at or '－'}"
+            )
             self._update_action_state()
 
     def _update_action_state(self) -> None:
         self.start_button.setEnabled(not self._running and self._ending_path() is not None)
+        self.recover_button.setEnabled(
+            not self._running
+            and self._ending_path() is not None
+            and any(
+                job.state
+                in {
+                    JobState.RESERVED_WAITING_CREDIT_RESET,
+                    JobState.WAITING_VIDEO,
+                    JobState.DOWNLOAD_PENDING,
+                    JobState.RECOVERY_PENDING,
+                }
+                for job in self.jobs
+            )
+        )
         self.pause_button.setEnabled(self._running)
         self.stop_button.setEnabled(self._running)
         self.login_button.setEnabled(not self._running)

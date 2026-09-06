@@ -36,3 +36,18 @@
 - 削除前に、対応source commit、version、必要なSHA-256、再build手順、ユーザーデータでないことを確認する。
 - source、Git履歴、release文書、checksum記録、build script、spec、config template、test fixtureは保持する。
 - `raw_files`、`output`、ユーザー設定、利用中browser profileなどユーザーデータをBuild Cleanupで削除しない。
+
+## Credit reservation / recovery
+
+- NotebookLMのクレジット枯渇はsource本文ではなく、visibleなstatus/alert/live surfaceの明示表示だけで判定する。残量percentageが取得できなくても枯渇表示を優先する。
+- 枯渇時に即時生成を反復しない。同一jobで即時生成と予約生成を二重実行しない。
+- 予約成功は完全一致した予約actionの実行後、remoteの予約待機状態を確認して確定する。
+- 予約・未回収情報は既存`system/jobs/*.json`へ永続化する。DBや終了時に失われるmemory-only stackを導入しない。
+- 未回収チェックは既存Notebook/artifactのみを対象とし、新規Notebook作成・動画再生成を行わない。reset前はremote操作を行わず、COMPLETEDは対象外とする。
+
+## Job state JSON persistence
+
+- job JSONはresolved path単位のprocess内mutexで直列化する。job保存にfilesystem lock fileを使わない。
+- atomic saveは同一directory tempへのwrite、flush、fsync、handle close、backup、`os.replace`の順を守る。
+- PermissionErrorおよびWinError 5/32だけをbounded retryする。復旧成功時はWARNING/INFOログだけとし、GUI modalやpipeline failureを発生させない。
+- 全retry失敗時だけterminal errorを表示する。既存JSON、RAW、Notebook、artifact、outputを削除・破損させず、再試行可能性を残す。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from zipfile import BadZipFile, ZipFile
@@ -13,6 +14,7 @@ from djd_maker.core.interfaces import (
     require_remote_deletion_gate,
 )
 from djd_maker.core.models import Job, JobState, Preset
+from djd_maker.core.repositories import JobStateSaveError
 
 
 class JobRepositoryPort(Protocol):
@@ -62,14 +64,26 @@ class PipelineCoordinator:
             JobState.DOWNLOAD_VERIFY_FAILED,
         }
     )
+    RECOVERY_STATES = frozenset(
+        {
+            JobState.RESERVED_WAITING_CREDIT_RESET,
+            JobState.WAITING_VIDEO,
+            JobState.DOWNLOAD_PENDING,
+            JobState.RECOVERY_PENDING,
+        }
+    )
     MEDIA_STATES = frozenset(
         {JobState.RAW_READY, JobState.ENDING, JobState.HLS_ENCODING, JobState.ZIPPING}
     )
     STATE_PROGRESS = {
         JobState.WAITING: 0.0,
         JobState.UPLOADING: 5.0,
+        JobState.CREDIT_EXHAUSTED: 10.0,
+        JobState.RESERVED_WAITING_CREDIT_RESET: 15.0,
+        JobState.RECOVERY_PENDING: 20.0,
         JobState.GENERATING: 10.0,
         JobState.WAITING_VIDEO: 20.0,
+        JobState.DOWNLOAD_PENDING: 25.0,
         JobState.DOWNLOADING: 30.0,
         JobState.DOWNLOAD_VERIFY_FAILED: 30.0,
         JobState.RAW_READY: 40.0,
@@ -138,6 +152,75 @@ class PipelineCoordinator:
             for future in futures:
                 future.result()
 
+    def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
+        """Advance only persisted remote/recovery jobs; never submit new work."""
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        processed: list[str] = []
+        for job in self.jobs.list():
+            if job.state not in self.RECOVERY_STATES:
+                continue
+            if job.state is JobState.RESERVED_WAITING_CREDIT_RESET:
+                reset_at = self._parse_utc(job.credit_reset_at)
+                if reset_at is not None and current < reset_at:
+                    continue
+            processed.append(job.id)
+            self._recover_remote_job(job, checked_at=current)
+
+        media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
+        with ThreadPoolExecutor(
+            max_workers=self.ffmpeg_concurrency, thread_name_prefix="djd-ffmpeg"
+        ) as pool:
+            futures = [pool.submit(self._run_media_job, job) for job in media_jobs]
+            for future in futures:
+                future.result()
+        return processed
+
+    @staticmethod
+    def _parse_utc(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("credit_reset_at must be timezone-aware")
+        return parsed.astimezone(UTC)
+
+    def _recover_remote_job(self, job: Job, *, checked_at: datetime) -> None:
+        """Read the existing Notebook and continue at download only when ready."""
+        if not job.notebook_id or not job.notebook_url:
+            job.error_code = "NOTEBOOK_RESUME_METADATA_MISSING"
+            job.error_message = "回収対象Notebookの識別情報がありません"
+            if job.state is not JobState.FAILED:
+                self._transition(job, JobState.FAILED)
+            return
+        try:
+            status = self.notebook.inspect_status(job)
+            job.last_checked_at = checked_at.isoformat()
+            job.artifact_status = status
+            if status == "READY":
+                if job.state is not JobState.DOWNLOAD_PENDING:
+                    self._transition(job, JobState.DOWNLOAD_PENDING)
+                self._run_notebook_job(job)
+                return
+            if status == "FAILED":
+                raise RuntimeError("remote video generation failed")
+            self._save(job)
+        except JobStateSaveError:
+            # The repository already exhausted its bounded Windows-sharing
+            # retries. Preserve remote/local artifacts and surface one terminal
+            # operation error to the GUI; do not rewrite the job as FAILED.
+            raise
+        except Exception as exc:
+            job.recovery_retry_count += 1
+            job.error_code = "RECOVERY_CHECK_FAILED"
+            job.error_message = str(exc)
+            if job.state not in {
+                JobState.RESERVED_WAITING_CREDIT_RESET,
+                JobState.RECOVERY_PENDING,
+            }:
+                self._transition(job, JobState.RECOVERY_PENDING)
+            else:
+                self._save(job)
+
     def recover_after_restart(self) -> list[Job]:
         loader = getattr(self.jobs, "load_recoverable", None)
         if loader is None:
@@ -157,9 +240,28 @@ class PipelineCoordinator:
                     raise RuntimeError("PRESET_NOT_SELECTED")
                 job.snapshot_preset(self.generation_preset)
                 self._transition(job, JobState.UPLOADING)
-                notebook_id, notebook_url = self.notebook.submit(job)
+                submission = self.notebook.submit(job)
+                if hasattr(submission, "notebook_id"):
+                    notebook_id = submission.notebook_id
+                    notebook_url = submission.notebook_url
+                else:
+                    notebook_id, notebook_url = submission
                 job.notebook_id = notebook_id
                 job.notebook_url = notebook_url
+                if bool(getattr(submission, "reserved", False)):
+                    snapshot = getattr(submission, "credit", None)
+                    job.credit_state = "CREDIT_EXHAUSTED"
+                    job.credit_percent = getattr(snapshot, "percent", None)
+                    reset_at = getattr(snapshot, "reset_at", None)
+                    job.credit_reset_at = reset_at.isoformat() if reset_at else None
+                    job.reservation_created_at = getattr(
+                        submission, "reservation_created_at", None
+                    )
+                    job.expected_generation_after = job.credit_reset_at
+                    job.artifact_status = "SCHEDULED_REMOTE"
+                    self._transition(job, JobState.CREDIT_EXHAUSTED)
+                    self._transition(job, JobState.RESERVED_WAITING_CREDIT_RESET)
+                    return
                 self._transition(job, JobState.GENERATING)
                 if self.scheduler is not None:
                     self.scheduler.schedule_generation(job)
@@ -186,6 +288,10 @@ class PipelineCoordinator:
                     if status == "FAILED":
                         raise RuntimeError("remote video generation failed")
                     return
+                self._transition(job, JobState.DOWNLOAD_PENDING)
+
+            if job.state is JobState.DOWNLOAD_PENDING:
+                job.download_status = "PENDING"
                 self._transition(job, JobState.DOWNLOADING)
 
             if job.state is JobState.DOWNLOADING:
@@ -197,6 +303,7 @@ class PipelineCoordinator:
                 )
                 if not download.exists():
                     self.notebook.download_artifact(job, download)
+                job.download_status = "DOWNLOADED"
                 raw_path = self.paths.raw_directory / f"{job.script_name}.mp4"
                 if raw_path.exists():
                     stored = self.raw_store.verify_existing(download, raw_path)
@@ -214,6 +321,7 @@ class PipelineCoordinator:
                 job.video_codec = getattr(metadata, "video_codec", None)
                 job.audio_codec = getattr(metadata, "audio_codec", None)
                 job.safety_gate = gate
+                job.raw_status = "READY"
                 self._transition(job, JobState.RAW_READY)
                 try:
                     require_remote_deletion_gate(gate)
@@ -224,6 +332,8 @@ class PipelineCoordinator:
                     job.error_code = "REMOTE_ARTIFACT_DELETE_FAILED"
                     job.error_message = str(exc)
                     self._save(job)
+        except JobStateSaveError:
+            raise
         except Exception as exc:
             job.error_message = str(exc)
             if job.state is JobState.DOWNLOADING:
@@ -291,6 +401,8 @@ class PipelineCoordinator:
                     job.zip_path = str(result.zip_path)
                 job.hls_result = "PASS"
                 self._transition(job, JobState.COMPLETED)
+        except JobStateSaveError:
+            raise
         except Exception as exc:
             job.error_code = "MEDIA_STAGE_FAILED"
             job.error_message = str(exc)

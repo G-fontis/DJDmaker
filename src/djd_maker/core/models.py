@@ -12,8 +12,12 @@ from uuid import uuid4
 class JobState(StrEnum):
     WAITING = "WAITING"
     UPLOADING = "UPLOADING"
+    CREDIT_EXHAUSTED = "CREDIT_EXHAUSTED"
+    RESERVED_WAITING_CREDIT_RESET = "RESERVED_WAITING_CREDIT_RESET"
+    RECOVERY_PENDING = "RECOVERY_PENDING"
     GENERATING = "GENERATING"
     WAITING_VIDEO = "WAITING_VIDEO"
+    DOWNLOAD_PENDING = "DOWNLOAD_PENDING"
     DOWNLOADING = "DOWNLOADING"
     DOWNLOAD_VERIFY_FAILED = "DOWNLOAD_VERIFY_FAILED"
     RAW_READY = "RAW_READY"
@@ -26,11 +30,25 @@ class JobState(StrEnum):
 
 ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.WAITING: frozenset({JobState.UPLOADING, JobState.FAILED}),
-    JobState.UPLOADING: frozenset({JobState.GENERATING, JobState.FAILED}),
+    JobState.UPLOADING: frozenset(
+        {JobState.GENERATING, JobState.CREDIT_EXHAUSTED, JobState.RECOVERY_PENDING, JobState.FAILED}
+    ),
+    JobState.CREDIT_EXHAUSTED: frozenset(
+        {JobState.RESERVED_WAITING_CREDIT_RESET, JobState.FAILED}
+    ),
+    JobState.RESERVED_WAITING_CREDIT_RESET: frozenset(
+        {JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.RECOVERY_PENDING, JobState.FAILED}
+    ),
+    JobState.RECOVERY_PENDING: frozenset(
+        {JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.FAILED}
+    ),
     JobState.GENERATING: frozenset(
         {JobState.WAITING_VIDEO, JobState.DOWNLOADING, JobState.FAILED}
     ),
-    JobState.WAITING_VIDEO: frozenset({JobState.DOWNLOADING, JobState.FAILED}),
+    JobState.WAITING_VIDEO: frozenset(
+        {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING, JobState.FAILED}
+    ),
+    JobState.DOWNLOAD_PENDING: frozenset({JobState.DOWNLOADING, JobState.FAILED}),
     JobState.DOWNLOADING: frozenset(
         {JobState.RAW_READY, JobState.DOWNLOAD_VERIFY_FAILED, JobState.FAILED}
     ),
@@ -114,6 +132,16 @@ class Job:
     generation_started_at: str | None = None
     next_poll_at: str | None = None
     last_polled_at: str | None = None
+    credit_state: str = "CREDIT_UNKNOWN"
+    credit_percent: int | None = None
+    credit_reset_at: str | None = None
+    reservation_created_at: str | None = None
+    expected_generation_after: str | None = None
+    last_checked_at: str | None = None
+    artifact_status: str = "NOT_CHECKED"
+    download_status: str = "PENDING"
+    raw_status: str = "PENDING"
+    recovery_retry_count: int = 0
     raw_path: str | None = None
     raw_size_bytes: int | None = None
     duration_seconds: float | None = None

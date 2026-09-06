@@ -4,6 +4,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
 
+import pytest
+
+from djd_maker.adapters.credit import CreditSnapshot, CreditState
 from djd_maker.core.interfaces import HlsResult, MediaResult
 from djd_maker.core.models import (
     DownloadSafetyGate,
@@ -12,6 +15,7 @@ from djd_maker.core.models import (
     Preset,
     preset_body_sha256,
 )
+from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
 from djd_maker.orchestration.scheduler import PersistentPollScheduler
 from djd_maker.testing.fake_notebook import FakeNotebookAdapter
@@ -32,8 +36,24 @@ class MemoryJobs:
         return [Job.from_dict(job.to_dict()) for job in self.data.values()]
 
 
+class TerminalSaveFailureJobs(MemoryJobs):
+    def save(self, job):
+        raise JobStateSaveError("ジョブ状態を保存できませんでした。再試行できます")
+
+
 def full_gate():
     return DownloadSafetyGate(**{item.name: True for item in fields(DownloadSafetyGate)})
+
+
+def test_terminal_job_save_failure_surfaces_without_marking_durable_job_failed(tmp_path):
+    job = Job("input.txt")
+    jobs = TerminalSaveFailureJobs(job)
+    instance = coordinator(tmp_path, jobs, FakeNotebookAdapter({}))
+
+    with pytest.raises(JobStateSaveError, match="再試行"):
+        instance.run_cycle()
+
+    assert jobs.get(job.id).state is JobState.WAITING
 
 
 class RawStore:
@@ -133,6 +153,42 @@ class InspectTrackingNotebook(FakeNotebookAdapter):
     def inspect_status(self, job):
         self.inspect_calls.append(job.id)
         return super().inspect_status(job)
+
+
+class OneReservedNotebook(FakeNotebookAdapter):
+    def submit(self, job):
+        if job.source_path == "reserved.txt":
+            self.submit_calls.append(job.id)
+            self.submitted_prompts.append(job.require_preset_body_snapshot())
+            return SimpleNamespace(
+                notebook_id=f"fake-{job.id}",
+                notebook_url=f"https://notebook.google.com/notebook/fake-{job.id}",
+                reserved=True,
+                credit=CreditSnapshot(
+                    CreditState.EXHAUSTED,
+                    reset_at=datetime(2026, 9, 8, tzinfo=UTC),
+                ),
+                reservation_created_at=datetime(2026, 9, 7, tzinfo=UTC).isoformat(),
+            )
+        return super().submit(job)
+
+
+def test_one_credit_reserved_job_does_not_block_other_job_completion(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    reserved = Job("reserved.txt", id="reserved")
+    available = Job("available.txt", id="available")
+    jobs = MemoryJobs(reserved, available)
+    notebook = OneReservedNotebook(
+        {reserved.source_path: fixture, available.source_path: fixture}
+    )
+
+    coordinator(tmp_path, jobs, notebook).run_cycle()
+
+    assert jobs.get("reserved").state is JobState.RESERVED_WAITING_CREDIT_RESET
+    assert jobs.get("available").state is JobState.COMPLETED
+    assert notebook.submit_calls.count("reserved") == 1
+    assert notebook.submit_calls.count("available") == 1
 
 
 def test_pipeline_uses_persisted_scheduler_deadline(tmp_path):

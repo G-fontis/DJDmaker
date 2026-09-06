@@ -11,7 +11,9 @@ from djd_maker.core.models import Job, JobState
 ACTIVE_STATES = frozenset(
     {
         JobState.UPLOADING,
+        JobState.CREDIT_EXHAUSTED,
         JobState.GENERATING,
+        JobState.DOWNLOAD_PENDING,
         JobState.DOWNLOADING,
         JobState.ENDING,
         JobState.HLS_ENCODING,
@@ -33,6 +35,7 @@ def _mark(done: bool, active: bool, failed: bool, label: str) -> str:
 def job_stage_texts(job: Job) -> tuple[str, str, str]:
     failed = job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
     notebook_done = job.state in {
+        JobState.DOWNLOAD_PENDING,
         JobState.DOWNLOADING,
         JobState.DOWNLOAD_VERIFY_FAILED,
         JobState.RAW_READY,
@@ -45,8 +48,12 @@ def job_stage_texts(job: Job) -> tuple[str, str, str]:
     hls_done = job.state is JobState.COMPLETED and bool(job.zip_path)
     notebook_active = job.state in {
         JobState.UPLOADING,
+        JobState.CREDIT_EXHAUSTED,
+        JobState.RESERVED_WAITING_CREDIT_RESET,
+        JobState.RECOVERY_PENDING,
         JobState.GENERATING,
         JobState.WAITING_VIDEO,
+        JobState.DOWNLOAD_PENDING,
         JobState.DOWNLOADING,
     }
     return (
@@ -66,7 +73,18 @@ def state_display(job: Job) -> str:
         return "○ 完成"
     if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}:
         return "× エラー"
-    if job.state in {JobState.UPLOADING, JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOADING}:
+    if job.state is JobState.RESERVED_WAITING_CREDIT_RESET:
+        return "－ クレジット回復待ち（予約済み）"
+    if job.state is JobState.RECOVERY_PENDING:
+        return "－ 未回収動画の確認待ち"
+    if job.state in {
+        JobState.UPLOADING,
+        JobState.CREDIT_EXHAUSTED,
+        JobState.GENERATING,
+        JobState.WAITING_VIDEO,
+        JobState.DOWNLOAD_PENDING,
+        JobState.DOWNLOADING,
+    }:
         return "▶ 動画生成中"
     if job.state is JobState.ENDING:
         return "▶ End処理中"

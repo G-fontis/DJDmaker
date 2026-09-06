@@ -15,13 +15,13 @@ VSVersionInfo(
         u'041104b0',
         [
           StringStruct(u'CompanyName', u'福ゼミ塾長'),
-          StringStruct(u'FileDescription', u'台本から授業動画つくるマシーン Ver1.0'),
-          StringStruct(u'FileVersion', u'1.0.0.0'),
+          StringStruct(u'FileDescription', u'台本から授業動画つくるマシーン Ver1.1'),
+          StringStruct(u'FileVersion', u'1.1.0.0'),
           StringStruct(u'InternalName', u'DJDmaker'),
           StringStruct(u'LegalCopyright', u'Created by 福ゼミ塾長'),
           StringStruct(u'OriginalFilename', u'DJDmaker.exe'),
           StringStruct(u'ProductName', u'台本から授業動画つくるマシーン'),
-          StringStruct(u'ProductVersion', u'1.0.0')
+          StringStruct(u'ProductVersion', u'1.1.0')
         ]
       )
     ]),

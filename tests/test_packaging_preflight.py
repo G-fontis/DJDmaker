@@ -119,7 +119,7 @@ def test_release_tree_requires_assets_and_rejects_runtime_user_data(tmp_path: Pa
 
 
 def test_complete_release_tree_passes_structural_scan(tmp_path: Path) -> None:
-    root = tmp_path / "DJDmaker_Ver1.0"
+    root = tmp_path / "DJDmaker_Ver1.1"
     (root / "_internal").mkdir(parents=True)
     (root / "DJDmaker.exe").write_bytes(b"exe")
     _default_config(root)
@@ -149,7 +149,7 @@ def test_spec_is_windowed_onedir_and_build_script_never_creates_zip() -> None:
     script = (PROJECT_ROOT / "packaging" / "build_windows.ps1").read_text(encoding="utf-8")
     hook = (PROJECT_ROOT / "packaging" / "runtime_hooks" / "portable_paths.py").read_text(encoding="utf-8")
     assert 'console=False' in spec
-    assert 'name="DJDmaker_Ver1.0"' in spec
+    assert 'name="DJDmaker_Ver1.1"' in spec
     assert 'collect_all("playwright")' in spec
     assert '"PySide6.QtMultimedia"' in spec
     assert '"runtime/ffmpeg"' in spec
@@ -158,8 +158,8 @@ def test_spec_is_windowed_onedir_and_build_script_never_creates_zip() -> None:
     version_info = (PROJECT_ROOT / "packaging" / "windows_version_info.txt").read_text(
         encoding="utf-8"
     )
-    assert "ProductVersion', u'1.0.0'" in version_info
-    assert "FileVersion', u'1.0.0.0'" in version_info
+    assert "ProductVersion', u'1.1.0'" in version_info
+    assert "FileVersion', u'1.1.0.0'" in version_info
     assert '"config"' in spec
     assert "--release-tree" in script
     assert 'Move-Item -LiteralPath $Source -Destination $Destination' in script

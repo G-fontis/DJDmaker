@@ -1,4 +1,5 @@
 from dataclasses import fields
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -8,15 +9,19 @@ from djd_maker.adapters.notebook import (
     ArtifactDeletionDisabled,
     ArtifactDeletionRetryableError,
     DomMismatchError,
+    GenerationOutcome,
     NotebookAdapterError,
     NotebookDomAdapter,
     NotebookEngineAdapter,
     PlaywrightArtifactDownload,
     PresetApplyMismatchError,
+    ReservationFailedError,
+    ReservationUnavailableError,
     RemoteVideoStatus,
     ResumeMetadata,
     SourceReadyTimeoutError,
 )
+from djd_maker.adapters.credit import CreditSnapshot, CreditState
 from djd_maker.core.interfaces import RemoteDeletionDenied
 from djd_maker.core.models import DownloadSafetyGate, Job, preset_body_sha256
 
@@ -32,6 +37,14 @@ LIVE_ARTIFACT_MENU_FIXTURE = (
     ("menuitem", "プロンプトとソースを表示", "mat-mdc-menu-item"),
     ("menuitem", "削除", "mat-mdc-menu-item"),
 )
+
+
+class CreditStub:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def detect(self):
+        return self.snapshot
 
 
 def test_verified_defaults_match_minimal_live_artifact_menu_fixture():
@@ -576,6 +589,61 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
     ]
 
 
+def test_engine_returns_structured_reservation_and_records_recovery_fields(tmp_path):
+    source = tmp_path / "reserved.txt"
+    source.write_text("script", encoding="utf-8")
+    jst = timezone(timedelta(hours=9))
+    created = datetime(2026, 9, 7, 22, 0, tzinfo=jst)
+    reset = datetime(2026, 9, 8, 1, 0, tzinfo=jst)
+    snapshot = CreditSnapshot(CreditState.EXHAUSTED, 0, reset, "credit exhausted")
+    persisted = []
+
+    class Dom:
+        def create_notebook(self):
+            return ResumeMetadata(
+                "reserved-id",
+                "https://notebook.google.com/notebook/reserved-id",
+                "",
+            )
+
+        def rename_notebook(self, _title):
+            pass
+
+        def upload_txt(self, _path):
+            pass
+
+        def wait_for_source_ready(self, _filename):
+            pass
+
+        def start_video_generation_from_chat(self, _prompt):
+            return GenerationOutcome(
+                RemoteVideoStatus.WAITING, True, snapshot, created
+            )
+
+    prompt = "selected snapshot"
+    job = Job(
+        str(source),
+        preset_body_snapshot=prompt,
+        preset_body_sha256=preset_body_sha256(prompt),
+    )
+    result = NotebookEngineAdapter(
+        Dom(), persist_identity=lambda current: persisted.append(current.to_dict())
+    ).submit(job)
+
+    assert tuple(result) == ("reserved-id", result.notebook_url)
+    assert result.reserved is True
+    assert result.credit is snapshot
+    assert result.reservation_created_at == created.isoformat()
+    assert job.credit_state == CreditState.EXHAUSTED.value
+    assert job.credit_percent == 0
+    assert job.credit_reset_at == reset.isoformat()
+    assert job.expected_generation_after == reset.isoformat()
+    assert job.reservation_created_at == created.isoformat()
+    assert job.artifact_status == "RESERVED"
+    assert len(persisted) == 2
+    assert persisted[0]["notebook_id"] == "reserved-id"
+
+
 def test_source_ready_requires_active_right_side_studio_card(monkeypatch):
     ticks = iter(range(20))
     monkeypatch.setattr(
@@ -786,6 +854,161 @@ def test_exact_test_preset_reaches_main_chat_without_video_card_controls():
     ]
     assert not any("Video Overview" in str(event) for event in events)
     assert not any("動画生成ボタン" in str(event) for event in events)
+
+
+def test_exhausted_precheck_schedules_without_sending_chat_generate():
+    jst = timezone(timedelta(hours=9))
+    now = datetime(2026, 9, 7, 22, 0, tzinfo=jst)
+    credit = CreditSnapshot(
+        CreditState.EXHAUSTED,
+        0,
+        datetime(2026, 9, 8, 1, 0, tzinfo=jst),
+        "01:00 にクレジットリセット",
+    )
+    events = []
+
+    class EmptyCards:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, selector):
+            assert selector == "artifact-library-item"
+            return EmptyCards()
+
+    adapter = NotebookDomAdapter(
+        Page(), credit_detector=CreditStub(credit), clock=lambda: now
+    )
+    adapter._wait_for_generation_chat_ready = lambda: pytest.fail(  # type: ignore[method-assign]
+        "exhausted precheck must not prepare or send immediate chat generation"
+    )
+    adapter.request_scheduled_video_generation = (  # type: ignore[method-assign]
+        lambda prompt, snapshot: events.append((prompt, snapshot))
+        or GenerationOutcome(RemoteVideoStatus.WAITING, True, snapshot, now)
+    )
+
+    outcome = adapter.start_video_generation_from_chat("selected preset")
+
+    assert outcome.reserved is True
+    assert events == [("selected preset", credit)]
+
+
+def test_reservation_uses_exact_allowlist_and_requires_waiting_status():
+    now = datetime(2026, 9, 7, 22, 0, tzinfo=timezone(timedelta(hours=9)))
+    credit = CreditSnapshot(CreditState.EXHAUSTED, reset_at=now)
+    events = []
+
+    class EmptyCards:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, selector):
+            assert selector == "artifact-library-item"
+            return EmptyCards()
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 2_000
+
+    class Node:
+        def __init__(self, name):
+            self.name = name
+            self.value = ""
+
+        def click(self):
+            events.append(("click", self.name))
+
+        def fill(self, value):
+            self.value = value
+
+        def input_value(self):
+            return self.value
+
+    adapter = NotebookDomAdapter(Page(), clock=lambda: now)
+    adapter._first_visible = lambda _selectors, name: Node(name)  # type: ignore[method-assign]
+
+    def select_schedule(candidates, name):
+        assert name == "クレジット不足時の予約生成ボタン"
+        assert all(kind == "role" and role == "button" for kind, role, _ in candidates)
+        labels = {label for _kind, _role, label in candidates}
+        assert "予約して生成" in labels
+        assert "生成" not in labels
+        return Node("予約して生成")
+
+    adapter._first_enabled_visible = select_schedule  # type: ignore[method-assign]
+    states = iter((RemoteVideoStatus.UNKNOWN, RemoteVideoStatus.WAITING))
+    adapter.inspect_status = lambda: next(states)  # type: ignore[method-assign]
+
+    outcome = adapter.request_scheduled_video_generation("prompt", credit)
+
+    assert outcome.remote_status is RemoteVideoStatus.WAITING
+    assert outcome.reserved is True
+    assert events[-1] == ("click", "予約して生成")
+
+
+def test_reservation_remote_failure_is_explicit():
+    credit = CreditSnapshot(CreditState.EXHAUSTED)
+
+    class EmptyCards:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, _selector):
+            return EmptyCards()
+
+    class Node:
+        value = ""
+
+        def click(self):
+            pass
+
+        def fill(self, value):
+            self.value = value
+
+        def input_value(self):
+            return self.value
+
+    adapter = NotebookDomAdapter(Page())
+    adapter._first_visible = lambda _selectors, _name: Node()  # type: ignore[method-assign]
+    adapter._first_enabled_visible = lambda _selectors, _name: Node()  # type: ignore[method-assign]
+    adapter.inspect_status = lambda: RemoteVideoStatus.FAILED  # type: ignore[method-assign]
+
+    with pytest.raises(ReservationFailedError, match="予約生成の失敗"):
+        adapter.request_scheduled_video_generation("prompt", credit)
+
+
+def test_missing_schedule_control_has_specific_failure():
+    credit = CreditSnapshot(CreditState.EXHAUSTED)
+
+    class EmptyCards:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, _selector):
+            return EmptyCards()
+
+    class Topic:
+        value = ""
+
+        def click(self):
+            pass
+
+        def fill(self, value):
+            self.value = value
+
+        def input_value(self):
+            return self.value
+
+    adapter = NotebookDomAdapter(Page())
+    adapter._first_visible = lambda _selectors, _name: Topic()  # type: ignore[method-assign]
+    adapter._first_enabled_visible = (  # type: ignore[method-assign]
+        lambda _selectors, _name: (_ for _ in ()).throw(DomMismatchError("missing"))
+    )
+
+    with pytest.raises(ReservationUnavailableError, match="予約生成UI"):
+        adapter.request_scheduled_video_generation("prompt", credit)
 
 
 def test_chat_input_readback_mismatch_blocks_send():

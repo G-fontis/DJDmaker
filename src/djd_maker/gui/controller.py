@@ -20,6 +20,10 @@ class GuiControllerPort(Protocol):
 
     def login(self) -> Any: ...
 
+    def recover_pending(self) -> Any: ...
+
+    def refresh_credit(self) -> Any: ...
+
     def retry(self, job_id: str, stage: str) -> Any: ...
 
     def shutdown(self) -> Any: ...
@@ -132,6 +136,12 @@ class AsyncControllerBridge(QObject):
 
     def login(self) -> bool:
         return self._invoke("login", self.controller.login)
+
+    def recover_pending(self) -> bool:
+        return self._invoke("recover", self.controller.recover_pending)
+
+    def refresh_credit(self) -> bool:
+        return self._invoke("credit", self.controller.refresh_credit)
 
     def retry(self, job_id: str, stage: str) -> bool:
         return self._invoke(f"retry:{stage}", lambda: self.controller.retry(job_id, stage))

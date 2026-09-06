@@ -173,6 +173,42 @@ def test_generating_resumes_monitoring_when_remote_identity_is_persisted(tmp_pat
     assert repository.recover_interrupted()[0].state is JobState.WAITING_VIDEO
 
 
+def test_uploading_with_remote_identity_recovers_without_resubmission(tmp_path) -> None:
+    repository = JobRepository(tmp_path / "jobs")
+    repository.save(
+        Job(
+            "input/a.txt",
+            id="job",
+            state=JobState.UPLOADING,
+            notebook_id="remote-id",
+            notebook_url="https://notebook.google.com/notebook/remote-id",
+        )
+    )
+
+    recovered = repository.recover_interrupted()[0]
+
+    assert recovered.state is JobState.RECOVERY_PENDING
+    assert recovered.error_code is None
+
+
+def test_pending_recovery_is_unique_and_excludes_completed(tmp_path) -> None:
+    repository = JobRepository(tmp_path / "jobs")
+    pending_states = (
+        JobState.RESERVED_WAITING_CREDIT_RESET,
+        JobState.RECOVERY_PENDING,
+        JobState.WAITING_VIDEO,
+        JobState.DOWNLOAD_PENDING,
+    )
+    for index, state in enumerate(pending_states):
+        repository.save(Job(f"input/{index}.txt", id=f"pending-{index}", state=state))
+    repository.save(Job("input/done.txt", id="done", state=JobState.COMPLETED))
+
+    pending = repository.pending_recovery()
+
+    assert [job.id for job in pending] == [f"pending-{index}" for index in range(4)]
+    assert len({job.id for job in pending}) == 4
+
+
 def test_restart_preserves_exact_preset_body_snapshot_and_hash(tmp_path) -> None:
     repository = JobRepository(tmp_path / "jobs")
     job = Job(
@@ -206,7 +242,10 @@ def test_generating_without_remote_identity_fails_closed_on_restart(tmp_path) ->
     "stable",
     [
         JobState.WAITING,
+        JobState.RESERVED_WAITING_CREDIT_RESET,
+        JobState.RECOVERY_PENDING,
         JobState.WAITING_VIDEO,
+        JobState.DOWNLOAD_PENDING,
         JobState.DOWNLOAD_VERIFY_FAILED,
         JobState.RAW_READY,
         JobState.COMPLETED,

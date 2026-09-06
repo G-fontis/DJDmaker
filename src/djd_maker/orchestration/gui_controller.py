@@ -24,6 +24,7 @@ class GuiPipelineController:
         pipeline: PipelineCoordinator | None,
         scheduler: PersistentPollScheduler,
         pipeline_factory: Callable[[], PipelineCoordinator] | None = None,
+        recovery_pipeline_factory: Callable[[], PipelineCoordinator] | None = None,
         cleanup: Callable[[], None] | None = None,
         settings_provider: Callable[[], AppSettings] | None = None,
         manual_login: Callable[[], Any] | None = None,
@@ -39,6 +40,7 @@ class GuiPipelineController:
             raise ValueError("pipeline or pipeline_factory is required")
         self.pipeline = pipeline
         self.pipeline_factory = pipeline_factory
+        self.recovery_pipeline_factory = recovery_pipeline_factory or pipeline_factory
         self.cleanup = cleanup or (lambda: None)
         self.settings_provider = settings_provider
         self.manual_login = manual_login
@@ -50,6 +52,7 @@ class GuiPipelineController:
         self._stop_event = threading.Event()
         self._guard = threading.RLock()
         self._worker: threading.Thread | None = None
+        self._recovering = False
         self._paused = False
         self._phase = "idle"
         self._jobs_callback: Callable[[object], None] = lambda _value: None
@@ -111,6 +114,8 @@ class GuiPipelineController:
 
     def start(self) -> dict[str, object]:
         with self._guard:
+            if self._recovering:
+                raise RuntimeError("未回収動画の確認処理が実行中です")
             if self._worker is not None and self._worker.is_alive():
                 self._paused = False
                 self.scheduler.resume()
@@ -130,6 +135,48 @@ class GuiPipelineController:
             )
             self._worker.start()
         return self.status()
+
+    def recover_pending(self) -> dict[str, object]:
+        """Check persisted recovery jobs once without creating new remote work."""
+        with self._guard:
+            if self._recovering or (
+                self._worker is not None and self._worker.is_alive()
+            ):
+                raise RuntimeError("別の処理が実行中です")
+            factory = self.recovery_pipeline_factory
+            if factory is None:
+                raise RuntimeError("未回収動画の回収処理が構成されていません")
+            self._recovering = True
+            self._phase = "recovery"
+        try:
+            pipeline = factory()
+            pending_before = [
+                job
+                for job in self.jobs.list()
+                if job.state in PipelineCoordinator.RECOVERY_STATES
+            ]
+            processed = pipeline.run_recovery_cycle()
+            values = self.jobs.list()
+            self._jobs_callback(values)
+            self._publish_status(values)
+            return {
+                "pending": len(pending_before),
+                "checked": len(processed),
+            }
+        finally:
+            try:
+                self.cleanup()
+            finally:
+                with self._guard:
+                    self._recovering = False
+                    self._phase = "idle"
+                self._publish_status()
+
+    def refresh_credit(self) -> dict[str, object]:
+        """Publish persisted/unknown credit state without polling the DOM."""
+        result = self.status()
+        self._status_callback(result)
+        return result
 
     def pause(self) -> dict[str, object]:
         with self._guard:
@@ -237,7 +284,12 @@ class GuiPipelineController:
                     self._jobs_callback(values)
                     self._publish_status(values)
                     if values and all(
-                        job.state in {JobState.COMPLETED, JobState.FAILED}
+                        job.state
+                        in {
+                            JobState.COMPLETED,
+                            JobState.FAILED,
+                            JobState.RESERVED_WAITING_CREDIT_RESET,
+                        }
                         for job in values
                     ):
                         break
@@ -264,6 +316,7 @@ class GuiPipelineController:
         values = self.jobs.list()
         with self._guard:
             worker_running = self._worker is not None and self._worker.is_alive()
+            recovering = self._recovering
             paused = self._paused
         pollable = [
             job
@@ -276,11 +329,28 @@ class GuiPipelineController:
             else None
         )
         return {
-            "running": worker_running and not paused,
+            "running": (worker_running or recovering) and not paused,
             "paused": paused,
             "scheduler_mode": self.scheduler.mode.value,
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
             "phase": self._phase,
+            **self._credit_status(values),
+        }
+
+    @staticmethod
+    def _credit_status(values: list[Job]) -> dict[str, object]:
+        observed = [
+            job
+            for job in values
+            if job.credit_state != "CREDIT_UNKNOWN"
+            or job.credit_percent is not None
+            or job.credit_reset_at is not None
+        ]
+        latest = max(observed, key=lambda job: job.updated_at) if observed else None
+        return {
+            "credit_state": latest.credit_state if latest else "CREDIT_UNKNOWN",
+            "credit_percent": latest.credit_percent if latest else None,
+            "credit_reset_at": latest.credit_reset_at if latest else None,
         }
 
     def _publish_status(self, values: list[Job] | None = None) -> None:

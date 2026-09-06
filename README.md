@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver1.0
+# 台本から授業動画つくるマシーン Ver1.1
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.0.0。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.1.0。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,7 +33,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.0`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.1`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 初回は設定画面でEnding動画を指定し、「動画生成プリセット」からプリセット名と本文を登録してください。プリセット一覧は保存されますが、選択状態は起動をまたいで保持しません。起動ごとに使用するプリセットを選択してください。未選択のまま開始した場合はNotebook作成前にエラー停止し、default・test・前回選択presetの自動投入はありません。選択本文はjob開始時にsnapshotされ、source ready後にメインチャットへ入力します。入力直後のDOM readback完全一致、送信後のuser message安定表示、Notebook側の動画artifact生成開始を確認します。通常pipelineは動画解説カードやGenerateボタンを直接操作しません。
 
@@ -73,6 +73,16 @@ docs/        調査・設計資料
 
 空ディレクトリのみ `.gitkeep` で保持し、実データは除外します。
 
+## Ver1.1 クレジット枯渇と未回収動画
+
+- 生成開始前と生成要求の状態進行時にNotebookLMの明示的なクレジット表示を確認します。
+- クレジット枯渇時は即時生成を繰り返さず、NotebookLMの完全一致した予約操作だけを使用します。予約成功はリモートの予約待機状態を確認して確定します。
+- リセット時刻はNotebookLMが表示するローカル時刻から、当日または翌日のtimezone付き日時として保存します。残量表示を取得できない場合も、枯渇の明示表示があれば安全な予約処理を継続します。
+- 予約・未回収状態は`system/jobs/*.json`に保持されます。［未回収動画のチェックから続ける］は既存Notebook/artifactだけを確認し、新規Notebookや重複動画を生成しません。リセット前は何も操作しません。
+- ジョブJSON保存はjob/path単位のprocess内mutex、同一directoryの一時ファイル、flush/fsync、backup、atomic replaceを使用します。Windowsの一時的なWinError 5/32はbounded retryで内部復旧し、復旧できた場合はダイアログを表示しません。
+
+詳細: [Ver1.1 credit/recovery/storage実装記録](docs/v11-credit-recovery-storage.md)
+
 ## Unit 0資料
 
 - [開発ルール](docs/DEVELOPMENT_RULES.md)
@@ -91,6 +101,7 @@ docs/        調査・設計資料
 - [v0.1.2認証Retrospective](docs/v012-auth-retrospective.md)
 - [GNBプリセット復元記録](docs/v013-preset-restoration.md)
 - [Ver1.0機能修正記録](docs/v10-critical-function-fix.md)
+- [Ver1.1 credit/recovery/storage実装記録](docs/v11-credit-recovery-storage.md)
 - [Release artifact記録](docs/release-artifact-history.md)
 
 ## Buildとライセンス
