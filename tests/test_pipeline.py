@@ -188,6 +188,62 @@ def test_selected_preset_is_snapshotted_and_switch_changes_generation_text(tmp_p
     assert prompts == ["プリセットA本文", "プリセットB本文"]
 
 
+def test_preset_edit_after_job_start_does_not_change_running_job_snapshot(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    first = Job("lesson-a.txt")
+    second = Job("lesson-b.txt")
+    jobs = MemoryJobs(first)
+    notebook = FakeNotebookAdapter(
+        {first.source_path: fixture, second.source_path: fixture},
+        status_by_job={first.id: "WAITING"},
+    )
+    old = Preset("preset", "Preset", "body before edit", "created", "updated")
+    instance = coordinator(tmp_path, jobs, notebook, preset=old)
+    instance.scheduler = PersistentPollScheduler(jobs, first_poll_seconds=600)
+
+    instance.run_cycle()
+    running = jobs.get(first.id)
+    assert running.state is JobState.WAITING_VIDEO
+    assert running.generation_prompt == "body before edit"
+
+    instance.generation_preset = Preset(
+        "preset", "Preset", "body after edit", "created", "updated-2"
+    )
+    jobs.save(second)
+    instance.run_cycle()
+
+    assert jobs.get(first.id).generation_prompt == "body before edit"
+    assert jobs.get(second.id).generation_prompt == "body after edit"
+    assert notebook.submitted_prompts == ["body before edit", "body after edit"]
+
+
+def test_multi_job_same_preset_preserves_job_identity_and_prompt(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    jobs_to_run = [Job(f"lesson-{number}.txt") for number in range(3)]
+    jobs = MemoryJobs(*jobs_to_run)
+    notebook = FakeNotebookAdapter(
+        {job.source_path: fixture for job in jobs_to_run}
+    )
+    preset = Preset("shared", "Shared", "same preset body", "created", "updated")
+
+    coordinator(tmp_path, jobs, notebook, preset=preset).run_cycle()
+
+    completed = jobs.list()
+    assert {job.id for job in completed} == {job.id for job in jobs_to_run}
+    assert all(job.state is JobState.COMPLETED for job in completed)
+    assert all(job.preset_id == "shared" for job in completed)
+    assert all(job.generation_prompt == "same preset body" for job in completed)
+    assert {Path(job.raw_path).stem for job in completed} == {
+        Path(job.source_path).stem for job in completed
+    }
+    assert {Path(job.zip_path).stem for job in completed} == {
+        Path(job.source_path).stem for job in completed
+    }
+    assert set(notebook.artifact_delete_calls) == {job.id for job in jobs_to_run}
+
+
 def test_waiting_notebook_does_not_block_raw_ready_job(tmp_path):
     fixture = tmp_path / "fixture.mp4"
     fixture.write_bytes(b"video")
