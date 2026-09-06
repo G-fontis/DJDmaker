@@ -12,7 +12,10 @@ ACTIVE_STATES = frozenset(
     {
         JobState.UPLOADING,
         JobState.CREDIT_EXHAUSTED,
+        JobState.RESERVED_WAITING_CREDIT_RESET,
+        JobState.RECOVERY_PENDING,
         JobState.GENERATING,
+        JobState.WAITING_VIDEO,
         JobState.DOWNLOAD_PENDING,
         JobState.DOWNLOADING,
         JobState.ENDING,

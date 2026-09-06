@@ -324,9 +324,9 @@ def test_credit_ui_shows_unknown_and_exact_percent(tmp_path: Path) -> None:
             "credit_reset_at": None,
         }
     )
-    assert window.credit_state_label.text() == "クレジット状態: CREDIT_UNKNOWN"
+    assert window.credit_state_label.text() == "取得不可  /  CREDIT_UNKNOWN"
     assert window.credit_percent_label.text() == "クレジット残量: 取得不可"
-    assert window.credit_reset_label.text() == "リセット時刻: －"
+    assert window.credit_reset_label.text() == "リセット予定: －"
 
     reset_at = "2026-09-08T14:30:00+09:00"
     window._apply_runtime_status(
@@ -336,9 +336,9 @@ def test_credit_ui_shows_unknown_and_exact_percent(tmp_path: Path) -> None:
             "credit_reset_at": reset_at,
         }
     )
-    assert window.credit_state_label.text() == "クレジット状態: CREDIT_AVAILABLE"
+    assert window.credit_state_label.text() == "利用可能  /  CREDIT_AVAILABLE"
     assert window.credit_percent_label.text() == "クレジット残量: 72%"
-    assert window.credit_reset_label.text() == f"リセット時刻: {reset_at}"
+    assert window.credit_reset_label.text() == f"リセット予定: {reset_at}"
     window.close()
 
 

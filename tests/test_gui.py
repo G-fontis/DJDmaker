@@ -8,7 +8,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QThreadPool
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from djd_maker.core.models import Job, JobState
 from djd_maker.core.settings import AppSettings
@@ -121,20 +121,24 @@ def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
     assert window.CREDIT == "Created by 福ゼミ塾長"
-    assert window.job_table.columnCount() == 6
-    assert [window.job_table.horizontalHeaderItem(i).text() for i in range(6)] == list(window.JOB_COLUMNS)
+    assert window.job_table.columnCount() == 8
+    assert [window.job_table.horizontalHeaderItem(i).text() for i in range(8)] == list(window.JOB_COLUMNS)
     assert window.job_table.item(0, 1).text() == "日本語の台本"
     assert window.total_label.text() == "全Job: 1"
     assert window.zip_complete_label.text() == "ZIP完了: 1/1"
     assert window.completion_group.isVisibleTo(window)
-    root_layout = window.centralWidget().layout()
-    controls_layout = root_layout.itemAt(4).layout()
-    assert [controls_layout.itemAt(index).widget() for index in range(9)] == [
+    controls_layout = window.sidebar.layout()
+    button_widgets = [
+        controls_layout.itemAt(index).widget()
+        for index in range(controls_layout.count())
+        if isinstance(controls_layout.itemAt(index).widget(), QPushButton)
+    ]
+    assert button_widgets == [
         window.settings_button,
         window.login_button,
         window.start_button,
-        window.recover_button,
         window.reload_button,
+        window.recover_button,
         window.pause_button,
         window.stop_button,
         window.log_button,

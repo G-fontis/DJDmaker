@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Protocol
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -30,6 +30,7 @@ from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.settings import AppSettings
 
 from .viewmodels import LogRecord, safe_existing_file
+from .hud import PALETTE, apply_hud_theme
 
 
 def open_local_path(path: Path, *, parent: QWidget | None = None) -> bool:
@@ -66,6 +67,7 @@ class PresetDialog(QDialog):
         prompt_text: str = "",
     ) -> None:
         super().__init__(parent)
+        apply_hud_theme(self)
         self.setWindowTitle("動画生成プリセット")
         self.resize(620, 430)
         self.name_edit = QLineEdit(name)
@@ -106,6 +108,7 @@ class SettingsDialog(QDialog):
         preset_repository: PresetRepositoryPort | None = None,
     ) -> None:
         super().__init__(parent)
+        apply_hud_theme(self)
         self.preset_repository = preset_repository
         self.setWindowTitle("設定")
         self.setMinimumWidth(620)
@@ -317,6 +320,7 @@ class JobDetailDialog(QDialog):
 
     def __init__(self, job: Job, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        apply_hud_theme(self)
         self.job = job
         self.setWindowTitle(f"ジョブ詳細 - {job.script_name}")
         self.setMinimumWidth(680)
@@ -332,6 +336,18 @@ class JobDetailDialog(QDialog):
         form.addRow("生成開始", QLabel(job.generation_started_at or "－"))
         form.addRow("最終確認", QLabel(job.last_polled_at or "－"))
         form.addRow("次回確認", QLabel(job.next_poll_at or "－"))
+        form.addRow("Credit状態", QLabel(job.credit_state or "CREDIT_UNKNOWN"))
+        form.addRow(
+            "Credit残量",
+            QLabel("取得不可" if job.credit_percent is None else f"{job.credit_percent}%"),
+        )
+        form.addRow("Credit reset", QLabel(job.credit_reset_at or "－"))
+        form.addRow("予約作成", QLabel(job.reservation_created_at or "－"))
+        form.addRow("生成予定", QLabel(job.expected_generation_after or "－"))
+        form.addRow("artifact状態", QLabel(job.artifact_status or "－"))
+        form.addRow("download状態", QLabel(job.download_status or "－"))
+        form.addRow("RAW状態", QLabel(job.raw_status or "－"))
+        form.addRow("Recovery試行", QLabel(str(job.recovery_retry_count)))
         form.addRow("RAW", QLabel(job.raw_path or "－"))
         form.addRow("RAW size", QLabel(str(job.raw_size_bytes) if job.raw_size_bytes is not None else "－"))
         form.addRow("duration", QLabel(str(job.duration_seconds) if job.duration_seconds is not None else "－"))
@@ -422,6 +438,7 @@ class LogDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        apply_hud_theme(self)
         self.setWindowTitle("実行ログ")
         self.resize(1000, 520)
         layout = QVBoxLayout(self)
@@ -441,6 +458,7 @@ class LogDialog(QDialog):
         self.table = QTableView()
         self.table.setModel(self.proxy)
         self.table.setSortingEnabled(True)
+        self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -454,9 +472,16 @@ class LogDialog(QDialog):
         if not isinstance(record, LogRecord):
             record = LogRecord("", message=str(record))
         value = record.sanitized()
-        self.model.appendRow([QStandardItem(text) for text in (
+        items = [QStandardItem(text) for text in (
             value.timestamp, value.job_id, value.engine, value.stage, value.level, value.message
-        )])
+        )]
+        level_color = {
+            "WARNING": PALETTE["warning"],
+            "ERROR": PALETTE["error"],
+            "INFO": PALETTE["cyan"],
+        }.get(value.level.upper(), PALETTE["text"])
+        items[4].setForeground(QBrush(QColor(level_color)))
+        self.model.appendRow(items)
 
     def _update_filter(self) -> None:
         self.proxy.criteria = [edit.text().strip() for edit in self.filter_edits]

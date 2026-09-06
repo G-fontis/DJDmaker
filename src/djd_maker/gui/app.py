@@ -23,6 +23,7 @@ from djd_maker.orchestration.scheduler import PersistentPollScheduler
 from djd_maker.packaging.preflight import application_root
 
 from .controller import AsyncControllerBridge
+from .hud import HUD_STYLESHEET
 from .main_window import MainWindow
 
 
@@ -41,6 +42,7 @@ def build_desktop(
 
     root = app_root.resolve()
     application = qt_app or QApplication.instance() or QApplication(sys.argv)
+    application.setStyleSheet(HUD_STYLESHEET)
     settings_repository = SettingsRepository(root / "system" / "settings.json")
     preset_repository = PresetRepository(root / "system" / "presets.json")
     job_repository = JobRepository(root / "system" / "jobs")
