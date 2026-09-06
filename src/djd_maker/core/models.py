@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -53,6 +54,10 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def preset_body_sha256(prompt_text: str) -> str:
+    return sha256(prompt_text.encode("utf-8")).hexdigest()
+
+
 @dataclass(slots=True)
 class DownloadSafetyGate:
     """NotebookLM側の削除許可に必要な全検証結果。"""
@@ -101,6 +106,10 @@ class Job:
     notebook_url: str | None = None
     preset_id: str | None = None
     preset_name: str | None = None
+    preset_body_snapshot: str | None = None
+    preset_body_sha256: str | None = None
+    # Kept for v0.1.3 job JSON compatibility. Production generation reads
+    # preset_body_snapshot only and never treats this field as a fallback.
     generation_prompt: str | None = None
     generation_started_at: str | None = None
     next_poll_at: str | None = None
@@ -134,6 +143,21 @@ class Job:
             raise InvalidStateTransition(f"{self.state} -> {target} is not allowed")
         self.state = target
         self.updated_at = utc_now()
+
+    def snapshot_preset(self, preset: Preset) -> None:
+        self.preset_id = preset.id
+        self.preset_name = preset.name
+        self.preset_body_snapshot = preset.prompt_text
+        self.preset_body_sha256 = preset_body_sha256(preset.prompt_text)
+        self.generation_prompt = preset.prompt_text
+
+    def require_preset_body_snapshot(self) -> str:
+        snapshot = self.preset_body_snapshot
+        if snapshot is None or not snapshot.strip():
+            raise ValueError("PRESET_SNAPSHOT_MISSING")
+        if self.preset_body_sha256 != preset_body_sha256(snapshot):
+            raise ValueError("PRESET_SNAPSHOT_HASH_MISMATCH")
+        return snapshot
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

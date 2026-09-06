@@ -228,7 +228,7 @@ def test_settings_dialog_manages_and_persists_selected_preset(tmp_path: Path, mo
     )
     dialog._delete_preset()
     assert repository.selected().name == "通常講義・改"  # type: ignore[union-attr]
-    assert PresetRepository(tmp_path / "system" / "presets.json").selected() is not None
+    assert PresetRepository(tmp_path / "system" / "presets.json").selected() is None
 
 
 def test_job_detail_enables_only_safe_actions(tmp_path: Path) -> None:

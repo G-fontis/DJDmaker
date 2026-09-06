@@ -8,16 +8,16 @@
 
 元GUIは選択preset本文を「今回使用する文章」へ読み込み、batch開始時にその編集内容をsnapshotする。動画生成では`VIDEO_OVERVIEW_CREATE`で「動画解説をカスタマイズ」を開き、`VIDEO_CUSTOM_TOPIC`の「この動画で重視するポイントは何ですか？」へ本文を`fill`した後、即時生成ボタンを押す。
 
-最新GNBは選択ID自体をsettingsへ保存しておらず、再起動時は名前順先頭がQComboBoxで暗黙選択される。今回の確定要件に従い、DJDmakerでは選択IDを明示保存して同じpresetを復元する。
+最新GNBは選択ID自体をsettingsへ保存しておらず、再起動時は名前順先頭がQComboBoxで暗黙選択される。CRITICAL補正後のDJDmakerではpreset一覧だけを保存し、選択IDはprocess内だけに保持する。起動時は必ず未選択とし、前回値や名前順先頭を暗黙選択しない。
 
 ## DJDmakerへの移植
 
-- `system/presets.json`へversioned envelope、preset一覧、`selected_preset_id`を保存する。
+- `system/presets.json`へversioned envelopeとpreset一覧を保存する。旧ファイルの`selected_preset_id`は起動時に無視し、次回保存時にnullへ移行する。選択はprocess内だけに保持する。
 - 既存JSON層のprocess内RLock、temporary file、flush/fsync、atomic `os.replace`、backup/recovery、bounded transient retryを再利用する。preset保存用lock fileは作らない。
 - 設定画面へ「動画生成プリセット」、選択、新規登録、編集、複製、削除を追加する。
 - default presetは新設しない。未登録・未選択時はNotebook作成前に「動画生成プリセットを登録・選択してください。」で停止する。
 - Start時の選択presetをpipelineへ渡し、各jobのpreset ID、名前、本文をJSONへsnapshotする。
-- TXT uploadとsource ready確認後、動画解説カスタムトピックへsnapshot本文を入力し、その後に生成を開始する。
+- TXT uploadとsource ready確認後、動画解説カスタムトピックへsnapshot本文を入力する。DOMからreadbackして完全一致した場合だけ生成を開始し、不一致は`PRESET_APPLY_MISMATCH`で停止する。
 - preset変更は次回Startから反映し、実行中jobのsnapshotは変更しない。
 
 ## 他のGNB GUI・設定機能の欠落監査

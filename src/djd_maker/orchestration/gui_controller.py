@@ -115,6 +115,11 @@ class GuiPipelineController:
                 self._paused = False
                 self.scheduler.resume()
                 return self.status()
+            # A completed run owns a pipeline assembled with that run's preset
+            # snapshot and browser page. Recompose on every new Start so a GUI
+            # selection/edit made between runs cannot reuse stale preset data.
+            if self.pipeline_factory is not None:
+                self.pipeline = None
             self._paused = False
             self._stop_event.clear()
             self._phase = "preflight" if self.pipeline_factory is not None else "processing"

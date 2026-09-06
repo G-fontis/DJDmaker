@@ -8,6 +8,8 @@ from djd_maker.core.models import (
     InvalidStateTransition,
     Job,
     JobState,
+    Preset,
+    preset_body_sha256,
 )
 
 
@@ -46,9 +48,25 @@ def test_invalid_transition_fails_closed() -> None:
 
 def test_job_json_round_trip_preserves_gate() -> None:
     original = Job("SD001.txt", safety_gate=passing_gate())
+    original.snapshot_preset(Preset("p", "Preset", "body", "created", "updated"))
     restored = Job.from_dict(original.to_dict())
     assert restored.to_dict() == original.to_dict()
     assert restored.safety_gate.remote_deletion_allowed
+    assert restored.require_preset_body_snapshot() == "body"
+    assert restored.preset_body_sha256 == preset_body_sha256("body")
+
+
+def test_preset_snapshot_rejects_missing_or_tampered_hash() -> None:
+    with pytest.raises(ValueError, match="PRESET_SNAPSHOT_MISSING"):
+        Job("lesson.txt", generation_prompt="must not be a fallback").require_preset_body_snapshot()
+
+    job = Job(
+        "lesson.txt",
+        preset_body_snapshot="selected body",
+        preset_body_sha256=preset_body_sha256("other body"),
+    )
+    with pytest.raises(ValueError, match="PRESET_SNAPSHOT_HASH_MISMATCH"):
+        job.require_preset_body_snapshot()
 
 
 def test_remote_deletion_requires_every_check() -> None:
@@ -60,4 +78,3 @@ def test_remote_deletion_requires_every_check() -> None:
 
 def test_remote_deletion_accepts_complete_gate() -> None:
     require_remote_deletion_gate(passing_gate())
-

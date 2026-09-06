@@ -9,7 +9,7 @@ from zipfile import ZIP_STORED, ZipFile
 import pytest
 
 from djd_maker.core.interfaces import HlsResult, MediaResult, RemoteDeletionDenied
-from djd_maker.core.models import DownloadSafetyGate, Job, JobState
+from djd_maker.core.models import DownloadSafetyGate, Job, JobState, Preset
 from djd_maker.core.repositories import JobRepository
 from djd_maker.orchestration.gui_controller import GuiPipelineController
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
@@ -130,6 +130,9 @@ def pipeline(
             tmp_path / "output",
             tmp_path / "work",
             ending,
+        ),
+        generation_preset=Preset(
+            "test-preset", "Test preset", "test body", "created", "updated"
         ),
     )
 

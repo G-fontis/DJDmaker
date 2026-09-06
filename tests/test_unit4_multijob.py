@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
 
 from djd_maker.core.interfaces import HlsResult, MediaResult
-from djd_maker.core.models import DownloadSafetyGate, Job, JobState
+from djd_maker.core.models import DownloadSafetyGate, Job, JobState, Preset
 from djd_maker.core.repositories import JobRepository
 from djd_maker.core.settings import AppSettings
 from djd_maker.gui.app import _resolved
@@ -163,6 +163,9 @@ def make_pipeline(
             ),
             ffmpeg_concurrency=2,
             scheduler=scheduler,
+            generation_preset=Preset(
+                "test-preset", "Test preset", "test body", "created", "updated"
+            ),
         ),
         ending_engine,
         hls_engine,

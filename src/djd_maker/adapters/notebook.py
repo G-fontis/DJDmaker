@@ -10,11 +10,15 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from djd_maker.core.interfaces import require_remote_deletion_gate
-from djd_maker.core.models import DownloadSafetyGate, Job
+from djd_maker.core.models import DownloadSafetyGate, Job, preset_body_sha256
 from djd_maker.media.validator import VideoValidator
 
 
 class NotebookAdapterError(RuntimeError):
+    pass
+
+
+class PresetApplyMismatchError(NotebookAdapterError):
     pass
 
 
@@ -437,9 +441,30 @@ class NotebookDomAdapter:
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
         self._first_visible(VIDEO_CREATE, "Video Overview作成").click()
-        self._first_visible(
+        topic = self._first_visible(
             VIDEO_CUSTOM_TOPIC, "動画解説のカスタムトピック欄"
-        ).fill(prompt)
+        )
+        self.diagnostic(
+            "PRESET_APPLY_EXPECTED:"
+            f"sha256={preset_body_sha256(prompt)},length={len(prompt)}"
+        )
+        topic.fill(prompt)
+        try:
+            readback = topic.input_value()
+        except Exception as exc:
+            self.diagnostic("PRESET_APPLY_MISMATCH:readback_failed")
+            raise PresetApplyMismatchError(
+                "PRESET_APPLY_MISMATCH: preset DOM readback failed"
+            ) from exc
+        self.diagnostic(
+            "PRESET_APPLY_READBACK:"
+            f"sha256={preset_body_sha256(readback)},length={len(readback)}"
+        )
+        if readback != prompt:
+            self.diagnostic("PRESET_APPLY_MISMATCH:value_differs")
+            raise PresetApplyMismatchError(
+                "PRESET_APPLY_MISMATCH: preset snapshot and DOM readback differ"
+            )
         self._first_visible(VIDEO_GENERATE, "動画生成ボタン").click()
 
     def inspect_status(self) -> RemoteVideoStatus:
@@ -727,9 +752,10 @@ class NotebookEngineAdapter:
         self.recover_page = recover_page
 
     def submit(self, job: Job) -> tuple[str, str]:
-        prompt = job.generation_prompt or ""
-        if not prompt.strip():
-            raise NotebookAdapterError("動画生成プリセットが設定されていません")
+        try:
+            prompt = job.require_preset_body_snapshot()
+        except ValueError as exc:
+            raise NotebookAdapterError(str(exc)) from exc
         metadata = self.dom.create_notebook()
         self.dom.rename_notebook(job.script_name)
         self.dom.upload_txt(Path(job.source_path))

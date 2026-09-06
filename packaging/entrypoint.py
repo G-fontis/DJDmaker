@@ -57,7 +57,7 @@ def _browser_smoke(report_path: Path) -> int:
 
 
 def _preset_smoke(report_path: Path) -> int:
-    """Verify packaged preset CRUD, selection and restart persistence."""
+    """Verify packaged preset CRUD and process-local blank startup selection."""
     if os.environ.get("DJD_PACKAGING_SMOKE") != "1":
         return 3
     from djd_maker.core.repositories import PresetRepository
@@ -71,16 +71,15 @@ def _preset_smoke(report_path: Path) -> int:
     selected = restarted.selected()
     passed = (
         [item.id for item in restarted.list()] == [first.id, second.id]
-        and selected is not None
-        and selected.id == second.id
-        and selected.prompt_text == "preset body B"
+        and selected is None
     )
     report_path.write_text(
         json.dumps(
             {
                 "passed": passed,
                 "preset_count": len(restarted.list()),
-                "selected_preset": selected.name if selected else None,
+                "selected_preset": None,
+                "selection_reset_on_restart": selected is None,
             },
             ensure_ascii=False,
         ),

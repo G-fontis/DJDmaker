@@ -25,6 +25,8 @@
 - Pre-flight全項目がPASSするまでNotebook作成、source投入、動画生成を開始しない。
 - 元GNB Creatorの動画生成presetは、選択本文をjobへスナップショットし、生成開始前にNotebookLMの動画解説カスタムトピック欄へ入力する。管理UIだけを実装して生成経路へ接続しない状態をPASSにしない。
 - preset JSONはsettingsと同じprocess内mutex、temporary、flush/fsync、atomic replace、backup/recoveryを使い、保存用lock fileへ依存させない。
+- preset一覧は保存するが選択IDはprocess内だけに保持し、アプリ起動時は必ず未選択にする。Start時に未選択ならNotebook作成前に停止し、default・test・前回値へfallbackしない。
+- job開始時にpreset ID、名前、本文snapshot、本文SHA-256を保存する。Notebookのcustom topicへsnapshot本文をfillした直後にDOM readbackを行い、完全一致しない場合は`PRESET_APPLY_MISMATCH`で生成ボタンを押さず停止する。
 
 ## EXE Build Cleanup
 

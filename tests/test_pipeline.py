@@ -5,7 +5,13 @@ from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
 
 from djd_maker.core.interfaces import HlsResult, MediaResult
-from djd_maker.core.models import DownloadSafetyGate, Job, JobState, Preset
+from djd_maker.core.models import (
+    DownloadSafetyGate,
+    Job,
+    JobState,
+    Preset,
+    preset_body_sha256,
+)
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
 from djd_maker.orchestration.scheduler import PersistentPollScheduler
 from djd_maker.testing.fake_notebook import FakeNotebookAdapter
@@ -103,7 +109,8 @@ def coordinator(tmp_path, jobs, notebook, ending=None, preset=None):
             ending_file,
         ),
         ffmpeg_concurrency=2,
-        generation_preset=preset,
+        generation_preset=preset
+        or Preset("test-preset", "Test preset", "test body", "created", "updated"),
     )
 
 
@@ -183,6 +190,8 @@ def test_selected_preset_is_snapshotted_and_switch_changes_generation_text(tmp_p
         saved = jobs.get(job.id)
         assert saved.preset_id == key
         assert saved.preset_name == f"Preset {key}"
+        assert saved.preset_body_snapshot == body
+        assert saved.preset_body_sha256 == preset_body_sha256(body)
         assert saved.generation_prompt == body
         prompts.extend(notebook.submitted_prompts)
     assert prompts == ["プリセットA本文", "プリセットB本文"]
@@ -205,6 +214,8 @@ def test_preset_edit_after_job_start_does_not_change_running_job_snapshot(tmp_pa
     instance.run_cycle()
     running = jobs.get(first.id)
     assert running.state is JobState.WAITING_VIDEO
+    assert running.preset_body_snapshot == "body before edit"
+    assert running.preset_body_sha256 == preset_body_sha256("body before edit")
     assert running.generation_prompt == "body before edit"
 
     instance.generation_preset = Preset(
@@ -215,6 +226,8 @@ def test_preset_edit_after_job_start_does_not_change_running_job_snapshot(tmp_pa
 
     assert jobs.get(first.id).generation_prompt == "body before edit"
     assert jobs.get(second.id).generation_prompt == "body after edit"
+    assert jobs.get(first.id).preset_body_snapshot == "body before edit"
+    assert jobs.get(second.id).preset_body_snapshot == "body after edit"
     assert notebook.submitted_prompts == ["body before edit", "body after edit"]
 
 
@@ -234,6 +247,11 @@ def test_multi_job_same_preset_preserves_job_identity_and_prompt(tmp_path):
     assert {job.id for job in completed} == {job.id for job in jobs_to_run}
     assert all(job.state is JobState.COMPLETED for job in completed)
     assert all(job.preset_id == "shared" for job in completed)
+    assert all(job.preset_body_snapshot == "same preset body" for job in completed)
+    assert all(
+        job.preset_body_sha256 == preset_body_sha256("same preset body")
+        for job in completed
+    )
     assert all(job.generation_prompt == "same preset body" for job in completed)
     assert {Path(job.raw_path).stem for job in completed} == {
         Path(job.source_path).stem for job in completed
@@ -242,6 +260,42 @@ def test_multi_job_same_preset_preserves_job_identity_and_prompt(tmp_path):
         Path(job.source_path).stem for job in completed
     }
     assert set(notebook.artifact_delete_calls) == {job.id for job in jobs_to_run}
+
+
+def test_unselected_preset_has_no_internal_fallback_and_creates_no_notebook(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    job = Job("lesson.txt", generation_prompt="legacy internal prompt")
+    jobs = MemoryJobs(job)
+    notebook = FakeNotebookAdapter({job.source_path: fixture})
+    instance = coordinator(tmp_path, jobs, notebook)
+    instance.generation_preset = None
+
+    instance.run_cycle()
+
+    failed = jobs.get(job.id)
+    assert failed.state is JobState.FAILED
+    assert failed.error_code == "NOTEBOOK_STAGE_FAILED"
+    assert "PRESET_NOT_SELECTED" in failed.error_message
+    assert notebook.submit_calls == []
+
+
+def test_dom_preset_mismatch_is_preserved_as_specific_job_error(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    job = Job("lesson.txt")
+    jobs = MemoryJobs(job)
+
+    class MismatchNotebook(FakeNotebookAdapter):
+        def submit(self, job):
+            raise RuntimeError("PRESET_APPLY_MISMATCH: DOM value differs")
+
+    notebook = MismatchNotebook({job.source_path: fixture})
+    coordinator(tmp_path, jobs, notebook).run_cycle()
+
+    failed = jobs.get(job.id)
+    assert failed.state is JobState.FAILED
+    assert failed.error_code == "PRESET_APPLY_MISMATCH"
 
 
 def test_waiting_notebook_does_not_block_raw_ready_job(tmp_path):

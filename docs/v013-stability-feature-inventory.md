@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | GNB-01 | GNBCreator | 専用Chrome profileとGoogle認証session | B | `BrowserManager`の通常Chrome AUTHから同一profileのautomation Chromeへhandoffする。 |
 | GNB-02 | GNBCreator | Notebook作成、rename、TXT source upload、source ready待機 | A | `NotebookDomAdapter` / `NotebookEngineAdapter`。titleとsourceはDOM readbackする。 |
-| GNB-03 | GNBCreator | 生成文章presetのCRUD、選択、再起動復元 | A | `PresetRepository`と`SettingsDialog`。選択IDも明示保存する。 |
+| GNB-03 | GNBCreator | 生成文章presetのCRUDと起動単位の明示選択 | A | `PresetRepository`と`SettingsDialog`。一覧は保存するが選択はprocess内だけとし、起動時は必ず空にする。 |
 | GNB-04 | GNBCreator | 選択preset本文を動画カスタムtopicへ送信 | A | job開始時に`generation_prompt`へsnapshotし、`VIDEO_CUSTOM_TOPIC`へfill後に生成する。 |
 | GNB-05 | GNBCreator | 生成完了監視と生成中・予約・失敗の区別 | A | playable video artifactを完成根拠とし、永続scheduler deadlineでpollする。 |
 | GNB-06 | GNBCreator | 対象artifactの一意なdownload | A | jobのNotebook identityと対象video cardを照合し、job専用download directoryへ保存する。 |

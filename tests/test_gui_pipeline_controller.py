@@ -13,7 +13,8 @@ from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication
 
 from djd_maker.core.interfaces import HlsResult, MediaResult
-from djd_maker.core.models import DownloadSafetyGate, Job, JobState
+from djd_maker.core.models import DownloadSafetyGate, Job, JobState, Preset
+from djd_maker.core.repositories import PresetRepository
 from djd_maker.core.settings import AppSettings
 from djd_maker.gui.controller import AsyncControllerBridge
 from djd_maker.gui.main_window import MainWindow
@@ -197,6 +198,47 @@ def test_successful_preflight_discovers_input_without_reload_operation(tmp_path:
     assert repository.list()[0].state is JobState.COMPLETED
 
 
+def test_each_new_start_recomposes_pipeline_for_current_selected_preset(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "first.txt").write_text("first", encoding="utf-8")
+    repository = MemoryJobs()
+    scheduler = PersistentPollScheduler(repository)
+    presets = PresetRepository(tmp_path / "system" / "presets.json")
+    selected = presets.create("Selected preset", "preset body A")
+    factory_bodies: list[str] = []
+
+    def pipeline_factory():
+        factory_bodies.append(presets.require_selected().prompt_text)
+        return Pipeline(repository)
+
+    instance = GuiPipelineController(
+        jobs=repository,
+        settings=AppSettings(input_directory="input"),
+        app_root=tmp_path,
+        pipeline=None,
+        pipeline_factory=pipeline_factory,
+        scheduler=scheduler,
+        cycle_interval_seconds=0.01,
+    )
+
+    instance.start()
+    deadline = time.monotonic() + 2
+    while instance.status()["running"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    presets.update(selected.id, "Selected preset", "preset body B")
+    (input_dir / "second.txt").write_text("second", encoding="utf-8")
+    instance.start()
+    deadline = time.monotonic() + 2
+    while instance.status()["running"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    instance.shutdown()
+
+    assert factory_bodies == ["preset body A", "preset body B"]
+    assert all(job.state is JobState.COMPLETED for job in repository.list())
+
+
 def test_browser_lifecycle_status_is_logged_without_credentials(tmp_path: Path) -> None:
     instance, _repository, _pipeline, _scheduler = controller(tmp_path)
     records: list[object] = []
@@ -305,6 +347,9 @@ def test_fake_notebook_runs_through_gui_bridge_to_completed_zip(tmp_path: Path) 
             tmp_path / "raw_files", tmp_path / "output", tmp_path / "work", ending
         ),
         scheduler=scheduler,
+        generation_preset=Preset(
+            "test-preset", "Test preset", "test body", "created", "updated"
+        ),
     )
     service = GuiPipelineController(
         jobs=jobs,

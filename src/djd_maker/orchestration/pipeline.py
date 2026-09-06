@@ -153,10 +153,9 @@ class PipelineCoordinator:
             return
         try:
             if job.state is JobState.WAITING:
-                if self.generation_preset is not None:
-                    job.preset_id = self.generation_preset.id
-                    job.preset_name = self.generation_preset.name
-                    job.generation_prompt = self.generation_preset.prompt_text
+                if self.generation_preset is None:
+                    raise RuntimeError("PRESET_NOT_SELECTED")
+                job.snapshot_preset(self.generation_preset)
                 self._transition(job, JobState.UPLOADING)
                 notebook_id, notebook_url = self.notebook.submit(job)
                 job.notebook_id = notebook_id
@@ -231,7 +230,10 @@ class PipelineCoordinator:
                 job.error_code = "DOWNLOAD_VERIFY_FAILED"
                 self._transition(job, JobState.DOWNLOAD_VERIFY_FAILED)
             elif job.state not in {JobState.FAILED, JobState.COMPLETED}:
-                job.error_code = job.error_code or "NOTEBOOK_STAGE_FAILED"
+                if str(exc).startswith("PRESET_APPLY_MISMATCH"):
+                    job.error_code = "PRESET_APPLY_MISMATCH"
+                else:
+                    job.error_code = job.error_code or "NOTEBOOK_STAGE_FAILED"
                 self._transition(job, JobState.FAILED)
 
     def _run_media_job(self, job: Job) -> None:
@@ -369,6 +371,8 @@ class PipelineCoordinator:
             notebook_url=previous.notebook_url,
             preset_id=previous.preset_id,
             preset_name=previous.preset_name,
+            preset_body_snapshot=previous.preset_body_snapshot,
+            preset_body_sha256=previous.preset_body_sha256,
             generation_prompt=previous.generation_prompt,
             raw_path=previous.raw_path,
             edited_path=previous.edited_path,

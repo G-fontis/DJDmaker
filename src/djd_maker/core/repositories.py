@@ -305,6 +305,9 @@ class PresetRepository:
             use_file_lock=False,
             replace_retry_delays=self.REPLACE_RETRY_DELAYS,
         )
+        # Selection is deliberately process-local. Every application launch
+        # starts blank so an old run can never silently choose a prompt.
+        self._selected_preset_id: str | None = None
 
     @staticmethod
     def _default() -> dict[str, Any]:
@@ -355,10 +358,8 @@ class PresetRepository:
         return next((item for item in self.list() if item.id == preset_id), None)
 
     def selected(self) -> Preset | None:
-        document = self._document.load(self._default())
-        selected_id = document.get("selected_preset_id")
         return next(
-            (item for item in self._presets(document) if item.id == selected_id),
+            (item for item in self.list() if item.id == self._selected_preset_id),
             None,
         )
 
@@ -377,11 +378,12 @@ class PresetRepository:
             if any(item.name.casefold() == clean_name.casefold() for item in presets):
                 raise DuplicatePresetNameError(clean_name)
             document["presets"] = [item.to_dict() for item in (*presets, created)]
-            if document.get("selected_preset_id") is None:
-                document["selected_preset_id"] = created.id
+            document["selected_preset_id"] = None
             return document
 
         self._document.update(self._default(), change)
+        if self._selected_preset_id is None:
+            self._selected_preset_id = created.id
         return created
 
     def update(self, preset_id: str, name: str, prompt_text: str) -> Preset:
@@ -409,6 +411,7 @@ class PresetRepository:
             document["presets"] = [
                 (changed if item.id == preset_id else item).to_dict() for item in presets
             ]
+            document["selected_preset_id"] = None
             return document
 
         self._document.update(self._default(), change)
@@ -425,21 +428,18 @@ class PresetRepository:
                 key=lambda item: (item.name.casefold(), item.id),
             )
             document["presets"] = [item.to_dict() for item in remaining]
-            if document.get("selected_preset_id") == preset_id:
-                document["selected_preset_id"] = remaining[0].id if remaining else None
+            document["selected_preset_id"] = None
             return document
 
         self._document.update(self._default(), change)
+        if self._selected_preset_id == preset_id:
+            remaining = self.list()
+            self._selected_preset_id = remaining[0].id if remaining else None
 
     def select(self, preset_id: str | None) -> None:
-        def change(document: dict[str, Any]) -> dict[str, Any]:
-            presets = self._presets(document)
-            if preset_id is not None and not any(item.id == preset_id for item in presets):
-                raise PresetNotFoundError(preset_id)
-            document["selected_preset_id"] = preset_id
-            return document
-
-        self._document.update(self._default(), change)
+        if preset_id is not None and self.get(preset_id) is None:
+            raise PresetNotFoundError(preset_id)
+        self._selected_preset_id = preset_id
 
     def duplicate(self, preset_id: str) -> Preset:
         original = self.get(preset_id)

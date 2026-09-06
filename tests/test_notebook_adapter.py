@@ -11,11 +11,12 @@ from djd_maker.adapters.notebook import (
     NotebookDomAdapter,
     NotebookEngineAdapter,
     PlaywrightArtifactDownload,
+    PresetApplyMismatchError,
     RemoteVideoStatus,
     ResumeMetadata,
 )
 from djd_maker.core.interfaces import RemoteDeletionDenied
-from djd_maker.core.models import DownloadSafetyGate
+from djd_maker.core.models import DownloadSafetyGate, preset_body_sha256
 
 
 # Minimal, secret-free extraction from GNBCreator's saved live diagnostic:
@@ -554,8 +555,14 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
 
     from djd_maker.core.models import Job
 
+    prompt = "選択したプリセット本文"
     result = NotebookEngineAdapter(Dom()).submit(
-        Job(str(source), generation_prompt="選択したプリセット本文")
+        Job(
+            str(source),
+            preset_body_snapshot=prompt,
+            preset_body_sha256=preset_body_sha256(prompt),
+            generation_prompt="ignored legacy prompt",
+        )
     )
     assert result[0] == "id"
     assert events == [
@@ -569,6 +576,41 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
 
 def test_video_generation_fills_selected_preset_before_generate_click():
     events = []
+    diagnostics = []
+
+    class Node:
+        def __init__(self, name):
+            self.name = name
+            self.value = ""
+
+        def click(self):
+            events.append(("click", self.name))
+
+        def fill(self, value):
+            self.value = value
+            events.append(("fill", self.name, value))
+
+        def input_value(self):
+            return self.value
+
+    adapter = NotebookDomAdapter(object(), diagnostic=diagnostics.append)
+    adapter._first_visible = lambda _selectors, name: Node(name)  # type: ignore[method-assign]
+    adapter.start_video_generation("プリセットAの本文")
+    assert events == [
+        ("click", "Video Overview作成"),
+        ("fill", "動画解説のカスタムトピック欄", "プリセットAの本文"),
+        ("click", "動画生成ボタン"),
+    ]
+    assert diagnostics == [
+        "PRESET_APPLY_EXPECTED:sha256="
+        f"{preset_body_sha256('プリセットAの本文')},length=9",
+        "PRESET_APPLY_READBACK:sha256="
+        f"{preset_body_sha256('プリセットAの本文')},length=9",
+    ]
+
+
+def test_video_generation_readback_mismatch_blocks_generate_click():
+    events = []
 
     class Node:
         def __init__(self, name):
@@ -580,14 +622,16 @@ def test_video_generation_fills_selected_preset_before_generate_click():
         def fill(self, value):
             events.append(("fill", self.name, value))
 
+        def input_value(self):
+            return "different DOM value"
+
     adapter = NotebookDomAdapter(object())
     adapter._first_visible = lambda _selectors, name: Node(name)  # type: ignore[method-assign]
-    adapter.start_video_generation("プリセットAの本文")
-    assert events == [
-        ("click", "Video Overview作成"),
-        ("fill", "動画解説のカスタムトピック欄", "プリセットAの本文"),
-        ("click", "動画生成ボタン"),
-    ]
+
+    with pytest.raises(PresetApplyMismatchError, match="PRESET_APPLY_MISMATCH"):
+        adapter.start_video_generation("selected preset snapshot")
+
+    assert not any(event == ("click", "動画生成ボタン") for event in events)
 
 
 def test_engine_rejects_missing_preset_before_creating_notebook():
@@ -598,7 +642,7 @@ def test_engine_rejects_missing_preset_before_creating_notebook():
     from djd_maker.adapters.notebook import NotebookAdapterError
     from djd_maker.core.models import Job
 
-    with pytest.raises(NotebookAdapterError, match="動画生成プリセット"):
+    with pytest.raises(NotebookAdapterError, match="PRESET_SNAPSHOT_MISSING"):
         NotebookEngineAdapter(Dom()).submit(Job("lesson.txt"))
 
 

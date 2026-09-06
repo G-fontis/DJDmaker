@@ -9,7 +9,7 @@ import pytest
 
 from djd_maker.adapters.ending import EndingEngineAdapter
 from djd_maker.adapters.hls import HlsAdapter
-from djd_maker.core.models import Job, JobState
+from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.repositories import JobRepository
 from djd_maker.media.raw_store import RawSafeStore
 from djd_maker.media.validator import VideoValidator
@@ -112,6 +112,9 @@ def test_txt_to_fake_notebook_raw_ending_hls_zip(tmp_path: Path) -> None:
             ending_file,
         ),
         ffmpeg_concurrency=1,
+        generation_preset=Preset(
+            "test-preset", "Test preset", "test body", "created", "updated"
+        ),
     )
 
     pipeline.run_cycle()

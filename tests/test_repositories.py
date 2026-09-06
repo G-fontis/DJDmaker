@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from djd_maker.core.models import InvalidStateTransition, Job, JobState
+from djd_maker.core.models import InvalidStateTransition, Job, JobState, Preset
 from djd_maker.core.repositories import (
     JobRepository,
     MalformedJsonError,
@@ -171,6 +171,27 @@ def test_generating_resumes_monitoring_when_remote_identity_is_persisted(tmp_pat
         )
     )
     assert repository.recover_interrupted()[0].state is JobState.WAITING_VIDEO
+
+
+def test_restart_preserves_exact_preset_body_snapshot_and_hash(tmp_path) -> None:
+    repository = JobRepository(tmp_path / "jobs")
+    job = Job(
+        "input/a.txt",
+        id="job",
+        state=JobState.WAITING_VIDEO,
+        notebook_id="remote-id",
+        notebook_url="https://notebook.google.com/notebook/remote-id",
+    )
+    job.snapshot_preset(
+        Preset("preset-id", "Preset name", "exact body", "created", "updated")
+    )
+    repository.save(job)
+
+    restored = JobRepository(tmp_path / "jobs").require("job")
+
+    assert restored.preset_id == "preset-id"
+    assert restored.preset_name == "Preset name"
+    assert restored.require_preset_body_snapshot() == "exact body"
 
 
 def test_generating_without_remote_identity_fails_closed_on_restart(tmp_path) -> None:

@@ -22,7 +22,7 @@ class FakeNotebookAdapter:
 
     def submit(self, job: Job) -> tuple[str, str]:
         self.submit_calls.append(job.id)
-        self.submitted_prompts.append(job.generation_prompt)
+        self.submitted_prompts.append(job.require_preset_body_snapshot())
         notebook_id = f"fake-{job.id}"
         self.status_by_job[job.id] = "READY"
         return notebook_id, f"https://notebook.google.com/notebook/{notebook_id}"

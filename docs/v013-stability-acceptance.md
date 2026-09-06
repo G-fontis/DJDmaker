@@ -1,5 +1,7 @@
 # v0.1.3 Stability-first real-use acceptance
 
+> 履歴注記: このAcceptance時点では選択presetの再起動復元を確認した。その後の`DJD-CHAPPY-V013-CRITICAL-PRESET-APPLY-MAIN-001`により、選択状態は起動をまたいで保持せず毎回未選択にする仕様へ変更された。
+
 指示ID: `DJD-CHAPPY-V013-STABILITY-FIRST-REAL-USE-ACCEPTANCE-001`
 
 実施日: 2026-09-06
