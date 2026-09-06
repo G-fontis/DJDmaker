@@ -1,7 +1,9 @@
 # v0.1.3 Stability-first real-use acceptance
 
-指示ID: `DJD-CHAPPY-V013-STABILITY-FIRST-REAL-USE-ACCEPTANCE-001`  
-実施日: 2026-09-06  
+指示ID: `DJD-CHAPPY-V013-STABILITY-FIRST-REAL-USE-ACCEPTANCE-001`
+
+実施日: 2026-09-06
+
 対象source HEAD: `8da310504a2a81f7c6a43be378dc0dc0a6d2572b`
 
 ## Fresh portable

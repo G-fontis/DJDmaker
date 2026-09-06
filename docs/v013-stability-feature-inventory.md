@@ -1,6 +1,7 @@
 # v0.1.3 実運用機能棚卸し
 
-指示ID: `DJD-CHAPPY-V013-STABILITY-FIRST-REAL-USE-ACCEPTANCE-001`  
+指示ID: `DJD-CHAPPY-V013-STABILITY-FIRST-REAL-USE-ACCEPTANCE-001`
+
 基準日: 2026-09-06
 
 分類は A=元エンジン機能をadapterとして移植、B=DJDmakerの統合フローで同等以上を実現、C=意図的に不採用、D=必須だが未移植、とする。CはDJDmakerの確定安全仕様または統合後の操作モデルと競合するものだけに限定した。
