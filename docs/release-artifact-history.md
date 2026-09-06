@@ -12,5 +12,7 @@
 | v0.1.3 auth release | `e9982c4f1d4dfc8ff3e075d969ff9fe578926ba3` | `DJDmaker_v0.1.3.zip` | 277,558,227 | `D56CA4CD7393709DA7665B1CABABFFAD91A292AB0C2299F5C993B3931303628D` |
 | v0.1.3 preset restore candidate | this change | `DJDmaker.exe` | 3,781,271 | `DA8367D4B959C829ACF93677EBC1D1C78C6DEB1F6E42EDAF6BA6B911B2CE1761` |
 | v0.1.3 preset restore candidate | this change | `DJDmaker_v0.1.3.zip` | 277,568,884 | `1F69185DE418732BFD5162DC89D439074D01A50C9968D5445320D3D68621B4AF` |
+| Ver1.0 critical function release | this release | `DJDmaker.exe` | 3,790,599 | `8DD0A610659C3984B683F09995F3BBDEC119191CA155B44C5D38F0E4A1D777C3` |
+| Ver1.0 critical function release | this release | `DJDmaker_Ver1.0.zip` | 271,871,538 | `E40D006FBE8B5D414605998DA35EFC4445269570E8823D78355B7BDD0AF8ADCA` |
 
 PyInstallerと依存packageはbyte-for-byte再現を保証していないため、source commit、build script、spec、FFmpeg license/inputを合わせて保全する。

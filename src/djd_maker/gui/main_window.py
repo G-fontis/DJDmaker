@@ -49,7 +49,7 @@ class PresetRepositoryPort(Protocol):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン v0.1.3"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.0"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態")

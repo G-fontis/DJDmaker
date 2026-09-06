@@ -194,12 +194,33 @@ def test_preflight_all_seven_checks_pass_before_return(tmp_path: Path) -> None:
 def test_expired_session_stops_automation_and_creates_nothing(tmp_path: Path) -> None:
     context = Context()
     manager, _driver, _auth = harness(tmp_path, contexts=[context], authenticated=False)
-    with pytest.raises(BrowserAuthenticationRequired, match="Googleへのログイン"):
+    with pytest.raises(BrowserAuthenticationRequired, match="Googleへのログイン") as raised:
         manager.prepare_for_processing()
+    assert "Chromeを閉じ" not in str(raised.value)
     status = manager.runtime_status()
     assert status["preflight_checks"]["google_authenticated"] == "FAIL"
     assert status["automation_connected"] is False
     assert context.created == []
+
+
+def test_start_when_auth_chrome_never_opened_uses_current_state(tmp_path: Path) -> None:
+    manager, driver, auth_launches = harness(tmp_path)
+    manager.prepare_for_processing()
+    assert auth_launches == []
+    assert len(driver.launches) == 1
+
+
+def test_stale_close_history_cannot_override_current_live_process(tmp_path: Path) -> None:
+    process = Process(blocking=True)
+    manager, driver, _auth = harness(tmp_path, auth_process=process)
+    manager._navigation_result = "auth-chrome-closed"
+    thread = threading.Thread(target=manager.open_login)
+    thread.start()
+    with pytest.raises(AuthChromeStillRunning):
+        manager.prepare_for_processing()
+    assert driver.launches == []
+    process.terminate()
+    thread.join(timeout=1)
 
 
 def test_profile_lock_delayed_release_is_bounded_and_then_passes(tmp_path: Path) -> None:

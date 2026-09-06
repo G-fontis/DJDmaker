@@ -8,15 +8,17 @@ from djd_maker.adapters.notebook import (
     ArtifactDeletionDisabled,
     ArtifactDeletionRetryableError,
     DomMismatchError,
+    NotebookAdapterError,
     NotebookDomAdapter,
     NotebookEngineAdapter,
     PlaywrightArtifactDownload,
     PresetApplyMismatchError,
     RemoteVideoStatus,
     ResumeMetadata,
+    SourceReadyTimeoutError,
 )
 from djd_maker.core.interfaces import RemoteDeletionDenied
-from djd_maker.core.models import DownloadSafetyGate, preset_body_sha256
+from djd_maker.core.models import DownloadSafetyGate, Job, preset_body_sha256
 
 
 # Minimal, secret-free extraction from GNBCreator's saved live diagnostic:
@@ -544,14 +546,14 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
         def upload_txt(self, path):
             events.append(("upload", path))
 
-        def wait_for_source_ready(self):
-            events.append("source_ready")
+        def wait_for_source_ready(self, filename):
+            events.append(("source_ready", filename))
 
         def rename_notebook(self, title):
             events.append(("rename", title))
 
-        def start_video_generation(self, prompt):
-            events.append(("generate", prompt))
+        def start_video_generation_from_chat(self, prompt):
+            events.append(("chat_generate", prompt))
 
     from djd_maker.core.models import Job
 
@@ -569,9 +571,268 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
         "create",
         ("rename", "SD001_仕事とは"),
         ("upload", source),
-        "source_ready",
-        ("generate", "選択したプリセット本文"),
+        ("source_ready", "SD001_仕事とは.txt"),
+        ("chat_generate", "選択したプリセット本文"),
     ]
+
+
+def test_source_ready_requires_active_right_side_studio_card(monkeypatch):
+    ticks = iter(range(20))
+    monkeypatch.setattr(
+        "djd_maker.adapters.notebook.time.monotonic", lambda: float(next(ticks))
+    )
+
+    class Page:
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    adapter = NotebookDomAdapter(Page())
+    adapter._body_text = lambda: "1 個のソース"  # type: ignore[method-assign]
+    adapter._source_registered = lambda _filename: True  # type: ignore[method-assign]
+    adapter._source_processing = lambda: False  # type: ignore[method-assign]
+    adapter._chat_source_count_positive = lambda: True  # type: ignore[method-assign]
+    adapter._studio_video_card_active = lambda: True  # type: ignore[method-assign]
+
+    adapter.wait_for_source_ready("lesson.txt", timeout_ms=10_000)
+
+
+def test_visible_filename_with_disabled_studio_card_times_out(monkeypatch):
+    ticks = iter(range(20))
+    monkeypatch.setattr(
+        "djd_maker.adapters.notebook.time.monotonic", lambda: float(next(ticks))
+    )
+
+    class Page:
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    adapter = NotebookDomAdapter(Page())
+    adapter._body_text = lambda: "1 個のソース"  # type: ignore[method-assign]
+    adapter._source_registered = lambda _filename: True  # type: ignore[method-assign]
+    adapter._source_processing = lambda: False  # type: ignore[method-assign]
+    adapter._chat_source_count_positive = lambda: True  # type: ignore[method-assign]
+    adapter._studio_video_card_active = lambda: False  # type: ignore[method-assign]
+
+    with pytest.raises(SourceReadyTimeoutError, match="5分"):
+        adapter.wait_for_source_ready("lesson.txt", timeout_ms=5_000)
+
+
+def test_source_timeout_marks_failed_and_recreates_notebook_once(tmp_path):
+    source = tmp_path / "lesson.txt"
+    source.write_text("source", encoding="utf-8")
+    events = []
+
+    class Dom:
+        def __init__(self):
+            self.creates = 0
+            self.waits = 0
+
+        def create_notebook(self):
+            self.creates += 1
+            events.append("create")
+            return ResumeMetadata(
+                f"id-{self.creates}",
+                f"https://notebook.google.com/notebook/id-{self.creates}",
+                "",
+            )
+
+        def rename_notebook(self, title):
+            events.append(("rename", title))
+
+        def upload_txt(self, path):
+            events.append(("upload", path.name))
+
+        def wait_for_source_ready(self, filename):
+            self.waits += 1
+            events.append(("wait", filename))
+            if self.waits == 1:
+                raise SourceReadyTimeoutError("timeout")
+
+        def start_video_generation_from_chat(self, prompt):
+            events.append(("chat_generate", prompt))
+
+    prompt = "selected snapshot"
+    result = NotebookEngineAdapter(Dom()).submit(
+        Job(
+            str(source),
+            preset_body_snapshot=prompt,
+            preset_body_sha256=preset_body_sha256(prompt),
+        )
+    )
+
+    assert result[0] == "id-2"
+    assert events == [
+        "create",
+        ("rename", "lesson"),
+        ("upload", "lesson.txt"),
+        ("wait", "lesson.txt"),
+        ("rename", "FAILED_lesson"),
+        "create",
+        ("rename", "lesson"),
+        ("upload", "lesson.txt"),
+        ("wait", "lesson.txt"),
+        ("chat_generate", prompt),
+    ]
+
+
+def test_second_source_timeout_marks_replacement_failed_and_stops(tmp_path):
+    source = tmp_path / "lesson.txt"
+    source.write_text("source", encoding="utf-8")
+    events = []
+
+    class Dom:
+        def __init__(self):
+            self.creates = 0
+
+        def create_notebook(self):
+            self.creates += 1
+            events.append("create")
+            return ResumeMetadata(
+                f"id-{self.creates}",
+                f"https://notebook.google.com/notebook/id-{self.creates}",
+                "",
+            )
+
+        def rename_notebook(self, title):
+            events.append(("rename", title))
+
+        def upload_txt(self, path):
+            events.append(("upload", path.name))
+
+        def wait_for_source_ready(self, filename):
+            events.append(("wait", filename))
+            raise SourceReadyTimeoutError("timeout")
+
+        def start_video_generation_from_chat(self, _prompt):
+            raise AssertionError("generation must not start without a ready source")
+
+    with pytest.raises(SourceReadyTimeoutError, match="timeout"):
+        NotebookEngineAdapter(Dom()).submit(
+            Job(
+                str(source),
+                preset_body_snapshot="selected snapshot",
+                preset_body_sha256=preset_body_sha256("selected snapshot"),
+            )
+        )
+
+    assert events == [
+        "create",
+        ("rename", "lesson"),
+        ("upload", "lesson.txt"),
+        ("wait", "lesson.txt"),
+        ("rename", "FAILED_lesson"),
+        "create",
+        ("rename", "lesson"),
+        ("upload", "lesson.txt"),
+        ("wait", "lesson.txt"),
+        ("rename", "FAILED_lesson"),
+    ]
+
+
+def test_exact_test_preset_reaches_main_chat_without_video_card_controls():
+    prompt = (
+        "ソースの読み込みが完了したら、以下の条件で動画を生成開始してください。\n"
+        "形式：説明動画\n・日本語\n・ペーパークラフト"
+    )
+    events = []
+
+    class EmptyCards:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, selector):
+            assert selector == "artifact-library-item"
+            return EmptyCards()
+
+    class Textbox:
+        value = ""
+
+        def fill(self, value):
+            self.value = value
+            events.append(("chat_fill", value))
+
+        def input_value(self):
+            return self.value
+
+        def press(self, key):
+            events.append(("chat_press", key))
+
+    class Send:
+        def is_enabled(self, **_kwargs):
+            return True
+
+        def click(self):
+            events.append("chat_send")
+
+    textbox = Textbox()
+    adapter = NotebookDomAdapter(Page())
+    adapter._wait_for_generation_chat_ready = lambda: textbox  # type: ignore[method-assign]
+    adapter._first_enabled_visible = lambda _candidates, _name: Send()  # type: ignore[method-assign]
+    adapter._wait_for_chat_message_sent = (  # type: ignore[method-assign]
+        lambda actual, _textbox: events.append(("sent_dom", actual))
+    )
+    adapter._wait_for_notebook_auto_generation = (  # type: ignore[method-assign]
+        lambda: events.append("auto_generation")
+    )
+
+    adapter.start_video_generation_from_chat(prompt)
+
+    assert events == [
+        ("chat_fill", prompt),
+        "chat_send",
+        ("sent_dom", prompt),
+        "auto_generation",
+    ]
+    assert not any("Video Overview" in str(event) for event in events)
+    assert not any("動画生成ボタン" in str(event) for event in events)
+
+
+def test_chat_input_readback_mismatch_blocks_send():
+    events = []
+
+    class EmptyCards:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, _selector):
+            return EmptyCards()
+
+    class Textbox:
+        def fill(self, _value):
+            events.append("fill")
+
+        def input_value(self):
+            return "different"
+
+    adapter = NotebookDomAdapter(Page())
+    adapter._wait_for_generation_chat_ready = lambda: Textbox()  # type: ignore[method-assign]
+    adapter._first_enabled_visible = lambda _candidates, _name: pytest.fail("must not send")  # type: ignore[method-assign]
+
+    with pytest.raises(PresetApplyMismatchError, match="main chat readback differ"):
+        adapter.start_video_generation_from_chat("expected")
+    assert events == ["fill"]
+
+
+def test_short_default_is_rejected_after_notebook_auto_generation():
+    class Card:
+        def inner_text(self):
+            return "短めの動画を生成しています"
+
+    class Cards:
+        first = Card()
+
+    class Page:
+        def locator(self, selector):
+            assert selector == "artifact-library-item"
+            return Cards()
+
+    adapter = NotebookDomAdapter(Page())
+    adapter.inspect_status = lambda: RemoteVideoStatus.GENERATING  # type: ignore[method-assign]
+
+    with pytest.raises(NotebookAdapterError, match="SHORT_DEFAULT_USED"):
+        adapter._wait_for_notebook_auto_generation()
 
 
 def test_video_generation_fills_selected_preset_before_generate_click():

@@ -36,4 +36,6 @@ def test_production_adapter_has_no_legacy_generation_prompt_fallback():
     ).read_text(encoding="utf-8")
     assert "job.generation_prompt or" not in adapter
     assert "require_preset_body_snapshot" in adapter
+    assert "self.dom.start_video_generation_from_chat(prompt)" in adapter
+    assert "self.dom.start_video_generation(prompt)" not in adapter
     assert 'raise RuntimeError("PRESET_NOT_SELECTED")' in pipeline

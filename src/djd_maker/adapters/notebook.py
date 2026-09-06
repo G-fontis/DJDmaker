@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import urlparse
@@ -19,6 +20,14 @@ class NotebookAdapterError(RuntimeError):
 
 
 class PresetApplyMismatchError(NotebookAdapterError):
+    pass
+
+
+class SourceReadyTimeoutError(NotebookAdapterError):
+    pass
+
+
+class SourceProcessingError(NotebookAdapterError):
     pass
 
 
@@ -236,6 +245,15 @@ SOURCE_READY = (
     ("text", "", "1 source"),
     ("css", "[data-testid*='source'][aria-busy='false']", ""),
 )
+SOURCE_READY_TIMEOUT_MS = 300_000
+SOURCE_ERROR_MARKERS = (
+    "ソースを処理できません",
+    "ソースの処理に失敗",
+    "アップロードに失敗",
+    "source processing failed",
+    "failed to process source",
+    "upload failed",
+)
 VIDEO_CREATE = (
     (
         "css",
@@ -257,6 +275,33 @@ VIDEO_CUSTOM_TOPIC = (
 VIDEO_GENERATE = (
     ("role", "button", "生成"),
     ("role", "button", "Generate"),
+)
+CHAT_INPUT = (
+    ("role", "textbox", "クエリボックス"),
+    ("label", "", "クエリボックス"),
+    ("role", "textbox", "Start typing"),
+    ("role", "textbox", "Ask a question"),
+    ("role", "textbox", "入力を開始"),
+    ("role", "textbox", "質問してみましょう"),
+    ("css", "textarea.query-box-input", ""),
+    ("css", "textarea", ""),
+    ("css", "[contenteditable='true'][role='textbox']", ""),
+)
+CHAT_SEND = (
+    ("role", "button", "送信"),
+    ("role", "button", "Send"),
+    ("label", "", "送信"),
+    ("label", "", "Send"),
+    ("css", "button.submit-button[type='submit']", ""),
+    ("css", "button[type='submit']", ""),
+)
+CHAT_MESSAGE_SURFACES = (
+    "[data-message-author-role='user']",
+    "[class*='user-message' i]",
+    "[class*='query-message' i]",
+    "chat-message",
+    "[data-testid*='message' i]",
+    ".message-content",
 )
 
 
@@ -321,6 +366,32 @@ class NotebookDomAdapter:
             self.page.wait_for_timeout(250)
         self.diagnostic(f"DOM_MISMATCH:{name}")
         raise DomMismatchError(f"{name}を特定できません")
+
+    def _first_enabled_visible(
+        self,
+        candidates: Iterable[tuple[str, str, str]],
+        name: str,
+    ) -> Any:
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while time.monotonic() < deadline:
+            for candidate in candidates:
+                try:
+                    locator = self._locator(*candidate)
+                    for index in range(locator.count()):
+                        item = locator.nth(index)
+                        try:
+                            visible = item.is_visible(timeout=300)
+                            enabled = item.is_enabled(timeout=300)
+                        except TypeError:
+                            visible = item.is_visible()
+                            enabled = item.is_enabled()
+                        if visible and enabled:
+                            return item
+                except Exception:
+                    continue
+            self.page.wait_for_timeout(250)
+        self.diagnostic(f"DOM_MISMATCH:{name}_not_enabled")
+        raise DomMismatchError(f"{name}が有効になりません")
 
     def _try_first_visible(self, candidates: Iterable[tuple[str, str, str]]) -> Any | None:
         for candidate in candidates:
@@ -392,13 +463,25 @@ class NotebookDomAdapter:
         editor = self._first_visible(TITLE_INPUT, "Notebookタイトル入力")
         editor.fill(title)
         editor.press("Enter")
-        actual = " ".join(editor.input_value().split())
-        page_title = " ".join(self.page.title().split())
-        if actual != expected or not (
-            page_title == expected or page_title.startswith(expected + " - ")
-        ):
-            self.diagnostic("DOM_MISMATCH:notebook_title_readback")
-            raise DomMismatchError("Notebook名の確定をreadbackできません")
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while time.monotonic() < deadline:
+            actual = ""
+            page_title = ""
+            try:
+                actual = " ".join(editor.input_value().split())
+            except Exception:
+                pass
+            try:
+                page_title = " ".join(self.page.title().split())
+            except Exception:
+                pass
+            if actual == expected and (
+                page_title == expected or page_title.startswith(expected + " - ")
+            ):
+                return
+            self.page.wait_for_timeout(250)
+        self.diagnostic("DOM_MISMATCH:notebook_title_readback")
+        raise DomMismatchError("Notebook名の確定をreadbackできません")
 
     def upload_txt(self, source_path: Path) -> None:
         source = source_path.resolve()
@@ -423,21 +506,136 @@ class NotebookDomAdapter:
             return
         file_input.set_input_files(str(source))
 
-    def wait_for_source_ready(self) -> None:
-        deadline = time.monotonic() + self.timeout_ms / 1000
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return " ".join(value.split())
+
+    def _body_text(self) -> str:
+        try:
+            return self._normalize_text(self.page.locator("body").inner_text())
+        except Exception:
+            return ""
+
+    def _any_visible(self, selector: str) -> bool:
+        try:
+            items = self.page.locator(selector)
+            return any(
+                items.nth(index).is_visible(timeout=300)
+                for index in range(items.count())
+            )
+        except Exception:
+            return False
+
+    def _source_registered(self, filename: str) -> bool:
+        expected = self._normalize_text(Path(filename).name)
+        for selector in ("button.source-stretched-button", ".source-title"):
+            try:
+                items = self.page.locator(selector)
+                for index in range(items.count()):
+                    item = items.nth(index)
+                    if not item.is_visible(timeout=300):
+                        continue
+                    values: list[str] = []
+                    try:
+                        values.append(self._normalize_text(item.inner_text()))
+                    except Exception:
+                        pass
+                    try:
+                        values.append(
+                            self._normalize_text(item.get_attribute("aria-label") or "")
+                        )
+                    except Exception:
+                        pass
+                    if any(expected in value for value in values):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _source_processing(self) -> bool:
+        for selector in (
+            "[role='progressbar']",
+            "[aria-busy='true']",
+            "mat-progress-spinner",
+            "mat-spinner",
+            ".source-loading",
+            ".source-processing",
+        ):
+            if self._any_visible(selector):
+                return True
+        body = self._body_text().casefold()
+        return any(
+            marker in body
+            for marker in ("ソースを処理中", "ソースを解析中", "processing source")
+        )
+
+    def _chat_source_count_positive(self) -> bool:
+        body = self._body_text()
+        counts = [int(value) for value in re.findall(r"(\d+)\s*個のソース", body)]
+        counts.extend(int(value) for value in re.findall(r"(\d+)\s+sources?", body, re.I))
+        return any(value > 0 for value in counts)
+
+    def _studio_video_card_active(self) -> bool:
+        """The user-visible readiness gate is the enabled Studio video card."""
+        for name in ("動画解説", "Video Overview"):
+            try:
+                cards = self.page.get_by_role("button", name=name, exact=True)
+                for index in range(cards.count()):
+                    card = cards.nth(index)
+                    if card.is_visible(timeout=300) and card.is_enabled(timeout=300):
+                        return True
+            except Exception:
+                continue
+        for selector in (
+            "basic-create-artifact-button:has([aria-label='動画解説']) button",
+            "basic-create-artifact-button:has([aria-label='Video Overview']) button",
+            "basic-create-artifact-button [aria-label='動画解説']",
+            "basic-create-artifact-button [aria-label='Video Overview']",
+        ):
+            try:
+                cards = self.page.locator(selector)
+                for index in range(cards.count()):
+                    card = cards.nth(index)
+                    if card.is_visible(timeout=300) and card.is_enabled(timeout=300):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def wait_for_source_ready(
+        self,
+        filename: str,
+        *,
+        timeout_ms: int = SOURCE_READY_TIMEOUT_MS,
+    ) -> None:
+        """Wait for indexing and the right-side Studio card to become active."""
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable_since: float | None = None
         while time.monotonic() < deadline:
-            for candidate in SOURCE_READY:
-                try:
-                    locator = self._locator(*candidate)
-                    if locator.count() and locator.first.is_visible(timeout=300):
-                        return
-                except Exception:
-                    continue
+            body = self._body_text().casefold()
+            if any(marker in body for marker in SOURCE_ERROR_MARKERS):
+                self.diagnostic("SOURCE_PROCESSING_FAILED")
+                raise SourceProcessingError("Notebookのソース処理に失敗しました")
+            ready = (
+                self._source_registered(filename)
+                and not self._source_processing()
+                and self._chat_source_count_positive()
+                and self._studio_video_card_active()
+            )
+            if ready:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= 2:
+                    self.diagnostic("SOURCE_READY_CONFIRMED:studio_video_card_active")
+                    return
+            else:
+                stable_since = None
             self.page.wait_for_timeout(500)
-        self.diagnostic("DOM_MISMATCH:source_ready_timeout")
-        raise DomMismatchError("TXT sourceの解析完了を確認できません")
+        self.diagnostic("SOURCE_READY_TIMEOUT:300s")
+        raise SourceReadyTimeoutError("TXT sourceの解析が5分以内に完了しませんでした")
 
     def start_video_generation(self, prompt: str) -> None:
+        """Legacy diagnostic path; production submission uses chat instead."""
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
         self._first_visible(VIDEO_CREATE, "Video Overview作成").click()
@@ -466,6 +664,138 @@ class NotebookDomAdapter:
                 "PRESET_APPLY_MISMATCH: preset snapshot and DOM readback differ"
             )
         self._first_visible(VIDEO_GENERATE, "動画生成ボタン").click()
+
+    @staticmethod
+    def _input_text(control: Any) -> str:
+        try:
+            return control.input_value()
+        except Exception:
+            try:
+                return control.text_content() or ""
+            except Exception:
+                return ""
+
+    def _sent_message_visible(self, prompt: str) -> bool:
+        for selector in CHAT_MESSAGE_SURFACES:
+            try:
+                messages = self.page.locator(selector)
+                for index in range(messages.count()):
+                    message = messages.nth(index)
+                    if message.is_visible(timeout=300) and message.inner_text() == prompt:
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _wait_for_generation_chat_ready(self, *, timeout_ms: int = 60_000) -> Any:
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable_since: float | None = None
+        textbox: Any = None
+        while time.monotonic() < deadline:
+            textbox = self._try_first_visible(CHAT_INPUT)
+            enabled = False
+            if textbox is not None:
+                try:
+                    enabled = bool(textbox.is_enabled(timeout=300))
+                except TypeError:
+                    enabled = bool(textbox.is_enabled())
+                except Exception:
+                    enabled = False
+            ready = enabled and self._studio_video_card_active()
+            if ready:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= 2:
+                    self.diagnostic("GENERATION_CHAT_READY_STABLE")
+                    return textbox
+            else:
+                stable_since = None
+            self.page.wait_for_timeout(250)
+        raise NotebookAdapterError(
+            "メインチャットとStudioカードの安定した準備完了を確認できませんでした"
+        )
+
+    def _wait_for_chat_message_sent(
+        self,
+        prompt: str,
+        textbox: Any,
+        *,
+        timeout_ms: int = 60_000,
+    ) -> None:
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable_since: float | None = None
+        while time.monotonic() < deadline:
+            sent = self._input_text(textbox) == "" and self._sent_message_visible(prompt)
+            if sent:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= 2:
+                    self.diagnostic("PRESET_CHAT_SENT_CONFIRMED_STABLE")
+                    return
+            else:
+                stable_since = None
+            self.page.wait_for_timeout(250)
+        raise PresetApplyMismatchError(
+            "PRESET_APPLY_MISMATCH: sent preset message was not confirmed in DOM"
+        )
+
+    def _wait_for_notebook_auto_generation(
+        self,
+        *,
+        timeout_ms: int = 120_000,
+    ) -> None:
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            status = self.inspect_status()
+            if status in {
+                RemoteVideoStatus.GENERATING,
+                RemoteVideoStatus.WAITING,
+                RemoteVideoStatus.READY,
+            }:
+                card = self.page.locator("artifact-library-item").first
+                text = ""
+                try:
+                    text = self._normalize_text(card.inner_text()).casefold()
+                except Exception:
+                    pass
+                if any(marker in text for marker in ("短め", "short", "brief")):
+                    raise NotebookAdapterError(
+                        "SHORT_DEFAULT_USED: Notebookが短め動画として生成を開始しました"
+                    )
+                self.diagnostic(f"NOTEBOOK_AUTO_GENERATION_STARTED:{status.value}")
+                return
+            if status is RemoteVideoStatus.FAILED:
+                raise NotebookAdapterError("Notebookの自動動画生成開始に失敗しました")
+            self.page.wait_for_timeout(500)
+        raise NotebookAdapterError("Notebookの自動動画生成開始を確認できませんでした")
+
+    def start_video_generation_from_chat(self, prompt: str) -> None:
+        """Send the exact job snapshot to main chat and let Notebook generate."""
+        if not prompt.strip():
+            raise ValueError("動画生成プリセット本文が空です")
+        if self.page.locator("artifact-library-item").count():
+            raise NotebookAdapterError(
+                "チャット送信前に動画artifactが存在するため重複生成を停止しました"
+            )
+        textbox = self._wait_for_generation_chat_ready()
+        self.diagnostic(
+            "PRESET_CHAT_EXPECTED:"
+            f"sha256={preset_body_sha256(prompt)},length={len(prompt)}"
+        )
+        textbox.fill(prompt)
+        readback = self._input_text(textbox)
+        self.diagnostic(
+            "PRESET_CHAT_READBACK:"
+            f"sha256={preset_body_sha256(readback)},length={len(readback)}"
+        )
+        if readback != prompt:
+            raise PresetApplyMismatchError(
+                "PRESET_APPLY_MISMATCH: preset snapshot and main chat readback differ"
+            )
+        send = self._first_enabled_visible(CHAT_SEND, "Notebookメインチャット送信ボタン")
+        send.click()
+        self._wait_for_chat_message_sent(prompt, textbox)
+        self._wait_for_notebook_auto_generation()
 
     def inspect_status(self) -> RemoteVideoStatus:
         cards = self.page.locator("artifact-library-item")
@@ -756,11 +1086,23 @@ class NotebookEngineAdapter:
             prompt = job.require_preset_body_snapshot()
         except ValueError as exc:
             raise NotebookAdapterError(str(exc)) from exc
+        source = Path(job.source_path)
         metadata = self.dom.create_notebook()
         self.dom.rename_notebook(job.script_name)
-        self.dom.upload_txt(Path(job.source_path))
-        self.dom.wait_for_source_ready()
-        self.dom.start_video_generation(prompt)
+        self.dom.upload_txt(source)
+        try:
+            self.dom.wait_for_source_ready(source.name)
+        except SourceReadyTimeoutError:
+            self.dom.rename_notebook(f"FAILED_{job.script_name}")
+            metadata = self.dom.create_notebook()
+            self.dom.rename_notebook(job.script_name)
+            self.dom.upload_txt(source)
+            try:
+                self.dom.wait_for_source_ready(source.name)
+            except SourceReadyTimeoutError:
+                self.dom.rename_notebook(f"FAILED_{job.script_name}")
+                raise
+        self.dom.start_video_generation_from_chat(prompt)
         return metadata.notebook_id, metadata.notebook_url
 
     def _open_job(self, job: Job) -> None:

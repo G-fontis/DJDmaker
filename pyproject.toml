@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "djd-maker"
-version = "0.1.3"
+version = "1.0.0"
 description = "台本から授業動画つくるマシーン"
 requires-python = ">=3.11"
 dependencies = [

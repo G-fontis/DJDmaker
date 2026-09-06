@@ -23,10 +23,11 @@
 - 認証用Chromeではremote debugging、CDP、Playwright、headless、automation目的のflagを使用せず、password、Cookie、token、Google login DOMを取得・操作しない。
 - Start時のPre-flightは完全な内部処理とし、正常時のユーザー操作を増やさない。正常フローはGoogleログインと授業動画作成開始の2操作だけとする。
 - Pre-flight全項目がPASSするまでNotebook作成、source投入、動画生成を開始しない。
-- 元GNB Creatorの動画生成presetは、選択本文をjobへスナップショットし、生成開始前にNotebookLMの動画解説カスタムトピック欄へ入力する。管理UIだけを実装して生成経路へ接続しない状態をPASSにしない。
+- 動画生成presetは、選択本文をjobへスナップショットし、source ready確認後にNotebookLMのメインチャットへ完全一致で送信する。管理UIだけを実装して生成経路へ接続しない状態をPASSにしない。
 - preset JSONはsettingsと同じprocess内mutex、temporary、flush/fsync、atomic replace、backup/recoveryを使い、保存用lock fileへ依存させない。
 - preset一覧は保存するが選択IDはprocess内だけに保持し、アプリ起動時は必ず未選択にする。Start時に未選択ならNotebook作成前に停止し、default・test・前回値へfallbackしない。
-- job開始時にpreset ID、名前、本文snapshot、本文SHA-256を保存する。Notebookのcustom topicへsnapshot本文をfillした直後にDOM readbackを行い、完全一致しない場合は`PRESET_APPLY_MISMATCH`で生成ボタンを押さず停止する。
+- job開始時にpreset ID、名前、本文snapshot、本文SHA-256を保存する。Notebookのメインチャットへsnapshot本文をfillした直後にDOM readbackを行い、完全一致しない場合は`PRESET_APPLY_MISMATCH`で送信せず停止する。送信後はuser messageの安定表示とNotebook側の動画artifact生成開始を確認する。通常pipelineから動画解説カードやGenerateボタンを直接操作しない。
+- Codexへの指示に修正・追加が発生した場合、一部差し替え・追記方式は禁止する。必ず最新内容をすべてマージした全文完成版指示を新しい指示IDで再発行し、Codexへは最新版全文だけを送る。この規則はDJDmaker以外のCodex連携開発にも適用する。
 
 ## EXE Build Cleanup
 

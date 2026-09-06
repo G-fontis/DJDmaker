@@ -72,7 +72,7 @@ class PresetDialog(QDialog):
         self.name_edit.setPlaceholderText("例：福ゼミ通常講義")
         self.prompt_edit = QPlainTextEdit(prompt_text)
         self.prompt_edit.setPlaceholderText(
-            "NotebookLMの動画解説カスタムトピックへ送信する文章を入力してください"
+            "NotebookLMのメインチャットへ送信する動画生成指示を入力してください"
         )
         form = QFormLayout()
         form.addRow("プリセット名", self.name_edit)

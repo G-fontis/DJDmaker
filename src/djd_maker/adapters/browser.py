@@ -191,8 +191,7 @@ class BrowserManager:
                 self._fail_check("google_authenticated")
                 self._stop_automation()
                 raise BrowserAuthenticationRequired(
-                    "Googleへのログインを確認できません。［Googleログイン］からログインし、"
-                    "Chromeを閉じてからもう一度開始してください。"
+                    "Googleへのログインを確認できません。［Googleログイン］からログインしてください。"
                 )
             self._pass_check("google_authenticated")
             if not self.ensure_home_dom(page):

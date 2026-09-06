@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン v0.1.3
+# 台本から授業動画つくるマシーン Ver1.0
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 0.1.3。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.0.0。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,9 +33,9 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_v0.1.3`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.0`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
-初回は設定画面でEnding動画を指定し、「動画生成プリセット」からプリセット名と本文を登録してください。プリセット一覧は保存されますが、選択状態は起動をまたいで保持しません。起動ごとに使用するプリセットを選択してください。未選択のまま開始した場合はNotebook作成前にエラー停止し、default・test・前回選択presetの自動投入はありません。選択本文はjob開始時にsnapshotされ、カスタムトピック欄への入力後にDOM readbackが完全一致した場合だけ動画生成を開始します。
+初回は設定画面でEnding動画を指定し、「動画生成プリセット」からプリセット名と本文を登録してください。プリセット一覧は保存されますが、選択状態は起動をまたいで保持しません。起動ごとに使用するプリセットを選択してください。未選択のまま開始した場合はNotebook作成前にエラー停止し、default・test・前回選択presetの自動投入はありません。選択本文はjob開始時にsnapshotされ、source ready後にメインチャットへ入力します。入力直後のDOM readback完全一致、送信後のuser message安定表示、Notebook側の動画artifact生成開始を確認します。通常pipelineは動画解説カードやGenerateボタンを直接操作しません。
 
 Googleログインは次の正式フローです。
 
@@ -48,9 +48,9 @@ Start後のPre-flightと動画完成までの処理は自動で、正常時に�
 
 ## 基本操作と自動処理
 
-1. `input`へ台本TXTを配置し、設定画面で`raw_files`、`output`、Ending動画、動画生成プリセットを指定します。プリセット変更時だけ設定画面を使い、通常運用では保存済みの選択を再利用します。
+1. `input`へ台本TXTを配置し、設定画面で`raw_files`、`output`、Ending動画、動画生成プリセットを指定します。プリセット一覧は保存されますが、起動ごとに使用するプリセットを選択します。
 2. 必要な場合は`Googleログイン`を押し、通常Chromeでログイン後、そのChromeを閉じます。CookieやpasswordをアプリやGitへ保存しません。
-3. `授業動画作成開始`を押すと7項目の内部Pre-flight後、Notebook作成、rename、source投入、動画生成、scheduler監視、Downloadをjob単位で実行します。
+3. `授業動画作成開始`を押すと7項目の内部Pre-flight後、Notebook作成、rename、source投入、source ready監視、メインチャットへのpreset送信、Notebook側の自動動画生成、scheduler監視、Downloadをjob単位で実行します。sourceが5分以内にreadyにならない場合はNotebook名へ`FAILED_`を付け、新しいNotebookで1回だけ再試行します。
 4. DownloadしたMP4を検証して`raw_files`へ永久保存した後、動画artifactだけをWeb UIから削除します。Notebook本体とsourceは削除しません。
 5. RAWにEnding処理を行い、6秒segmentのHLSと無圧縮ZIPを`output`へ作成します。
 
@@ -90,6 +90,7 @@ docs/        調査・設計資料
 - [Windows packaging preflight](docs/windows-packaging.md)
 - [v0.1.2認証Retrospective](docs/v012-auth-retrospective.md)
 - [GNBプリセット復元記録](docs/v013-preset-restoration.md)
+- [Ver1.0機能修正記録](docs/v10-critical-function-fix.md)
 - [Release artifact記録](docs/release-artifact-history.md)
 
 ## Buildとライセンス
