@@ -36,7 +36,7 @@ def test_real_composition_opens_gui_before_browser_or_ending_configuration(tmp_p
         tmp_path, qt_app=application, browser_manager=browser  # type: ignore[arg-type]
     )
 
-    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.2"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.3"
     assert not browser.started
     assert not window.start_button.isEnabled()
     window.close()

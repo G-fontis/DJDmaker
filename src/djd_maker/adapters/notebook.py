@@ -332,6 +332,16 @@ class NotebookDomAdapter:
                 continue
         return None
 
+    @classmethod
+    def preflight_home_page(cls, page: Any, timeout_ms: int = 30_000) -> bool:
+        """Confirm the home create control without clicking or creating anything."""
+        adapter = cls(page, timeout_ms=timeout_ms)
+        try:
+            adapter._first_visible(CREATE_NOTEBOOK, "Notebook作成ボタン")
+        except DomMismatchError:
+            return False
+        return True
+
     def _dismiss_optional_dialogs(self, timeout_ms: int = 5_000) -> None:
         deadline = time.monotonic() + timeout_ms / 1000
         quiet_since = time.monotonic()

@@ -43,7 +43,7 @@ class JobRepositoryPort(Protocol):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン v0.1.2"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン v0.1.3"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態")
@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_processing)
         self.pause_button.clicked.connect(self.pause_processing)
         self.stop_button.clicked.connect(self.stop_processing)
-        self.login_button.clicked.connect(self.controller.login)
+        self.login_button.clicked.connect(self.start_login)
         self.details_button.clicked.connect(self.show_selected_job)
         self.log_button.clicked.connect(self.show_logs)
         self.settings_button.clicked.connect(self.show_settings)
@@ -361,8 +361,15 @@ class MainWindow(QMainWindow):
             return
         if self.controller.start():
             self._running = True
-            self.statusBar().showMessage("開始要求を送信しました")
+            self.statusBar().showMessage("準備確認中...")
             self._update_action_state()
+
+    def start_login(self) -> None:
+        self.statusBar().showMessage(
+            "Googleログイン用Chromeを開きます。ログイン後、このChromeを閉じてください。"
+            "パスワード等をアプリが取得することはありません。"
+        )
+        self.controller.login()
 
     def pause_processing(self) -> None:
         if self._running:
@@ -375,15 +382,22 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("安全な停止を要求しました。実行中工程の終了を待っています")
 
     def _operation_started(self, operation: str) -> None:
-        self.statusBar().showMessage(f"{operation} 実行中")
+        if operation == "start":
+            self.statusBar().showMessage("準備確認中...")
+        elif operation == "login":
+            self.statusBar().showMessage(
+                "Googleログイン用Chromeでログインし、完了後にChromeを閉じてください"
+            )
+        else:
+            self.statusBar().showMessage(f"{operation} 実行中")
 
     def _operation_finished(self, operation: str, _result: object) -> None:
         if operation in {"stop", "pause"}:
             self._running = False
         if operation == "login":
-            self.statusBar().showMessage(
-                "ログイン後、このChromeは閉じずに［授業動画作成開始］を押してください"
-            )
+            self.statusBar().showMessage("ログイン確認待ち。［授業動画作成開始］で自動確認します")
+        elif operation == "start":
+            self.statusBar().showMessage("準備確認中...")
         else:
             self.statusBar().showMessage(f"{operation} 完了")
         self._update_action_state()

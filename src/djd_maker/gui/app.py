@@ -44,7 +44,10 @@ def build_desktop(
     settings_repository = SettingsRepository(root / "system" / "settings.json")
     job_repository = JobRepository(root / "system" / "jobs")
     settings = settings_repository.load()
-    browser = browser_manager or BrowserManager(root / "browser" / "chrome-profile")
+    browser = browser_manager or BrowserManager(
+        root / "browser" / "chrome-profile",
+        selector_probe=NotebookDomAdapter.preflight_home_page,
+    )
     scheduler = PersistentPollScheduler(
         job_repository,
         first_poll_seconds=settings.first_notebook_check_seconds,

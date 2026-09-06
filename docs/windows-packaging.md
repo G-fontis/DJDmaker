@@ -6,7 +6,7 @@
 
 ## 採用候補
 
-PyInstaller 6系のwindowed `onedir` を採用します。`onefile` の起動時展開を避け、Qt plugin、Playwright、FFmpegの所在を利用者が確認でき、起動速度、ウイルス対策ソフトによる誤検知の抑制、障害診断、部分更新を優先します。実行ファイルは `DJDmaker.exe`、配布フォルダーは `DJDmaker_v0.1.2` です。
+PyInstaller 6系のwindowed `onedir` を採用します。`onefile` の起動時展開を避け、Qt plugin、Playwright、FFmpegの所在を利用者が確認でき、起動速度、ウイルス対策ソフトによる誤検知の抑制、障害診断、部分更新を優先します。実行ファイルは `DJDmaker.exe`、配布フォルダーは `DJDmaker_v0.1.3` です。
 
 `packaging/DJDMaker.spec` は次を行います。
 

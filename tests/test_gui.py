@@ -116,7 +116,7 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.2"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン v0.1.3"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
@@ -166,6 +166,20 @@ def test_controller_start_is_nonblocking_and_reports_by_signal(tmp_path: Path) -
     assert bridge.busy
     gate.set()
     _drain_until(lambda: "start" in finished)
+    window.close()
+
+
+def test_normal_ux_is_login_then_start_with_no_extra_gui_operation(tmp_path: Path) -> None:
+    window, _settings, controller, bridge = _window(tmp_path, [])
+    window.login_button.click()
+    _drain_until(lambda: not bridge.busy)
+    assert controller.calls == ["login"]
+    assert "ログイン確認待ち" in window.statusBar().currentMessage()
+
+    window.start_button.click()
+    _drain_until(lambda: not bridge.busy)
+    assert controller.calls == ["login", "start"]
+    assert window.statusBar().currentMessage() == "準備確認中..."
     window.close()
 
 

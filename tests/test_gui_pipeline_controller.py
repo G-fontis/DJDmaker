@@ -129,7 +129,7 @@ def test_pause_resume_stop_and_retry_mapping(tmp_path: Path) -> None:
     assert scheduler.mode is SchedulerMode.STOPPED
 
 
-def test_unauthenticated_start_keeps_same_browser_for_login(tmp_path: Path) -> None:
+def test_unauthenticated_start_closes_automation_and_requests_login(tmp_path: Path) -> None:
     repository = MemoryJobs(Job("lesson.txt"))
     scheduler = PersistentPollScheduler(repository)
     cleanup_calls: list[str] = []
@@ -159,8 +159,42 @@ def test_unauthenticated_start_keeps_same_browser_for_login(tmp_path: Path) -> N
     while instance.status()["running"] and time.monotonic() < deadline:
         time.sleep(0.01)
 
-    assert cleanup_calls == []
+    assert cleanup_calls == ["closed"]
     assert errors == [("startup", "Googleへのログインが必要です")]
+    assert scheduler.mode is SchedulerMode.STOPPED
+    assert repository.list()[0].state is JobState.WAITING
+
+
+def test_successful_preflight_discovers_input_without_reload_operation(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "fresh lesson.txt").write_text("lesson", encoding="utf-8")
+    repository = MemoryJobs()
+    scheduler = PersistentPollScheduler(repository)
+
+    def pipeline_factory():
+        return Pipeline(repository)
+
+    instance = GuiPipelineController(
+        jobs=repository,
+        settings=AppSettings(input_directory="input"),
+        app_root=tmp_path,
+        pipeline=None,
+        pipeline_factory=pipeline_factory,
+        scheduler=scheduler,
+        cycle_interval_seconds=0.01,
+    )
+    instance.start()
+    deadline = time.monotonic() + 2
+    while not repository.list() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    while repository.list()[0].state is not JobState.COMPLETED and time.monotonic() < deadline:
+        time.sleep(0.01)
+    instance.shutdown()
+
+    assert len(repository.list()) == 1
+    assert repository.list()[0].script_name == "fresh lesson"
+    assert repository.list()[0].state is JobState.COMPLETED
 
 
 def test_browser_lifecycle_status_is_logged_without_credentials(tmp_path: Path) -> None:
@@ -168,15 +202,16 @@ def test_browser_lifecycle_status_is_logged_without_credentials(tmp_path: Path) 
     records: list[object] = []
     instance.browser_status_provider = lambda: {
         "profile_path": "C:/portable/browser/chrome-profile",
-        "process_alive": True,
-        "pid": 4321,
-        "browser_connected": True,
-        "context_count": 1,
+        "auth_process_alive": False,
+        "auth_pid": None,
+        "automation_connected": True,
         "page_count": 2,
         "gemini_page_count": 1,
         "selected_page_url": "https://notebook.google.com/",
-        "navigation_result": "existing-gemini-page",
+        "navigation_result": "navigated-home",
         "authentication_result": "authenticated",
+        "preflight_result": "PRE_FLIGHT_READY",
+        "preflight_checks": {"auth_chrome_closed": "PASS"},
     }
     instance.bind(
         jobs=lambda _value: None,
@@ -186,7 +221,7 @@ def test_browser_lifecycle_status_is_logged_without_credentials(tmp_path: Path) 
     )
     instance.login()
     message = records[0]["message"]
-    assert "pid=4321" in message and "authentication_result=authenticated" in message
+    assert "PRE_FLIGHT_READY" in message and "authentication_result=authenticated" in message
     assert "Cookie" not in message and "token" not in message
 
 

@@ -51,6 +51,7 @@ class GuiPipelineController:
         self._guard = threading.RLock()
         self._worker: threading.Thread | None = None
         self._paused = False
+        self._phase = "idle"
         self._jobs_callback: Callable[[object], None] = lambda _value: None
         self._status_callback: Callable[[object], None] = lambda _value: None
         self._log_callback: Callable[[object], None] = lambda _value: None
@@ -116,7 +117,7 @@ class GuiPipelineController:
                 return self.status()
             self._paused = False
             self._stop_event.clear()
-            self.scheduler.start()
+            self._phase = "preflight" if self.pipeline_factory is not None else "processing"
             self._worker = threading.Thread(
                 target=self._run_loop,
                 name="djd-pipeline-controller",
@@ -184,10 +185,17 @@ class GuiPipelineController:
                     self._log_callback(
                         {"level": "ERROR", "stage": "startup", "message": str(exc)}
                     )
+                    self._publish_browser_status("preflight-failed")
                     self._error_callback("startup", str(exc))
                     return
                 self._publish_browser_status("start")
                 self.pipeline.scheduler = self.scheduler
+                # Normal operation must remain Login -> Start only. Discover
+                # pre-existing input TXT internally after the side-effect-free
+                # browser gate succeeds, before the first pipeline cycle.
+                self.reload()
+            self.scheduler.start()
+            self._phase = "processing"
             while not self._stop_event.is_set():
                 with self._guard:
                     paused = self._paused
@@ -244,6 +252,7 @@ class GuiPipelineController:
                 self.pipeline = None
             with self._guard:
                 self._worker = None
+                self._phase = "idle"
             self._publish_status()
 
     def status(self) -> dict[str, object]:
@@ -266,6 +275,7 @@ class GuiPipelineController:
             "paused": paused,
             "scheduler_mode": self.scheduler.mode.value,
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
+            "phase": self._phase,
         }
 
     def _publish_status(self, values: list[Job] | None = None) -> None:

@@ -11,7 +11,7 @@ $ProjectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Pa
 $Spec = Join-Path $ProjectRoot "packaging\DJDMaker.spec"
 $DistRoot = Join-Path $ProjectRoot "dist"
 $WorkRoot = Join-Path $ProjectRoot "build\pyinstaller"
-$ReleaseRoot = Join-Path $DistRoot "DJDmaker_v0.1.2"
+$ReleaseRoot = Join-Path $DistRoot "DJDmaker_v0.1.3"
 $AssetRoot = Join-Path $ProjectRoot "build\packaging-assets"
 
 $env:DJD_FFMPEG_PATH = (Resolve-Path -LiteralPath $FFmpegPath).Path
