@@ -128,6 +128,19 @@ def verify(root: Path) -> dict[str, object]:
         raise RuntimeError("packaged browser smoke did not pass")
     browser_report_path.unlink()
 
+    preset_report_path = root / "work" / "portable-preset-report.json"
+    completed = _run(
+        [str(executable), "--packaging-preset-smoke", str(preset_report_path)],
+        cwd=root,
+        env=smoke_environment,
+    )
+    if completed.returncode != 0 or not preset_report_path.is_file():
+        raise RuntimeError(f"packaged preset smoke failed: exit={completed.returncode}")
+    preset_report = json.loads(preset_report_path.read_text(encoding="utf-8"))
+    if preset_report.get("passed") is not True:
+        raise RuntimeError("packaged preset smoke did not pass")
+    preset_report_path.unlink()
+
     e2e_report_path = root / "work" / "portable-fake-e2e-report.json"
     completed = _run(
         [str(executable), "--packaging-fake-e2e", str(e2e_report_path)],
@@ -147,6 +160,7 @@ def verify(root: Path) -> dict[str, object]:
         "media_versions": media_versions,
         "settings_restart": reports,
         "browser_smoke": browser_report,
+        "preset_smoke": preset_report,
         "portable_fake_e2e": e2e_report,
     }
 

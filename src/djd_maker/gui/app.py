@@ -14,7 +14,7 @@ from djd_maker.adapters.notebook import (
     NotebookEngineAdapter,
     PlaywrightArtifactDownload,
 )
-from djd_maker.core.repositories import JobRepository, SettingsRepository
+from djd_maker.core.repositories import JobRepository, PresetRepository, SettingsRepository
 from djd_maker.media.raw_store import RawSafeStore
 from djd_maker.media.validator import VideoValidator
 from djd_maker.orchestration.gui_controller import GuiPipelineController
@@ -42,6 +42,7 @@ def build_desktop(
     root = app_root.resolve()
     application = qt_app or QApplication.instance() or QApplication(sys.argv)
     settings_repository = SettingsRepository(root / "system" / "settings.json")
+    preset_repository = PresetRepository(root / "system" / "presets.json")
     job_repository = JobRepository(root / "system" / "jobs")
     settings = settings_repository.load()
     browser = browser_manager or BrowserManager(
@@ -57,6 +58,7 @@ def build_desktop(
     def pipeline_factory() -> PipelineCoordinator:
         current = settings_repository.load()
         current.validate()
+        selected_preset = preset_repository.require_selected()
         ending_path = _resolved(root, current.ending_video) if current.ending_video else Path("")
         if not current.ending_video or not ending_path.is_file():
             raise FileNotFoundError("Ending動画が未設定または存在しません")
@@ -87,6 +89,7 @@ def build_desktop(
             ),
             ffmpeg_concurrency=current.ffmpeg_concurrency,
             scheduler=scheduler,
+            generation_preset=selected_preset,
         )
 
     service = GuiPipelineController(
@@ -107,6 +110,7 @@ def build_desktop(
         settings_repository=settings_repository,
         job_repository=job_repository,
         controller=bridge,
+        preset_repository=preset_repository,
     )
     return application, window, service
 

@@ -12,9 +12,9 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from djd_maker.core.models import Job, JobState
 from djd_maker.core.settings import AppSettings
-from djd_maker.core.repositories import SettingsRepository, SettingsSaveError
+from djd_maker.core.repositories import PresetRepository, SettingsRepository, SettingsSaveError
 from djd_maker.gui.controller import AsyncControllerBridge
-from djd_maker.gui.dialogs import JobDetailDialog, LogDialog
+from djd_maker.gui.dialogs import JobDetailDialog, LogDialog, SettingsDialog
 from djd_maker.gui.main_window import MainWindow
 from djd_maker.gui.viewmodels import LogRecord, sanitize_log_text
 
@@ -181,6 +181,54 @@ def test_normal_ux_is_login_then_start_with_no_extra_gui_operation(tmp_path: Pat
     assert controller.calls == ["login", "start"]
     assert window.statusBar().currentMessage() == "準備確認中..."
     window.close()
+
+
+def test_settings_dialog_manages_and_persists_selected_preset(tmp_path: Path, monkeypatch) -> None:
+    _app()
+    repository = PresetRepository(tmp_path / "system" / "presets.json")
+
+    class NewDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return 1
+
+        def values(self):
+            return "通常講義", "最初の本文"
+
+    monkeypatch.setattr("djd_maker.gui.dialogs.PresetDialog", NewDialog)
+    dialog = SettingsDialog(AppSettings(), preset_repository=repository)
+    assert dialog.preset_combo.count() == 0
+    assert [
+        dialog.new_preset_button.text(),
+        dialog.edit_preset_button.text(),
+        dialog.duplicate_preset_button.text(),
+        dialog.delete_preset_button.text(),
+    ] == ["新規登録", "編集", "複製", "削除"]
+    dialog._new_preset()
+    created = repository.selected()
+    assert created is not None
+    assert dialog.preset_combo.currentText() == "通常講義"
+
+    class EditDialog(NewDialog):
+        def values(self):
+            return "通常講義・改", "変更した本文"
+
+    monkeypatch.setattr("djd_maker.gui.dialogs.PresetDialog", EditDialog)
+    dialog._edit_preset()
+    assert repository.selected().prompt_text == "変更した本文"  # type: ignore[union-attr]
+    dialog._duplicate_preset()
+    assert repository.selected().name == "通常講義・改 (copy)"  # type: ignore[union-attr]
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    dialog._delete_preset()
+    assert repository.selected().name == "通常講義・改"  # type: ignore[union-attr]
+    assert PresetRepository(tmp_path / "system" / "presets.json").selected() is not None
 
 
 def test_job_detail_enables_only_safe_actions(tmp_path: Path) -> None:

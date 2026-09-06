@@ -23,6 +23,8 @@
 - 認証用Chromeではremote debugging、CDP、Playwright、headless、automation目的のflagを使用せず、password、Cookie、token、Google login DOMを取得・操作しない。
 - Start時のPre-flightは完全な内部処理とし、正常時のユーザー操作を増やさない。正常フローはGoogleログインと授業動画作成開始の2操作だけとする。
 - Pre-flight全項目がPASSするまでNotebook作成、source投入、動画生成を開始しない。
+- 元GNB Creatorの動画生成presetは、選択本文をjobへスナップショットし、生成開始前にNotebookLMの動画解説カスタムトピック欄へ入力する。管理UIだけを実装して生成経路へ接続しない状態をPASSにしない。
+- preset JSONはsettingsと同じprocess内mutex、temporary、flush/fsync、atomic replace、backup/recoveryを使い、保存用lock fileへ依存させない。
 
 ## EXE Build Cleanup
 

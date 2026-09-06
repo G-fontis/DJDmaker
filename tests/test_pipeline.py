@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
 
 from djd_maker.core.interfaces import HlsResult, MediaResult
-from djd_maker.core.models import DownloadSafetyGate, Job, JobState
+from djd_maker.core.models import DownloadSafetyGate, Job, JobState, Preset
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
 from djd_maker.orchestration.scheduler import PersistentPollScheduler
 from djd_maker.testing.fake_notebook import FakeNotebookAdapter
@@ -85,7 +85,8 @@ class Hls:
         return HlsResult(hls_dir, playlist, (segment,), output_zip)
 
 
-def coordinator(tmp_path, jobs, notebook, ending=None):
+def coordinator(tmp_path, jobs, notebook, ending=None, preset=None):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     ending_file = tmp_path / "ending.mp4"
     ending_file.write_bytes(b"ending")
     return PipelineCoordinator(
@@ -102,6 +103,7 @@ def coordinator(tmp_path, jobs, notebook, ending=None):
             ending_file,
         ),
         ffmpeg_concurrency=2,
+        generation_preset=preset,
     )
 
 
@@ -166,6 +168,24 @@ def test_fake_notebook_pipeline_completes_headlessly(tmp_path):
     assert Path(result.zip_path).name == "SD001_仕事とは.zip"
     assert notebook.artifact_delete_calls == [job.id]
     assert result.progress_percent == 100.0
+
+
+def test_selected_preset_is_snapshotted_and_switch_changes_generation_text(tmp_path):
+    fixture = tmp_path / "fixture.mp4"
+    fixture.write_bytes(b"video")
+    prompts = []
+    for key, body in (("a", "プリセットA本文"), ("b", "プリセットB本文")):
+        job = Job(f"lesson-{key}.txt")
+        jobs = MemoryJobs(job)
+        notebook = FakeNotebookAdapter({job.source_path: fixture})
+        preset = Preset(key, f"Preset {key}", body, "created", "updated")
+        coordinator(tmp_path / key, jobs, notebook, preset=preset).run_cycle()
+        saved = jobs.get(job.id)
+        assert saved.preset_id == key
+        assert saved.preset_name == f"Preset {key}"
+        assert saved.generation_prompt == body
+        prompts.extend(notebook.submitted_prompts)
+    assert prompts == ["プリセットA本文", "プリセットB本文"]
 
 
 def test_waiting_notebook_does_not_block_raw_ready_job(tmp_path):

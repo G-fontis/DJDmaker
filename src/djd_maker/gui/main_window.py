@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from djd_maker.core.models import Job, JobState
+from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.settings import AppSettings
 
 from .controller import AsyncControllerBridge
@@ -42,6 +42,12 @@ class JobRepositoryPort(Protocol):
     def list(self) -> list[Job]: ...
 
 
+class PresetRepositoryPort(Protocol):
+    def list(self) -> list[Preset]: ...
+
+    def selected(self) -> Preset | None: ...
+
+
 class MainWindow(QMainWindow):
     APPLICATION_NAME = "台本から授業動画つくるマシーン v0.1.3"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
@@ -55,6 +61,7 @@ class MainWindow(QMainWindow):
         settings_repository: SettingsRepositoryPort,
         job_repository: JobRepositoryPort,
         controller: AsyncControllerBridge,
+        preset_repository: PresetRepositoryPort | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -62,6 +69,7 @@ class MainWindow(QMainWindow):
         self.settings_repository = settings_repository
         self.job_repository = job_repository
         self.controller = controller
+        self.preset_repository = preset_repository
         self.settings = self.settings_repository.load()
         self.jobs: list[Job] = []
         self._running = False
@@ -272,7 +280,11 @@ class MainWindow(QMainWindow):
         self._preview_player.play(ending)
 
     def show_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self)
+        dialog = SettingsDialog(
+            self.settings,
+            self,
+            preset_repository=self.preset_repository,
+        )
         if not dialog.exec():
             return
         updated = dialog.value()
@@ -352,6 +364,13 @@ class MainWindow(QMainWindow):
         self._log_dialog.activateWindow()
 
     def start_processing(self) -> None:
+        if self.preset_repository is not None and self.preset_repository.selected() is None:
+            QMessageBox.warning(
+                self,
+                "プリセット未設定",
+                "動画生成プリセットを登録・選択してください。",
+            )
+            return
         if self._ending_path() is None:
             QMessageBox.warning(
                 self,

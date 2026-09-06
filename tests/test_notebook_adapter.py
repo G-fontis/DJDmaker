@@ -549,20 +549,57 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
         def rename_notebook(self, title):
             events.append(("rename", title))
 
-        def start_video_generation(self):
-            events.append("generate")
+        def start_video_generation(self, prompt):
+            events.append(("generate", prompt))
 
     from djd_maker.core.models import Job
 
-    result = NotebookEngineAdapter(Dom()).submit(Job(str(source)))
+    result = NotebookEngineAdapter(Dom()).submit(
+        Job(str(source), generation_prompt="選択したプリセット本文")
+    )
     assert result[0] == "id"
     assert events == [
         "create",
         ("rename", "SD001_仕事とは"),
         ("upload", source),
         "source_ready",
-        "generate",
+        ("generate", "選択したプリセット本文"),
     ]
+
+
+def test_video_generation_fills_selected_preset_before_generate_click():
+    events = []
+
+    class Node:
+        def __init__(self, name):
+            self.name = name
+
+        def click(self):
+            events.append(("click", self.name))
+
+        def fill(self, value):
+            events.append(("fill", self.name, value))
+
+    adapter = NotebookDomAdapter(object())
+    adapter._first_visible = lambda _selectors, name: Node(name)  # type: ignore[method-assign]
+    adapter.start_video_generation("プリセットAの本文")
+    assert events == [
+        ("click", "Video Overview作成"),
+        ("fill", "動画解説のカスタムトピック欄", "プリセットAの本文"),
+        ("click", "動画生成ボタン"),
+    ]
+
+
+def test_engine_rejects_missing_preset_before_creating_notebook():
+    class Dom:
+        def create_notebook(self):
+            raise AssertionError("Notebook must not be created")
+
+    from djd_maker.adapters.notebook import NotebookAdapterError
+    from djd_maker.core.models import Job
+
+    with pytest.raises(NotebookAdapterError, match="動画生成プリセット"):
+        NotebookEngineAdapter(Dom()).submit(Job("lesson.txt"))
 
 
 def test_engine_status_waits_for_delayed_artifact_dom():

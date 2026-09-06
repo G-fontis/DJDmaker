@@ -244,6 +244,12 @@ VIDEO_CREATE = (
         "",
     ),
 )
+VIDEO_CUSTOM_TOPIC = (
+    ("role", "textbox", "この動画で重視するポイントは何ですか？"),
+    ("role", "textbox", "What should the AI hosts focus on?"),
+    ("label", "", "この動画で重視するポイントは何ですか？"),
+    ("css", "textarea", ""),
+)
 VIDEO_GENERATE = (
     ("role", "button", "生成"),
     ("role", "button", "Generate"),
@@ -427,8 +433,13 @@ class NotebookDomAdapter:
         self.diagnostic("DOM_MISMATCH:source_ready_timeout")
         raise DomMismatchError("TXT sourceの解析完了を確認できません")
 
-    def start_video_generation(self) -> None:
+    def start_video_generation(self, prompt: str) -> None:
+        if not prompt.strip():
+            raise ValueError("動画生成プリセット本文が空です")
         self._first_visible(VIDEO_CREATE, "Video Overview作成").click()
+        self._first_visible(
+            VIDEO_CUSTOM_TOPIC, "動画解説のカスタムトピック欄"
+        ).fill(prompt)
         self._first_visible(VIDEO_GENERATE, "動画生成ボタン").click()
 
     def inspect_status(self) -> RemoteVideoStatus:
@@ -716,11 +727,14 @@ class NotebookEngineAdapter:
         self.recover_page = recover_page
 
     def submit(self, job: Job) -> tuple[str, str]:
+        prompt = job.generation_prompt or ""
+        if not prompt.strip():
+            raise NotebookAdapterError("動画生成プリセットが設定されていません")
         metadata = self.dom.create_notebook()
         self.dom.rename_notebook(job.script_name)
         self.dom.upload_txt(Path(job.source_path))
         self.dom.wait_for_source_ready()
-        self.dom.start_video_generation()
+        self.dom.start_video_generation(prompt)
         return metadata.notebook_id, metadata.notebook_url
 
     def _open_job(self, job: Job) -> None:

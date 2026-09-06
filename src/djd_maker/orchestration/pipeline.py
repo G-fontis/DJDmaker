@@ -12,7 +12,7 @@ from djd_maker.core.interfaces import (
     NotebookEngine,
     require_remote_deletion_gate,
 )
-from djd_maker.core.models import Job, JobState
+from djd_maker.core.models import Job, JobState, Preset
 
 
 class JobRepositoryPort(Protocol):
@@ -91,6 +91,7 @@ class PipelineCoordinator:
         paths: PipelinePaths,
         ffmpeg_concurrency: int = 1,
         scheduler: PollSchedulerPort | None = None,
+        generation_preset: Preset | None = None,
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
@@ -105,6 +106,7 @@ class PipelineCoordinator:
         self.paths = paths
         self.ffmpeg_concurrency = ffmpeg_concurrency
         self.scheduler = scheduler
+        self.generation_preset = generation_preset
 
     def _save(self, job: Job) -> None:
         self.jobs.save(job)
@@ -151,6 +153,10 @@ class PipelineCoordinator:
             return
         try:
             if job.state is JobState.WAITING:
+                if self.generation_preset is not None:
+                    job.preset_id = self.generation_preset.id
+                    job.preset_name = self.generation_preset.name
+                    job.generation_prompt = self.generation_preset.prompt_text
                 self._transition(job, JobState.UPLOADING)
                 notebook_id, notebook_url = self.notebook.submit(job)
                 job.notebook_id = notebook_id
@@ -361,6 +367,9 @@ class PipelineCoordinator:
             state=restart_at,
             notebook_id=previous.notebook_id,
             notebook_url=previous.notebook_url,
+            preset_id=previous.preset_id,
+            preset_name=previous.preset_name,
+            generation_prompt=previous.generation_prompt,
             raw_path=previous.raw_path,
             edited_path=previous.edited_path,
             safety_gate=previous.safety_gate,

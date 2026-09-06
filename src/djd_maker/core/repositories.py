@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 from uuid import uuid4
 
-from .models import Job, JobState, utc_now
+from .models import Job, JobState, Preset, utc_now
 from .settings import AppSettings
 from .storage import JsonStore
 
@@ -36,6 +36,14 @@ class RepositoryLockTimeout(RepositoryError):
 
 class SettingsSaveError(RepositoryError):
     """Settings publish failed after bounded transient retries."""
+
+
+class PresetNotFoundError(LookupError):
+    pass
+
+
+class DuplicatePresetNameError(ValueError):
+    pass
 
 
 _thread_locks_guard = threading.Lock()
@@ -283,6 +291,168 @@ class SettingsRepository:
                 "設定をsettings.jsonへ保存できませんでした。既存の設定ファイルは"
                 "破損していません。ほかの同期処理が終わってから再試行してください。"
             ) from error
+
+
+class PresetRepository:
+    """Atomic JSON persistence for GNB-compatible generation presets."""
+
+    REPLACE_RETRY_DELAYS = SettingsRepository.REPLACE_RETRY_DELAYS
+
+    def __init__(self, path: str | Path) -> None:
+        self._document = _VersionedDocument(
+            path,
+            "presets",
+            use_file_lock=False,
+            replace_retry_delays=self.REPLACE_RETRY_DELAYS,
+        )
+
+    @staticmethod
+    def _default() -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "presets",
+            "selected_preset_id": None,
+            "presets": [],
+        }
+
+    @staticmethod
+    def _decode(value: Mapping[str, Any]) -> Preset:
+        try:
+            return Preset(
+                id=str(value["id"]),
+                name=str(value["name"]),
+                prompt_text=str(value["prompt_text"]),
+                created_at=str(value["created_at"]),
+                updated_at=str(value["updated_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise MalformedJsonError(f"invalid preset: {error}") from error
+
+    @classmethod
+    def _presets(cls, document: Mapping[str, Any]) -> list[Preset]:
+        values = document.get("presets")
+        if not isinstance(values, list):
+            raise MalformedJsonError("presets must be a list")
+        presets = [cls._decode(value) for value in values if isinstance(value, Mapping)]
+        if len(presets) != len(values) or len({item.id for item in presets}) != len(presets):
+            raise MalformedJsonError("preset entries or ids are invalid")
+        return presets
+
+    @staticmethod
+    def _validate(name: str, prompt_text: str) -> tuple[str, str]:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Preset name must not be empty")
+        if not prompt_text.strip():
+            raise ValueError("Preset prompt must not be empty")
+        return clean_name, prompt_text
+
+    def list(self) -> list[Preset]:
+        presets = self._presets(self._document.load(self._default()))
+        return sorted(presets, key=lambda item: (item.name.casefold(), item.id))
+
+    def get(self, preset_id: str) -> Preset | None:
+        return next((item for item in self.list() if item.id == preset_id), None)
+
+    def selected(self) -> Preset | None:
+        document = self._document.load(self._default())
+        selected_id = document.get("selected_preset_id")
+        return next(
+            (item for item in self._presets(document) if item.id == selected_id),
+            None,
+        )
+
+    def require_selected(self) -> Preset:
+        preset = self.selected()
+        if preset is None or not preset.prompt_text.strip():
+            raise RuntimeError("動画生成プリセットを登録・選択してください。")
+        return preset
+
+    def create(self, name: str, prompt_text: str) -> Preset:
+        clean_name, prompt_text = self._validate(name, prompt_text)
+        created = Preset(uuid4().hex, clean_name, prompt_text, utc_now(), utc_now())
+
+        def change(document: dict[str, Any]) -> dict[str, Any]:
+            presets = self._presets(document)
+            if any(item.name.casefold() == clean_name.casefold() for item in presets):
+                raise DuplicatePresetNameError(clean_name)
+            document["presets"] = [item.to_dict() for item in (*presets, created)]
+            if document.get("selected_preset_id") is None:
+                document["selected_preset_id"] = created.id
+            return document
+
+        self._document.update(self._default(), change)
+        return created
+
+    def update(self, preset_id: str, name: str, prompt_text: str) -> Preset:
+        clean_name, prompt_text = self._validate(name, prompt_text)
+        changed: Preset | None = None
+
+        def change(document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal changed
+            presets = self._presets(document)
+            if any(
+                item.id != preset_id and item.name.casefold() == clean_name.casefold()
+                for item in presets
+            ):
+                raise DuplicatePresetNameError(clean_name)
+            original = next((item for item in presets if item.id == preset_id), None)
+            if original is None:
+                raise PresetNotFoundError(preset_id)
+            changed = Preset(
+                original.id,
+                clean_name,
+                prompt_text,
+                original.created_at,
+                utc_now(),
+            )
+            document["presets"] = [
+                (changed if item.id == preset_id else item).to_dict() for item in presets
+            ]
+            return document
+
+        self._document.update(self._default(), change)
+        assert changed is not None
+        return changed
+
+    def delete(self, preset_id: str) -> None:
+        def change(document: dict[str, Any]) -> dict[str, Any]:
+            presets = self._presets(document)
+            if not any(item.id == preset_id for item in presets):
+                raise PresetNotFoundError(preset_id)
+            remaining = sorted(
+                (item for item in presets if item.id != preset_id),
+                key=lambda item: (item.name.casefold(), item.id),
+            )
+            document["presets"] = [item.to_dict() for item in remaining]
+            if document.get("selected_preset_id") == preset_id:
+                document["selected_preset_id"] = remaining[0].id if remaining else None
+            return document
+
+        self._document.update(self._default(), change)
+
+    def select(self, preset_id: str | None) -> None:
+        def change(document: dict[str, Any]) -> dict[str, Any]:
+            presets = self._presets(document)
+            if preset_id is not None and not any(item.id == preset_id for item in presets):
+                raise PresetNotFoundError(preset_id)
+            document["selected_preset_id"] = preset_id
+            return document
+
+        self._document.update(self._default(), change)
+
+    def duplicate(self, preset_id: str) -> Preset:
+        original = self.get(preset_id)
+        if original is None:
+            raise PresetNotFoundError(preset_id)
+        existing = {item.name.casefold() for item in self.list()}
+        base = f"{original.name} (copy)"
+        name = base
+        counter = 2
+        while name.casefold() in existing:
+            name = f"{base} {counter}"
+            counter += 1
+        return self.create(name, original.prompt_text)
 
 
 class JobRepository:

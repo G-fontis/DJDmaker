@@ -79,6 +79,18 @@ class DownloadSafetyGate:
         return tuple(name for name, passed in asdict(self).items() if not passed)
 
 
+@dataclass(frozen=True, slots=True)
+class Preset:
+    id: str
+    name: str
+    prompt_text: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
 @dataclass(slots=True)
 class Job:
     source_path: str
@@ -87,6 +99,9 @@ class Job:
     state: JobState = JobState.WAITING
     notebook_id: str | None = None
     notebook_url: str | None = None
+    preset_id: str | None = None
+    preset_name: str | None = None
+    generation_prompt: str | None = None
     generation_started_at: str | None = None
     next_poll_at: str | None = None
     last_polled_at: str | None = None

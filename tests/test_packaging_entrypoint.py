@@ -30,3 +30,19 @@ def test_settings_smoke_can_change_and_read_expected_value(
         "expected_value": 241,
     }
     assert json.loads(read_report.read_text(encoding="utf-8"))["passed"] is True
+
+
+def test_preset_smoke_persists_selected_preset_across_repository_restart(
+    tmp_path, monkeypatch
+) -> None:
+    from djd_maker.packaging import preflight
+
+    monkeypatch.setenv("DJD_PACKAGING_SMOKE", "1")
+    monkeypatch.setattr(preflight, "application_root", lambda: tmp_path)
+    report = tmp_path / "preset-report.json"
+    assert ENTRYPOINT._preset_smoke(report) == 0
+    assert json.loads(report.read_text(encoding="utf-8")) == {
+        "passed": True,
+        "preset_count": 2,
+        "selected_preset": "portable B",
+    }

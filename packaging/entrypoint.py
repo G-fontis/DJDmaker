@@ -56,6 +56,39 @@ def _browser_smoke(report_path: Path) -> int:
     return 0 if passed else 7
 
 
+def _preset_smoke(report_path: Path) -> int:
+    """Verify packaged preset CRUD, selection and restart persistence."""
+    if os.environ.get("DJD_PACKAGING_SMOKE") != "1":
+        return 3
+    from djd_maker.core.repositories import PresetRepository
+    from djd_maker.packaging.preflight import application_root
+
+    repository = PresetRepository(application_root() / "system" / "presets.json")
+    first = repository.create("portable A", "preset body A")
+    second = repository.create("portable B", "preset body B")
+    repository.select(second.id)
+    restarted = PresetRepository(application_root() / "system" / "presets.json")
+    selected = restarted.selected()
+    passed = (
+        [item.id for item in restarted.list()] == [first.id, second.id]
+        and selected is not None
+        and selected.id == second.id
+        and selected.prompt_text == "preset body B"
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "passed": passed,
+                "preset_count": len(restarted.list()),
+                "selected_preset": selected.name if selected else None,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return 0 if passed else 8
+
+
 def _dispatch() -> int:
     if len(sys.argv) in {4, 5} and sys.argv[1] == "--packaging-settings-smoke":
         expected_value = int(sys.argv[4]) if len(sys.argv) == 5 else 137
@@ -68,6 +101,8 @@ def _dispatch() -> int:
         return run_portable_fake_e2e(Path(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] == "--packaging-browser-smoke":
         return _browser_smoke(Path(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--packaging-preset-smoke":
+        return _preset_smoke(Path(sys.argv[2]))
     from djd_maker.gui.app import main
 
     return main()

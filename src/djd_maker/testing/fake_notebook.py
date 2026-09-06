@@ -15,12 +15,14 @@ class FakeNotebookAdapter:
     fixture_by_source: dict[str, Path]
     status_by_job: dict[str, str] = field(default_factory=dict)
     submit_calls: list[str] = field(default_factory=list)
+    submitted_prompts: list[str | None] = field(default_factory=list)
     download_calls: list[str] = field(default_factory=list)
     artifact_delete_calls: list[str] = field(default_factory=list)
     fail_delete: bool = False
 
     def submit(self, job: Job) -> tuple[str, str]:
         self.submit_calls.append(job.id)
+        self.submitted_prompts.append(job.generation_prompt)
         notebook_id = f"fake-{job.id}"
         self.status_by_job[job.id] = "READY"
         return notebook_id, f"https://notebook.google.com/notebook/{notebook_id}"

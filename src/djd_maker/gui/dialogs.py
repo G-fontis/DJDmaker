@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QStandardItem, QStandardItemModel
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QTableView,
@@ -24,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from djd_maker.core.models import Job, JobState
+from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.settings import AppSettings
 
 from .viewmodels import LogRecord, safe_existing_file
@@ -37,9 +39,74 @@ def open_local_path(path: Path, *, parent: QWidget | None = None) -> bool:
     return QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
 
-class SettingsDialog(QDialog):
-    def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
+class PresetRepositoryPort(Protocol):
+    def list(self) -> list[Preset]: ...
+
+    def selected(self) -> Preset | None: ...
+
+    def create(self, name: str, prompt_text: str) -> Preset: ...
+
+    def update(self, preset_id: str, name: str, prompt_text: str) -> Preset: ...
+
+    def delete(self, preset_id: str) -> None: ...
+
+    def select(self, preset_id: str | None) -> None: ...
+
+    def duplicate(self, preset_id: str) -> Preset: ...
+
+
+class PresetDialog(QDialog):
+    """GNB Creator compatible name/body editor."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        name: str = "",
+        prompt_text: str = "",
+    ) -> None:
         super().__init__(parent)
+        self.setWindowTitle("動画生成プリセット")
+        self.resize(620, 430)
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("例：福ゼミ通常講義")
+        self.prompt_edit = QPlainTextEdit(prompt_text)
+        self.prompt_edit.setPlaceholderText(
+            "NotebookLMの動画解説カスタムトピックへ送信する文章を入力してください"
+        )
+        form = QFormLayout()
+        form.addRow("プリセット名", self.name_edit)
+        form.addRow("本文", self.prompt_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def _validate_and_accept(self) -> None:
+        if not self.name_edit.text().strip() or not self.prompt_edit.toPlainText().strip():
+            QMessageBox.warning(self, "入力不足", "プリセット名と本文を入力してください。")
+            return
+        self.accept()
+
+    def values(self) -> tuple[str, str]:
+        return self.name_edit.text().strip(), self.prompt_edit.toPlainText().strip()
+
+
+class SettingsDialog(QDialog):
+    def __init__(
+        self,
+        settings: AppSettings,
+        parent: QWidget | None = None,
+        *,
+        preset_repository: PresetRepositoryPort | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.preset_repository = preset_repository
         self.setWindowTitle("設定")
         self.setMinimumWidth(620)
         layout = QVBoxLayout(self)
@@ -66,12 +133,124 @@ class SettingsDialog(QDialog):
         padding = QLabel("0.5秒（安全仕様・変更不可）")
         form.addRow("音声末尾余白", padding)
 
+        if self.preset_repository is not None:
+            preset_group = QGroupBox("動画生成プリセット")
+            preset_layout = QVBoxLayout(preset_group)
+            preset_form = QFormLayout()
+            self.preset_combo = QComboBox()
+            preset_form.addRow("選択中プリセット", self.preset_combo)
+            preset_layout.addLayout(preset_form)
+            preset_buttons = QHBoxLayout()
+            self.new_preset_button = QPushButton("新規登録")
+            self.edit_preset_button = QPushButton("編集")
+            self.duplicate_preset_button = QPushButton("複製")
+            self.delete_preset_button = QPushButton("削除")
+            for button in (
+                self.new_preset_button,
+                self.edit_preset_button,
+                self.duplicate_preset_button,
+                self.delete_preset_button,
+            ):
+                preset_buttons.addWidget(button)
+            preset_buttons.addStretch()
+            preset_layout.addLayout(preset_buttons)
+            layout.addWidget(preset_group)
+            self.preset_combo.currentIndexChanged.connect(self._preset_changed)
+            self.new_preset_button.clicked.connect(self._new_preset)
+            self.edit_preset_button.clicked.connect(self._edit_preset)
+            self.duplicate_preset_button.clicked.connect(self._duplicate_preset)
+            self.delete_preset_button.clicked.connect(self._delete_preset)
+            self._reload_presets()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _selected_preset(self) -> Preset | None:
+        if self.preset_repository is None:
+            return None
+        preset_id = self.preset_combo.currentData()
+        return next((item for item in self.preset_repository.list() if item.id == preset_id), None)
+
+    def _reload_presets(self, select_id: str | None = None) -> None:
+        assert self.preset_repository is not None
+        if select_id is None:
+            selected = self.preset_repository.selected()
+            select_id = selected.id if selected else None
+        presets = self.preset_repository.list()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for preset in presets:
+            self.preset_combo.addItem(preset.name, preset.id)
+        index = self.preset_combo.findData(select_id) if select_id is not None else -1
+        self.preset_combo.setCurrentIndex(index)
+        self.preset_combo.blockSignals(False)
+        has_selection = index >= 0
+        self.edit_preset_button.setEnabled(has_selection)
+        self.duplicate_preset_button.setEnabled(has_selection)
+        self.delete_preset_button.setEnabled(has_selection)
+
+    def _preset_changed(self) -> None:
+        assert self.preset_repository is not None
+        self.preset_repository.select(self.preset_combo.currentData())
+        has_selection = self.preset_combo.currentIndex() >= 0
+        self.edit_preset_button.setEnabled(has_selection)
+        self.duplicate_preset_button.setEnabled(has_selection)
+        self.delete_preset_button.setEnabled(has_selection)
+
+    def _new_preset(self) -> None:
+        assert self.preset_repository is not None
+        dialog = PresetDialog(self)
+        if not dialog.exec():
+            return
+        try:
+            preset = self.preset_repository.create(*dialog.values())
+            self.preset_repository.select(preset.id)
+            self._reload_presets(preset.id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "保存できません", str(exc))
+
+    def _edit_preset(self) -> None:
+        assert self.preset_repository is not None
+        preset = self._selected_preset()
+        if preset is None:
+            QMessageBox.information(self, "プリセット", "編集するプリセットを選択してください。")
+            return
+        dialog = PresetDialog(self, name=preset.name, prompt_text=preset.prompt_text)
+        if not dialog.exec():
+            return
+        try:
+            self.preset_repository.update(preset.id, *dialog.values())
+            self._reload_presets(preset.id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "保存できません", str(exc))
+
+    def _duplicate_preset(self) -> None:
+        assert self.preset_repository is not None
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        try:
+            duplicate = self.preset_repository.duplicate(preset.id)
+            self.preset_repository.select(duplicate.id)
+            self._reload_presets(duplicate.id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "複製できません", str(exc))
+
+    def _delete_preset(self) -> None:
+        assert self.preset_repository is not None
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        answer = QMessageBox.question(
+            self, "プリセット削除", f"「{preset.name}」を削除しますか？"
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.preset_repository.delete(preset.id)
+            self._reload_presets()
 
     def _directory_row(self, form: QFormLayout, label: str, value: str) -> QLineEdit:
         edit = QLineEdit(value)
