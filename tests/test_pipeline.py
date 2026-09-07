@@ -134,6 +134,34 @@ def coordinator(tmp_path, jobs, notebook, ending=None, preset=None):
     )
 
 
+@pytest.mark.parametrize('state',[JobState.RAW_READY,JobState.ENDING,JobState.HLS_ENCODING,JobState.ZIPPING])
+def test_optional_ending_uses_immutable_raw_and_can_resume(tmp_path,state):
+    from dataclasses import replace
+    raw=tmp_path/'raw.mp4';raw.write_bytes(b'original raw video')
+    job=Job('optional.txt',state=state,raw_path=str(raw))
+    if state in {JobState.HLS_ENCODING,JobState.ZIPPING}:
+        job.edited_path=str(raw);job.ending_result='SKIPPED (not configured)'
+    jobs=MemoryJobs(job);ending=Ending()
+    pipeline=coordinator(tmp_path,jobs,FakeNotebookAdapter({}),ending)
+    pipeline.paths=replace(pipeline.paths,ending_video=None)
+    pipeline.run_cycle()
+    saved=jobs.get(job.id)
+    assert saved.state is JobState.COMPLETED
+    assert saved.ending_result=='SKIPPED (not configured)'
+    assert saved.edited_path==str(raw)
+    assert ending.calls==[]
+    assert raw.read_bytes()==b'original raw video'
+    with ZipFile(saved.zip_path) as archive:
+        assert archive.read('segment00000.ts')==raw.read_bytes()
+
+
+def test_optional_ending_constructor_accepts_none(tmp_path):
+    instance=PipelineCoordinator(jobs=MemoryJobs(),notebook=FakeNotebookAdapter({}),
+        raw_store=RawStore(),ending=Ending(),hls=Hls(),validator=Validator(),
+        paths=PipelinePaths(tmp_path/'raw',tmp_path/'output',tmp_path/'work',None))
+    assert instance.paths.ending_video is None
+
+
 class SchedulerClock:
     def __init__(self) -> None:
         self.now = datetime(2026, 9, 6, tzinfo=UTC)

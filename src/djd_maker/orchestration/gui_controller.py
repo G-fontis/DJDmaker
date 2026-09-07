@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import threading
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from djd_maker.core.models import Job, JobState
 from djd_maker.core.settings import AppSettings
+from djd_maker.core.cancellation import CancellationToken, RunCancelled, cancellation_scope, checkpoint
+from djd_maker.adapters.notebook_modal import BlockingModalError
 
 from .pipeline import PipelineCoordinator
 from .scheduler import PersistentPollScheduler, SchedulerMode
@@ -26,6 +29,8 @@ class GuiPipelineController:
         pipeline_factory: Callable[[], PipelineCoordinator] | None = None,
         recovery_pipeline_factory: Callable[[], PipelineCoordinator] | None = None,
         cleanup: Callable[[], None] | None = None,
+        abort_owned_external: Callable[[], None] | None = None,
+        shutdown_diagnostic: Callable[[], dict] | None = None,
         settings_provider: Callable[[], AppSettings] | None = None,
         manual_login: Callable[[], Any] | None = None,
         browser_status_provider: Callable[[], dict[str, object]] | None = None,
@@ -42,6 +47,8 @@ class GuiPipelineController:
         self.pipeline_factory = pipeline_factory
         self.recovery_pipeline_factory = recovery_pipeline_factory or pipeline_factory
         self.cleanup = cleanup or (lambda: None)
+        self.abort_owned_external = abort_owned_external or (lambda: None)
+        self.shutdown_diagnostic = shutdown_diagnostic or (lambda: {})
         self.settings_provider = settings_provider
         self.manual_login = manual_login
         self.browser_status_provider = browser_status_provider
@@ -49,10 +56,14 @@ class GuiPipelineController:
         if self.pipeline is not None:
             self.pipeline.scheduler = scheduler
         self.cycle_interval_seconds = cycle_interval_seconds
-        self._stop_event = threading.Event()
+        self.cancellation = CancellationToken()
+        self._stop_event = self.cancellation.event
         self._guard = threading.RLock()
         self._worker: threading.Thread | None = None
+        self._retiring_worker: threading.Thread | None = None
         self._recovering = False
+        self._recovery_done = threading.Event()
+        self._recovery_done.set()
         self._paused = False
         self._phase = "idle"
         self._jobs_callback: Callable[[object], None] = lambda _value: None
@@ -136,7 +147,7 @@ class GuiPipelineController:
             if self.pipeline_factory is not None:
                 self.pipeline = None
             self._paused = False
-            self._stop_event.clear()
+            self.cancellation.reset()
             self._phase = "preflight" if self.pipeline_factory is not None else "processing"
             self._worker = threading.Thread(
                 target=self._run_loop,
@@ -147,6 +158,10 @@ class GuiPipelineController:
         return self.status()
 
     def recover_pending(self) -> dict[str, object]:
+        with cancellation_scope(self.cancellation):
+            return self._recover_pending_cancellable()
+
+    def _recover_pending_cancellable(self) -> dict[str, object]:
         """Check persisted recovery jobs once without creating new remote work."""
         with self._guard:
             if self._recovering or (
@@ -157,6 +172,8 @@ class GuiPipelineController:
             if factory is None:
                 raise RuntimeError("未回収動画の回収処理が構成されていません")
             self._recovering = True
+            self.cancellation.reset()
+            self._recovery_done.clear()
             self._phase = "recovery"
         try:
             pipeline = factory()
@@ -173,13 +190,17 @@ class GuiPipelineController:
                 "pending": len(pending_before),
                 "checked": len(processed),
             }
+        except RunCancelled:
+            return {'pending': 0, 'checked': 0, 'stopped': True}
         finally:
             try:
-                self.cleanup()
+                with cancellation_scope(None):
+                    self.cleanup()
             finally:
                 with self._guard:
                     self._recovering = False
                     self._phase = "idle"
+                    self._recovery_done.set()
                 self._publish_status()
 
     def refresh_credit(self) -> dict[str, object]:
@@ -195,18 +216,32 @@ class GuiPipelineController:
         self._publish_status()
         return self.status()
 
-    def stop(self) -> dict[str, object]:
+    def request_stop(self) -> None:
         self.scheduler.stop()
-        self._stop_event.set()
+        self.cancellation.request()
+        self._phase = 'STOP_REQUESTED'
+
+    def stop(self) -> dict[str, object]:
+        self.request_stop()
         with self._guard:
-            worker = self._worker
-        if worker is None:
+            worker = self._worker or self._retiring_worker
+        if (worker is None or not worker.is_alive()) and not self._recovering:
             self.cleanup()
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=5)
+            worker.join(timeout=6)
+            if worker.is_alive():
+                self._log_callback({'level':'WARNING', 'stage':'shutdown-fallback',
+                    'message':json.dumps({**self.cancellation.diagnostic(), **self.shutdown_diagnostic()})})
+                self.abort_owned_external()
+                worker.join(timeout=4)
+        if self._recovering:
+            if not self._recovery_done.wait(timeout=6):
+                self.abort_owned_external()
+                self._recovery_done.wait(timeout=4)
         with self._guard:
             if worker is None or not worker.is_alive():
                 self._worker = None
+                self._phase = 'STOPPED'
             self._paused = False
         self._publish_status()
         return self.status()
@@ -214,6 +249,7 @@ class GuiPipelineController:
     def shutdown(self) -> None:
         result = self.stop()
         if result["running"]:
+            self._log_callback({'level':'ERROR', 'stage':'shutdown-timeout', 'message':json.dumps(self.cancellation.diagnostic())})
             raise RuntimeError("pipeline worker did not stop safely")
 
     def retry(self, job_id: str, stage: str) -> Job:
@@ -234,8 +270,13 @@ class GuiPipelineController:
         return result
 
     def _run_loop(self) -> None:
+        with cancellation_scope(self.cancellation):
+            self._run_loop_cancellable()
+
+    def _run_loop_cancellable(self) -> None:
         cleanup_browser = True
         try:
+            checkpoint('pipeline.start')
             if self.pipeline is None:
                 assert self.pipeline_factory is not None
                 try:
@@ -270,6 +311,8 @@ class GuiPipelineController:
                 if not paused:
                     try:
                         self.pipeline.run_cycle()
+                    except BlockingModalError:
+                        raise
                     except Exception as exc:
                         self._log_callback(
                             {
@@ -311,13 +354,19 @@ class GuiPipelineController:
                     ):
                         break
                 self._stop_event.wait(self.cycle_interval_seconds)
+        except BlockingModalError as exc:
+            self.cancellation.request()
+            self._error_callback('modal', str(exc))
+        except RunCancelled:
+            self._log_callback({'level':'INFO', 'stage':'stopped', 'message':json.dumps(self.cancellation.diagnostic())})
         finally:
             # No terminal job can require another Notebook poll. Keep scheduler
             # state aligned with the stopped worker after natural completion too.
             self.scheduler.stop()
             if cleanup_browser:
                 try:
-                    self.cleanup()
+                    with cancellation_scope(None):
+                        self.cleanup()
                 except Exception as exc:
                     self._log_callback(
                         {"level": "WARNING", "stage": "shutdown", "message": str(exc)}
@@ -325,8 +374,9 @@ class GuiPipelineController:
             if self.pipeline_factory is not None:
                 self.pipeline = None
             with self._guard:
+                self._retiring_worker = self._worker
                 self._worker = None
-                self._phase = "idle"
+                self._phase = "STOPPED" if self._stop_event.is_set() else "idle"
             self._publish_status()
 
     def status(self) -> dict[str, object]:

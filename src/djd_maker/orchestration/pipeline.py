@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,8 @@ from djd_maker.core.interfaces import (
 )
 from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.repositories import JobStateSaveError
+from djd_maker.core.cancellation import RunCancelled, checkpoint
+from djd_maker.adapters.notebook_modal import BlockingModalError
 
 
 class JobRepositoryPort(Protocol):
@@ -48,7 +51,7 @@ class PipelinePaths:
     raw_directory: Path
     output_directory: Path
     work_directory: Path
-    ending_video: Path
+    ending_video: Path | None
 
 
 class PipelineCoordinator:
@@ -110,7 +113,7 @@ class PipelineCoordinator:
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
-        if not paths.ending_video.is_file():
+        if paths.ending_video is not None and not paths.ending_video.is_file():
             raise FileNotFoundError(f"Ending動画が未設定または存在しません: {paths.ending_video}")
         self.jobs = jobs
         self.notebook = notebook
@@ -143,7 +146,9 @@ class PipelineCoordinator:
         from djd_maker.core.job_migration import failure_class
         resumed = []
         for job in self.jobs.list():
-            if job.state is not JobState.FAILED:
+            checkpoint('resume.dequeue', job.id)
+            interrupted = job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:')
+            if job.state is not JobState.FAILED and not interrupted:
                 continue
             if job_ids is not None and job.id not in job_ids:
                 continue
@@ -173,6 +178,8 @@ class PipelineCoordinator:
                     target = {"READY": JobState.DOWNLOAD_PENDING, "GENERATING": JobState.WAITING_VIDEO, "WAITING": JobState.RESERVED_WAITING_CREDIT_RESET}.get(status)
                     if status == "NOT_STARTED" and job.failure_class != "FATAL_FAILED":
                         target = JobState.WAITING_VIDEO if diagnosis.get("reply") == "GENERATION_ACCEPTED" else JobState.WAITING
+            except BlockingModalError:
+                raise
             except Exception as exc:
                 job.error_message = f"RESUME_DIAGNOSIS_FAILED: {exc}"
             if target is not None:
@@ -189,6 +196,7 @@ class PipelineCoordinator:
         # Browser automation remains serialized. Waiting in this lane never
         # prevents already downloaded jobs from entering the media pool below.
         for job in self.jobs.list():
+            checkpoint('queue.dequeue', job.id)
             if job.state in self.NOTEBOOK_STATES and not (
                 self.scheduler is not None and job.state is JobState.WAITING_VIDEO
             ):
@@ -201,7 +209,10 @@ class PipelineCoordinator:
         with ThreadPoolExecutor(
             max_workers=self.ffmpeg_concurrency, thread_name_prefix="djd-ffmpeg"
         ) as pool:
-            futures = [pool.submit(self._run_media_job, job) for job in media_jobs]
+            futures = []
+            for job in media_jobs:
+                checkpoint('media.dequeue')
+                futures.append(pool.submit(copy_context().run, self._run_media_job, job))
             for future in futures:
                 future.result()
 
@@ -210,6 +221,7 @@ class PipelineCoordinator:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         processed: list[str] = []
         for job in self.jobs.list():
+            checkpoint('recovery.dequeue', job.id)
             if job.state not in self.RECOVERY_STATES:
                 continue
             if job.state is JobState.RESERVED_WAITING_CREDIT_RESET:
@@ -223,7 +235,10 @@ class PipelineCoordinator:
         with ThreadPoolExecutor(
             max_workers=self.ffmpeg_concurrency, thread_name_prefix="djd-ffmpeg"
         ) as pool:
-            futures = [pool.submit(self._run_media_job, job) for job in media_jobs]
+            futures = []
+            for job in media_jobs:
+                checkpoint('media.dequeue')
+                futures.append(pool.submit(copy_context().run, self._run_media_job, job))
             for future in futures:
                 future.result()
         return processed
@@ -257,6 +272,9 @@ class PipelineCoordinator:
             if status == "FAILED":
                 raise RuntimeError("remote video generation failed")
             self._save(job)
+        except BlockingModalError:
+            # An ambiguous dialog stops the run, not just this recovery item.
+            raise
         except JobStateSaveError:
             # The repository already exhausted its bounded Windows-sharing
             # retries. Preserve remote/local artifacts and surface one terminal
@@ -289,6 +307,7 @@ class PipelineCoordinator:
             return
         try:
             if job.state is JobState.WAITING:
+                checkpoint('notebook.submit')
                 if self.generation_preset is None:
                     raise RuntimeError("PRESET_NOT_SELECTED")
                 if job.preset_body_snapshot is None:
@@ -337,6 +356,7 @@ class PipelineCoordinator:
                     return
 
             if job.state is JobState.WAITING_VIDEO:
+                checkpoint('artifact.poll')
                 status = self.notebook.inspect_status(job)
                 if status != "READY":
                     if status == "FAILED":
@@ -349,6 +369,7 @@ class PipelineCoordinator:
                 self._transition(job, JobState.DOWNLOADING)
 
             if job.state is JobState.DOWNLOADING:
+                checkpoint('download.start')
                 download = (
                     self.paths.work_directory
                     / job.id
@@ -386,6 +407,12 @@ class PipelineCoordinator:
                     job.error_code = "REMOTE_ARTIFACT_DELETE_FAILED"
                     job.error_message = str(exc)
                     self._save(job)
+        except (RunCancelled, BlockingModalError):
+            job.resume_checkpoint = 'STOPPED:' + job.state.value
+            if job.state is JobState.UPLOADING:
+                job.state = JobState.RECOVERY_PENDING
+            self._save(job)
+            raise
         except JobStateSaveError:
             raise
         except Exception as exc:
@@ -409,6 +436,7 @@ class PipelineCoordinator:
 
     def _run_media_job(self, job: Job) -> None:
         try:
+            checkpoint('media.start', job.id)
             raw = Path(job.raw_path or "")
             edited = (
                 self.paths.work_directory / job.id / "ending" / f"{job.script_name}.mp4"
@@ -417,6 +445,15 @@ class PipelineCoordinator:
 
             if job.state is JobState.RAW_READY:
                 self._transition(job, JobState.ENDING)
+
+            if job.state is JobState.ENDING:
+                if self.paths.ending_video is None:
+                    validated = self.validator.validate(raw)
+                    if not getattr(validated, 'valid', True):
+                        raise ValueError('Endingスキップ元RAWの検証に失敗しました')
+                    job.edited_path = str(raw)
+                    job.ending_result = 'SKIPPED (not configured)'
+                    self._transition(job, JobState.HLS_ENCODING)
 
             if job.state is JobState.ENDING:
                 existing_is_valid = False
@@ -462,6 +499,10 @@ class PipelineCoordinator:
                     job.zip_path = str(result.zip_path)
                 job.hls_result = "PASS"
                 self._transition(job, JobState.COMPLETED)
+        except RunCancelled:
+            job.resume_checkpoint = 'STOPPED:' + job.state.value
+            self._save(job)
+            raise
         except JobStateSaveError:
             raise
         except Exception as exc:

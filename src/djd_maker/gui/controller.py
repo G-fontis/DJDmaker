@@ -132,6 +132,9 @@ class AsyncControllerBridge(QObject):
         return self._invoke("pause", self.controller.pause)
 
     def stop(self) -> bool:
+        request = getattr(self.controller, 'request_stop', None)
+        if callable(request):
+            request()
         return self._invoke("stop", self.controller.stop)
 
     def login(self) -> bool:

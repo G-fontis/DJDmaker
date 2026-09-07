@@ -5,6 +5,7 @@ import time
 import re
 
 from .replies import ReplyKind, classify_reply
+from djd_maker.core.cancellation import checkpoint
 
 
 # Keep input selection inside the central panel. No page-wide textarea fallback.
@@ -27,6 +28,10 @@ class ChatFlow:
         self.send_timeout = send_timeout
 
     def root(self):
+        checkpoint('chat.interactable')
+        ensure = getattr(self.dom, 'ensure_interactable', None)
+        if callable(ensure):
+            ensure()
         roots = self.page.locator(CHAT_ROOT)
         visible = [roots.nth(i) for i in range(roots.count()) if roots.nth(i).is_visible()]
         if len(visible) != 1:
@@ -96,6 +101,7 @@ class ChatFlow:
         baseline = None
         last_target_error = None
         for attempt in range(1, 4):
+            checkpoint('chat.retry')
             if baseline is not None:
                 # Read again just before retransmission to catch delayed replies.
                 found, reply = self.correlated_reply(prompt, baseline)
@@ -124,6 +130,7 @@ class ChatFlow:
                 buttons = self.root().get_by_role("button", name=re.compile(r"^(送信|Send)$"))
                 active = [buttons.nth(i) for i in range(buttons.count()) if buttons.nth(i).is_visible() and buttons.nth(i).is_enabled()]
                 if len(active) == 1:
+                    checkpoint('chat.send')
                     self.dom.diagnostic("CHAT_SEND_ENABLED")
                     active[0].click()
                     sent = True

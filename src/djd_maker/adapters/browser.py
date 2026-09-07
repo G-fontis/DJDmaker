@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import os
 import time
+from djd_maker.core.cancellation import checkpoint, current_token, interruptible_sleep
+from .cancellable_browser import wrap
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -99,6 +102,9 @@ class BrowserManager:
         self._preflight_result = "NOT_RUN"
         self._preflight_checks = {name: "PENDING" for name in PREFLIGHT_CHECKS}
         self._auth_command: tuple[str, ...] = ()
+        self._automation_owner: int | None = None
+        self._owned_process_job = None
+        self._last_owned_process_count = 0
 
     @property
     def auth_process_alive(self) -> bool:
@@ -233,7 +239,7 @@ class BrowserManager:
         attempts = (0.0, *self.lock_retry_delays)
         for index, delay in enumerate(attempts):
             if delay:
-                time.sleep(delay)
+                interruptible_sleep(delay)
             if self._profile_lock_probe(self.user_data_dir):
                 return
             if index == len(attempts) - 1:
@@ -265,23 +271,34 @@ class BrowserManager:
             self._factory = sync_playwright
         last_error: Exception | None = None
         for index in range(len(self.lock_retry_delays) + 1):
+            checkpoint('browser.launch')
             try:
                 self._playwright = self._factory().start()
+                self._automation_owner = threading.get_ident()
+                if os.name == 'nt' and type(self._playwright).__module__.startswith('playwright.sync_api'):
+                    from .owned_process_job import OwnedProcessJob
+                    # PipeTransport owns the driver Process. Capture once before
+                    # Chromium exists; the Job Object then owns all descendants.
+                    driver = self._playwright._impl_obj._connection._transport._proc
+                    self._owned_process_job = OwnedProcessJob(driver.pid)
                 self.context = self._playwright.chromium.launch_persistent_context(
                     str(self.user_data_dir),
                     executable_path=str(self.chrome_executable),
                     headless=self.headless,
                     accept_downloads=True,
                 )
+                if current_token() is not None:
+                    self.context = wrap(self.context)
                 self.context.set_default_timeout(self.timeout_ms)
                 self.browser = getattr(self.context, "browser", None)
                 return
             except Exception as exc:
+                checkpoint('browser.launch_failed')
                 last_error = exc
                 self._stop_automation()
                 if not self._profile_lock_failure(exc) or index >= len(self.lock_retry_delays):
                     break
-                time.sleep(self.lock_retry_delays[index])
+                interruptible_sleep(self.lock_retry_delays[index])
         if last_error is not None and self._profile_lock_failure(last_error):
             raise BrowserProfileLocked("専用profileが別のChromeで使用中です") from last_error
         raise BrowserConnectionError("automation Chromeの起動に失敗しました") from last_error
@@ -397,7 +414,7 @@ class BrowserManager:
             try:
                 page.wait_for_timeout(250)
             except Exception:
-                time.sleep(0.25)
+                interruptible_sleep(0.25)
         return False
 
     @staticmethod
@@ -432,10 +449,18 @@ class BrowserManager:
     def _stop_automation(self) -> None:
         context = self.context
         playwright = self._playwright
+        if (context is not None or playwright is not None) and self._automation_owner not in {None, threading.get_ident()}:
+            raise BrowserStartError('BROWSER_THREAD_OWNERSHIP: cleanup must run on the owning worker')
+        owned = self._owned_process_job
+        watchdog = threading.Timer(6, owned.terminate) if owned is not None else None
+        if watchdog:
+            watchdog.daemon = True
+            watchdog.start()
         self.context = None
         self.browser = None
         self._managed_page = None
         self._playwright = None
+        self._automation_owner = None
         if context is not None:
             try:
                 context.close()
@@ -446,6 +471,33 @@ class BrowserManager:
                 playwright.stop()
             except Exception:
                 pass
+        if watchdog:
+            watchdog.cancel()
+            watchdog.join()
+        if owned:
+            try:
+                owned.terminate()
+                deadline = time.monotonic() + 2
+                while owned.active_processes() and time.monotonic() < deadline:
+                    time.sleep(.02)  # bounded cleanup, cancellation already in progress
+                self._last_owned_process_count = owned.active_processes()
+                if self._last_owned_process_count:
+                    raise BrowserStartError('AUTOMATION_PROCESS_CLEANUP_INCOMPLETE')
+            finally:
+                owned.close()
+                self._owned_process_job = None
+
+    def abort_owned_automation(self) -> None:
+        """OS-only timeout fallback; safe from a non-Playwright thread."""
+        owned = self._owned_process_job
+        if owned is not None:
+            owned.terminate()
+
+    def shutdown_diagnostic(self) -> dict[str, object]:
+        owned = self._owned_process_job
+        return {'automation_owner_thread': self._automation_owner,
+                'owned_driver_pid': owned.pid if owned else None,
+                'owned_processes': owned.active_processes() if owned else self._last_owned_process_count}
 
     def stop(self) -> None:
         with self._guard:

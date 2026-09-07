@@ -116,7 +116,7 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2.1"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
@@ -144,14 +144,14 @@ def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path
     assert "shutdown" in controller.calls
 
 
-def test_ending_not_configured_blocks_start(tmp_path: Path, monkeypatch) -> None:
+def test_ending_not_configured_allows_start(tmp_path: Path, monkeypatch) -> None:
     window, _settings, controller, _bridge = _window(tmp_path, [], ending=False)
     warnings: list[str] = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(str(args[2])))
-    assert not window.start_button.isEnabled()
+    assert window.start_button.isEnabled()
     window.start_processing()
-    assert "start" not in controller.calls
-    assert warnings and "Ending" in warnings[0]
+    _drain_until(lambda: 'start' in controller.calls)
+    assert not warnings
     window.close()
 
 

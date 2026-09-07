@@ -60,7 +60,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.1"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -85,6 +85,8 @@ class MainWindow(QMainWindow):
         self.jobs: list[Job] = []
         self._checked_job_ids: set[str] = set()
         self._running = False
+        self._stopping = False
+        self._closing = False
         self._log_dialog = LogDialog(self)
         self._preview_player = EndingPreviewPlayer(
             lambda path: open_local_path(path, parent=self), self
@@ -440,11 +442,11 @@ class MainWindow(QMainWindow):
                 "動画生成プリセットを登録・選択してください。",
             )
             return
-        if self._ending_path() is None:
+        if self.settings.ending_video and self._ending_path() is None:
             QMessageBox.warning(
                 self,
-                "Ending未設定",
-                "授業動画作成を開始する前に、有効なEnding動画を設定してください。",
+                "Endingファイルが見つかりません",
+                "選択したEnding動画を再選択するか、設定を空にしてください。未選択なら結合せずに進みます。",
             )
             return
         if self.controller.start():
@@ -460,11 +462,11 @@ class MainWindow(QMainWindow):
         self.controller.login()
 
     def recover_pending(self) -> None:
-        if self._ending_path() is None:
+        if self.settings.ending_video and self._ending_path() is None:
             QMessageBox.warning(
                 self,
-                "Ending未設定",
-                "未回収動画の後工程を続ける前に、有効なEnding動画を設定してください。",
+                "Endingファイルが見つかりません",
+                "選択したEnding動画を再選択するか、設定を空にしてください。",
             )
             return
         if self.controller.recover_pending():
@@ -478,7 +480,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("安全な工程境界で一時停止します")
 
     def stop_processing(self) -> None:
-        if self._running:
+        if self._running and not self._stopping:
+            self._stopping = True
+            self.stop_button.setEnabled(False)
             self.controller.stop()
             self.statusBar().showMessage("安全な停止を要求しました。実行中工程の終了を待っています")
 
@@ -496,14 +500,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{operation} 実行中")
 
     def _operation_finished(self, operation: str, _result: object) -> None:
+        if operation == 'stop':
+            self._stopping = False
         if operation in {"stop", "pause", "recover"}:
             self._running = False
+        if operation == "stop" and isinstance(_result, dict):
+            self._running = bool(_result.get("running", False))
         if operation == "login":
             self.statusBar().showMessage("ログイン確認待ち。［授業動画作成開始］で自動確認します")
         elif operation == "start":
             self.statusBar().showMessage("準備確認中...")
         elif operation == "recover":
             self.statusBar().showMessage("未回収動画の確認が完了しました")
+        elif operation == "stop" and self._running:
+            self.statusBar().showMessage("停止要求済み。処理の安全な終了を待っています")
         else:
             self.statusBar().showMessage(f"{operation} 完了")
         self._update_action_state()
@@ -538,7 +548,7 @@ class MainWindow(QMainWindow):
             self._update_action_state()
 
     def _update_action_state(self) -> None:
-        self.start_button.setEnabled(not self._running and self._ending_path() is not None)
+        self.start_button.setEnabled(not self._running)
         self.recover_button.setEnabled(
             not self._running
             and any(
@@ -553,16 +563,21 @@ class MainWindow(QMainWindow):
             )
         )
         self.pause_button.setEnabled(self._running)
-        self.stop_button.setEnabled(self._running)
+        self.stop_button.setEnabled(self._running and not self._stopping)
         self.login_button.setEnabled(not self._running)
         self.details_button.setEnabled(self._selected_job() is not None)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closing:
+            event.ignore()
+            return
+        self._closing = True
         self._preview_player.stop()
         self.setEnabled(False)
         if self.controller.shutdown(timeout_ms=5000):
             event.accept()
         else:
+            self._closing = False
             self.setEnabled(True)
             QMessageBox.warning(
                 self,

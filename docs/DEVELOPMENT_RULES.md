@@ -18,6 +18,9 @@
 
 ## 認証・ブラウザ変更のRelease Gate
 
+- 2026-09-07追加指示: Endingファイル選択は動作必須条件にしない。未選択時はEnding結合をスキップし、再検証したRAWを変更せずHLS/ZIPへ渡す。選択済みファイルが消失した場合は未選択と混同せず、再選択・設定解除を案内する。
+- 2026-09-07補正: 告知modalのlive自動dismiss未確認は既知事項として許容し、fixtureで安全性を担保する。強制再現をしない。他のStop/Close/配布Gateは免除されない。
+
 - 認証またはブラウザ起動方式を変更するreleaseでは、既存Cookie/sessionをコピーしないFresh Profile Sign-in Acceptanceを必須とする。
 - Warm profileの成功だけをFresh認証の証拠にしてはならない。Fresh、Warm、期限切れsessionを分けて記録する。
 - 認証用Chromeではremote debugging、CDP、Playwright、headless、automation目的のflagを使用せず、password、Cookie、token、Google login DOMを取得・操作しない。

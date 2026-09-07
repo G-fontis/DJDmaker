@@ -702,6 +702,7 @@ def test_source_timeout_retries_same_notebook_without_reupload(tmp_path):
 
     class Dom:
         ensure_source = NotebookDomAdapter.ensure_source
+        ensure_interactable = lambda self: None
         diagnostic = staticmethod(lambda _message: None)
 
         def source_state(self, _name):
@@ -762,6 +763,7 @@ def test_third_source_timeout_preserves_notebook_and_stops(tmp_path):
 
     class Dom:
         ensure_source = NotebookDomAdapter.ensure_source
+        ensure_interactable = lambda self: None
         diagnostic = staticmethod(lambda _message: None)
 
         def source_state(self, _name):

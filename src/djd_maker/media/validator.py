@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+from djd_maker.core.cancellation import run_process, checkpoint, current_token, interruptible_sleep
 import time
 from typing import Callable
 
@@ -95,7 +96,10 @@ class VideoValidator:
             except OSError as exc:
                 raise MediaValidationError(f"cannot stat video: {path}") from exc
             if index + 1 < self.stability_checks:
-                self._sleep(self.stability_interval_seconds)
+                if current_token():
+                    interruptible_sleep(self.stability_interval_seconds)
+                else:
+                    self._sleep(self.stability_interval_seconds)
         if len(set(sizes)) != 1:
             raise MediaValidationError(f"video size is not stable: {path}")
         if sizes[-1] <= 0:
@@ -109,7 +113,7 @@ class VideoValidator:
             "-show_format", "-of", "json", str(target),
         ]
         try:
-            completed = subprocess.run(
+            completed = run_process(
                 command,
                 shell=False,
                 capture_output=True,

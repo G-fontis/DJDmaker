@@ -15,6 +15,7 @@ from djd_maker.core.interfaces import require_remote_deletion_gate
 from djd_maker.core.models import DownloadSafetyGate, Job, preset_body_sha256
 from djd_maker.adapters.credit import CreditDetector, CreditSnapshot, CreditState
 from djd_maker.media.validator import VideoValidator
+from djd_maker.core.cancellation import checkpoint
 
 
 class NotebookAdapterError(RuntimeError):
@@ -393,8 +394,10 @@ class NotebookDomAdapter:
         diagnostic: Callable[[str], None] | None = None,
         credit_detector: Any | None = None,
         clock: Callable[[], datetime] | None = None,
+        interactable_guard: Callable[..., None] | None = None,
     ) -> None:
         self.page = page
+        self.interactable_guard = interactable_guard
         self.download_handoff = download_handoff
         self.artifact_delete_selectors = (
             VERIFIED_ARTIFACT_DELETE_SELECTORS
@@ -406,6 +409,11 @@ class NotebookDomAdapter:
         self.clock = clock or (lambda: datetime.now().astimezone())
         self._injected_credit_detector = credit_detector
         self._generation_prompt_for_fallback: str | None = None
+
+    def ensure_interactable(self):
+        checkpoint('notebook.interactable')
+        if self.interactable_guard is not None:
+            self.interactable_guard(self.page, diagnostic=self.diagnostic)
 
     def inspect_credit(self) -> CreditSnapshot:
         detector = self._injected_credit_detector or CreditDetector(
@@ -497,6 +505,9 @@ class NotebookDomAdapter:
         return True
 
     def _dismiss_optional_dialogs(self, timeout_ms: int = 5_000) -> None:
+        if self.interactable_guard is not None:
+            self.ensure_interactable()
+            return
         deadline = time.monotonic() + timeout_ms / 1000
         quiet_since = time.monotonic()
         while time.monotonic() < deadline:
@@ -557,6 +568,7 @@ class NotebookDomAdapter:
         raise DomMismatchError("Notebook名の確定をreadbackできません")
 
     def upload_txt(self, source_path: Path) -> None:
+        self.ensure_interactable()
         source = source_path.resolve()
         if not source.is_file() or source.suffix.casefold() != ".txt":
             raise FileNotFoundError(f"有効なTXTではありません: {source}")
@@ -567,7 +579,10 @@ class NotebookDomAdapter:
         file_input = self._try_first_attached(FILE_INPUT)
         if file_input is None:
             self._first_visible(ADD_SOURCE, "ソース追加ボタン").click()
-            self._dismiss_optional_dialogs()
+            # The upload picker is now an expected operation dialog. Never
+            # dismiss its X as though it were an informational announcement.
+            if self.interactable_guard is None:
+                self._dismiss_optional_dialogs()
             file_input = self._try_first_attached(FILE_INPUT)
         if file_input is None:
             upload_button = self._first_visible(
@@ -685,6 +700,7 @@ class NotebookDomAdapter:
         deadline = time.monotonic() + timeout_ms / 1000
         stable_since: float | None = None
         while time.monotonic() < deadline:
+            self.ensure_interactable()
             if self.source_state(filename) == "ERROR":
                 self.diagnostic("SOURCE_PROCESSING_FAILED")
                 raise SourceProcessingError("Notebookのソース処理に失敗しました")
@@ -741,6 +757,7 @@ class NotebookDomAdapter:
         return "PROCESSING"
 
     def ensure_source(self, source: Path) -> None:
+        self.ensure_interactable()
         for attempt in range(1, 4):
             state = self.source_state(source.name)
             self.diagnostic(f"SOURCE_ATTEMPT:{attempt}:state={state}")
@@ -807,6 +824,7 @@ class NotebookDomAdapter:
         timeout_ms: int = 120_000,
     ) -> GenerationOutcome:
         """Use only a verified schedule action and require its remote status."""
+        self.ensure_interactable()
         if credit.state is not CreditState.EXHAUSTED:
             raise ReservationFailedError(
                 "明示的なクレジット枯渇根拠なしでは予約生成しません"
@@ -977,6 +995,7 @@ class NotebookDomAdapter:
 
     def start_video_generation_from_chat(self, prompt: str) -> GenerationOutcome:
         """Send the exact job snapshot to main chat and let Notebook generate."""
+        self.ensure_interactable()
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
         if self.page.locator("artifact-library-item").count():
@@ -1027,6 +1046,7 @@ class NotebookDomAdapter:
         return RemoteVideoStatus.NOT_STARTED if not text else RemoteVideoStatus.UNKNOWN
 
     def download_artifact(self, artifact_title: str, destination: Path) -> Path:
+        self.ensure_interactable()
         if self.download_handoff is None:
             raise NotebookAdapterError("download handoffが設定されていません")
         if destination.exists():
@@ -1404,7 +1424,12 @@ class NotebookEngineAdapter:
         except Exception:
             current = urlparse("")
         if current.hostname != parsed.hostname or current.path != parsed.path:
+            checkpoint('notebook.goto')
             self.dom.page.goto(job.notebook_url, wait_until="domcontentloaded")
+            checkpoint('notebook.goto.complete')
+        ensure = getattr(self.dom, 'ensure_interactable', None)
+        if callable(ensure):
+            ensure()
 
     def inspect_status(self, job: Job) -> str:
         self._open_job(job)
@@ -1414,6 +1439,10 @@ class NotebookEngineAdapter:
         deadline = time.monotonic() + min(self.dom.timeout_ms, 60_000) / 1000
         status = RemoteVideoStatus.UNKNOWN
         while time.monotonic() < deadline:
+            checkpoint('artifact.poll')
+            ensure = getattr(self.dom, 'ensure_interactable', None)
+            if callable(ensure):
+                ensure()
             status = self.dom.inspect_status()
             if status not in {
                 RemoteVideoStatus.NOT_STARTED,

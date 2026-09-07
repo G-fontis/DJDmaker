@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver1.2
+# 台本から授業動画つくるマシーン Ver1.2.1
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.2.0。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.2.1。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,9 +33,13 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.2`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.2.1`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+
+Ver1.2.1ではStop/Window ×の協調停止と所有automation process限定の終了処理を追加しています。告知modalは既知の安全な情報dialogだけを閉じ、未知・確認dialogは自動で閉じず停止します。告知のlive自動dismissは自然再現せず未確認（ユーザー承認済みの既知事項）であり、fixtureで検証しています。
 
 ## Ver1.2 再開・移行
+
+Ending動画は任意です。設定を空にするとEnding結合をスキップし、検証済みRAWからHLS/ZIPを作成します。RAWそのものは変更しません。選択済みのEndingファイルが見つからない場合は、設定画面で再選択するかパスを空にしてください。
 
 - 生成前のFAILEDは［授業動画作成開始］で既存Notebookとsourceを診断し、同じjob ID・保存済みpreset本文で再開します。過去のquota返信を現在の不足判定に流用しません。
 - ［未回収動画のチェックから続ける］は生成済み／予約済み／未回収専用で、新規Notebookやpreset送信を行いません。
