@@ -58,13 +58,19 @@ class DeferredRecovery:
         entry = self.deferred.record(job, type(error).__name__)
         self._deferred_notice(entry, 'save.deferred', '状態ファイルを保存できませんでした。このjobを保留し、他のjobを続行します。')
 
-    def _retry_deferred(self):
+    def _retry_deferred(self, *, local_only=False):
         for job_id in list(self.deferred.entries):
             checkpoint('deferred.dequeue')
             attempts = self._deferred_attempts.get(job_id, 0)
             if attempts >= self.MAX_DEFERRED_ATTEMPTS:
                 continue
             entry = self.deferred.entries[job_id]
+            if local_only and entry.snapshot:
+                snapshot = Job.from_dict(entry.snapshot)
+                downloaded = self.paths.work_directory / snapshot.id / 'download' / f'{snapshot.script_name}.mp4'
+                raw = Path(snapshot.raw_path) if snapshot.raw_path else self.paths.raw_directory / f'{snapshot.script_name}.mp4'
+                if snapshot.notebook_url and not (raw.is_file() or downloaded.is_file() or snapshot.state is JobState.COMPLETED):
+                    continue
             self._deferred_attempts[job_id] = attempts + 1
             entry.retry_count += 1
             self._deferred_notice(entry, 'save.retry', 'remote/local成果物を照合し、状態保存を再試行します。')
@@ -72,7 +78,7 @@ class DeferredRecovery:
                 # Reconciliation must not recursively save via an old job's
                 # runtime observer, nor publish a success row before the save.
                 with operation_scope(lambda *_args: None):
-                    job = self._reconcile_deferred(entry)
+                    job = self._reconcile_deferred(entry, local_only=local_only)
                     if job is None:
                         raise ValueError('RECONCILIATION_UNCERTAIN')
                     checkpoint('deferred.publish')
@@ -90,7 +96,7 @@ class DeferredRecovery:
                 self.deferred.persist(entry)
                 self._deferred_notice(entry, 'save.unresolved', '状態保存を復旧できませんでした。他のjob処理を続行します。')
 
-    def _reconcile_deferred(self, entry):
+    def _reconcile_deferred(self, entry, *, local_only=False):
         if not entry.snapshot:
             return None
         job = Job.from_dict(entry.snapshot)
@@ -147,6 +153,8 @@ class DeferredRecovery:
             job.state = JobState.DOWNLOADING
             return job
         if job.notebook_id and job.notebook_url:
+            if local_only:
+                return None
             checkpoint('deferred.remote.inspect')
             status = self.notebook.inspect_status(job)
             target = {'READY': JobState.DOWNLOAD_PENDING, 'GENERATING': JobState.WAITING_VIDEO,

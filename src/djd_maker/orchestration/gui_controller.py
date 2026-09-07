@@ -174,6 +174,7 @@ class GuiPipelineController:
                 raise RuntimeError("未回収動画の確認処理が実行中です")
             if self._worker is not None and self._worker.is_alive():
                 self._paused = False
+                self.cancellation.resume()
                 self.scheduler.resume()
                 self._runtime_update({**self._runtime, 'stage': 'resume'})
                 return self.status()
@@ -251,12 +252,19 @@ class GuiPipelineController:
         return result
 
     def pause(self) -> dict[str, object]:
+        self.request_pause()
         with self._guard:
             self._paused = True
             self.scheduler.pause()
         self._runtime_update({**self._runtime, 'stage': 'pause'})
         self._publish_status()
         return self.status()
+
+    def request_pause(self) -> None:
+        self.cancellation.request_pause()
+
+    def resume(self) -> dict[str, object]:
+        return self.start()
 
     def request_stop(self) -> None:
         self.scheduler.stop()
@@ -363,6 +371,7 @@ class GuiPipelineController:
             self.scheduler.start()
             self._phase = "processing"
             while not self._stop_event.is_set():
+                checkpoint('pipeline.dequeue')
                 with self._guard:
                     paused = self._paused
                 if not paused:
@@ -411,7 +420,9 @@ class GuiPipelineController:
                         for job in values
                     ):
                         break
-                self._stop_event.wait(self.cycle_interval_seconds)
+                limit = getattr(self.pipeline, 'cloud_limit', None)
+                interval = max(1.0, self.cycle_interval_seconds) if limit and limit.blocked else self.cycle_interval_seconds
+                self._stop_event.wait(interval)
         except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError) as exc:
             self.cancellation.request()
             self._error_callback('modal' if isinstance(exc, BlockingModalError) else 'pipeline', str(exc))
@@ -458,7 +469,10 @@ class GuiPipelineController:
         )
         return {
             "running": (worker_running or recovering) and not paused,
+            "active": worker_running or recovering,
             "paused": paused,
+            "pause_state": ('PAUSED' if self.cancellation.paused.is_set() else 'PAUSE_REQUESTED') if paused else None,
+            "cloud_limit": self.pipeline.cloud_limit.status() if hasattr(self.pipeline, 'cloud_limit') else self.cloud_limit.status() if hasattr(self, 'cloud_limit') else {},
             "scheduler_mode": self.scheduler.mode.value,
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
             "phase": self._phase,

@@ -19,7 +19,27 @@ class CancellationToken:
         self.navigation_count_at_stop = None
         self.current_jobs = {}
         self.children = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self.pause_requested = False
+        self.paused = threading.Event()
+        self._pause_started = None
+        self._pause_duration = 0.0
+
+    def request_pause(self):
+        with self._condition:
+            if not self.pause_requested:
+                self._pause_started = time.monotonic()
+            self.pause_requested = True
+
+    def resume(self):
+        with self._condition:
+            if self._pause_started is not None:
+                self._pause_duration += time.monotonic() - self._pause_started
+                self._pause_started = None
+            self.pause_requested = False
+            self.paused.clear()
+            self._condition.notify_all()
 
     def request(self):
         with self._lock:
@@ -27,6 +47,7 @@ class CancellationToken:
                 self.requested_at = time.monotonic()
                 self.navigation_count_at_stop = self.navigation_count
                 self.event.set()
+                self._condition.notify_all()
 
     def reset(self):
         with self._lock:
@@ -38,12 +59,22 @@ class CancellationToken:
             self.requested_at = None
             self.navigation_count_at_stop = None
             self.operation = None
+            self.pause_requested = False
+            self.paused.clear()
+            self._pause_started = None
+            self._pause_duration = 0.0
+            self._condition.notify_all()
 
     def check(self, operation=None):
-        if self.event.is_set():
-            raise RunCancelled("STOP_REQUESTED")
-        if operation:
-            self.operation = operation
+        with self._condition:
+            # An already running child may finish; no new child/task can start.
+            while self.pause_requested and operation != 'subprocess.wait' and not self.event.is_set():
+                self.paused.set()
+                self._condition.wait()
+            if self.event.is_set():
+                raise RunCancelled("STOP_REQUESTED")
+            if operation:
+                self.operation = operation
 
     def navigation(self):
         with self._lock:
@@ -54,6 +85,7 @@ class CancellationToken:
         self.check()
         if self.event.wait(max(0, seconds)):
             raise RunCancelled('STOP_REQUESTED')
+        self.check()
 
     def diagnostic(self):
         return dict(stop_requested_at=self.requested_at, current_operation=self.operation,
@@ -67,6 +99,16 @@ _current = ContextVar('djd_run_cancellation', default=None)
 
 def current_token():
     return _current.get()
+
+
+def active_monotonic():
+    """Observation deadlines exclude time deliberately spent paused."""
+    now = time.monotonic()
+    token = current_token()
+    if token is None:
+        return now
+    with token._lock:
+        return now - token._pause_duration - (now-token._pause_started if token._pause_started is not None else 0)
 
 
 def checkpoint(operation=None, job_id=None):

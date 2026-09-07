@@ -15,8 +15,11 @@ class AppSettings:
     notebook_poll_seconds: int = 120
     audio_tail_padding_seconds: float = 0.5
     ffmpeg_concurrency: int = 1
+    gui_type: str = 'PHASE1'
 
     def validate(self) -> None:
+        if self.gui_type not in {'PHASE1', 'PHASE2'}:
+            raise ValueError('unsupported gui_type')
         if self.first_notebook_check_seconds < 1:
             raise ValueError("first_notebook_check_seconds must be positive")
         if self.notebook_poll_seconds < 1:
@@ -34,4 +37,3 @@ class AppSettings:
             (app_root / value).resolve()
             for value in (self.input_directory, self.raw_directory, self.output_directory)
         )
-

@@ -8,7 +8,8 @@ from pathlib import Path
 def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) -> int:
     if os.environ.get('DJD_PACKAGING_SMOKE') != '1':
         return 3
-    from PySide6.QtCore import QTimer, QObject, Slot
+    from PySide6.QtCore import QTimer, QObject, Slot, Qt
+    from djd_maker.core.commands import EventId
     from PySide6.QtWidgets import QApplication
     from djd_maker.gui.app import build_desktop
     from djd_maker.gui.dialogs import PresetDialog
@@ -92,11 +93,16 @@ def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) 
     service._runtime_update=observe
     class TableProbe(QObject):
         @Slot(object)
-        def receive(self, job):
+        def receive(self, event):
+            if event.id != EventId.JOB_UPDATED:
+                return
+            job = event.payload
             table_updates.append({'job':job.id,'stage':job.presentation_stage,'state':job.state.value,
                                   'display':next(j.presentation_stage for j in window.jobs if j.id==job.id)})
     probe=TableProbe()
-    window.controller.job_changed.connect(probe.receive)
+    # Observe the same queued event as MainWindow, after its connected consumer.
+    # The legacy upstream signal fires before the queued GUI update is delivered.
+    window.controller.presentation_event.connect(probe.receive, Qt.ConnectionType.QueuedConnection)
     window.controller.operation_failed.disconnect(window._operation_failed)
     window.controller.operation_failed.connect(lambda op,msg:errors.append([op,msg]))
     def close_modal():

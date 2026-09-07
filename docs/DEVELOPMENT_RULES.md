@@ -1,5 +1,18 @@
 # 開発ルール
 
+## Ver1.2.5 上限待機・Pause・Dual GUI（今回の優先指示）
+
+- 指示 `DJD-CHAPPY-V125-LIMIT-PAUSE-DUALGUI-COMPONENT-ARCHITECTURE-FULL-001` を優先する。main Ver1.2.4 backendを正本とし、phase2 `f6f5871925f44718f51a106f7f55fa44e8f882b1` からpresentationのみ取り込む。phase2 ref自体と元3repoは変更しない。
+- visibleなAI使用量上限/Chat無効表示・時刻・disabled状態を検出する。source/会話本文は根拠にしない。OS local時刻で解除時刻を解釈し、固定5分を加えて `system/cloud-limit.json` にatomic保存する。
+- 再開予定前の新規Notebook・source upload・Preset/Chat送信・生成・新規予約は禁止。予約実装は履歴互換として保持するがproduction Chat flowから呼ばない。以前の予約開始指示より本規則を優先する。
+- 通常Phase A→Bを維持。Limit時はローカルRAW検証/Ending任意/HLS/ZIP/TXT移動/保存復旧を優先する。2026-09-08のliveで上限中のWeb動画Downloadを確認したため、完成確認済みDownload待ちの回収を許可する。ローカル処理のためにremote artifact削除を必須にせず、未削除状態とRAW gateを保持する。
+- backlogが空なら待機し、期限前のNotebook巡回は行わない。期限後もlimit表示消失とChat enabledの再確認が必要。確認不能時は待機を維持する。
+- Pauseは共通CancellationTokenのConditionでsafe checkpointを停止する。新しいgoto/送信/upload/Download/FFmpeg開始は禁止。開始済みの短い操作・FFmpegは終了checkpointまで許可し、その後はResumeまたはStopまで待つ。観測timeoutからPause時間を除外するが、Limitの実時刻deadlineは変更しない。
+- PHASE1/PHASE2は同じCommand ID/Router/Event/ViewModelを使う。GUI切替は処理停止中のみ。表示widget再構築中の実行接続の混在を避けるため、Pause中も切替しない。選択GUIのみsettingsへ保存し、job状態を変更しない。
+- action追加時はID、payload schema、共通handler、両GUI binding、required-command/誤mapping/unknown-ID testを同時に追加する。ID重複は起動エラー、unknown/不正payloadはINTERFACE_ERRORとしてGUI action dispatchを無効化する。backendを無条件killしない。
+- source/test/live Gate完了前のversion bump/buildは禁止。portable Gate完了前のcommit/pushは禁止。既存531 tests・状態保存隔離・RAW安全性・Ending任意・Stop/Closeを維持する。
+- 本番job JSONは変更せず、Acceptanceはcopy側stateだけを保存する。実際のVer1.2.4運用folderに2026-09-08時点で256 JSONを確認しており、旧指示の177件に限定せず全件を保護する。
+
 ## Ver1.2.4 状態保存失敗のjob単位隔離（最新指示）
 
 - `DJD-CHAPPY-V123-MAIN-JOBSTATE-SAVE-FAILURE-ISOLATION-CONTINUE-FULL-001`によりmain修正を明示許可。基準f35ba708、phase2はf6f58719のまま変更しない。

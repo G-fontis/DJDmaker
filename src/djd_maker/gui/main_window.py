@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QGroupBox,
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -36,6 +37,9 @@ from .preview import EndingPreviewPlayer
 from .viewmodels import ACTIVE_STATES, job_stage_texts, state_display, summarize_jobs
 from .viewmodels import sanitize_log_text
 from djd_maker.core.runtime_operation import operation_text
+from djd_maker.core.commands import CommandId, CommandRouter, BUTTON_COMMANDS, InterfaceError, EventId
+from .phase2_presentation import Phase2Presentation
+from .presentation_models import JobViewModel, CreditLimitViewModel
 
 
 class SettingsRepositoryPort(Protocol):
@@ -64,8 +68,8 @@ class NaturalItem(QTableWidgetItem):
         return key(self.text()) < key(other.text())
 
 
-class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.4"
+class MainWindow(Phase2Presentation, QMainWindow):
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.5"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -92,6 +96,11 @@ class MainWindow(QMainWindow):
         store = getattr(self.job_repository, '_deferred_state', None)
         self._deferred_overlays = set(store.entries) if store else set()
         self._running = False
+        self._paused = False
+        self._active_run = False
+        self._dispatch_disabled = False
+        self.last_command = None
+        self._limit_status = {}
         self._stopping = False
         self._closing = False
         self._log_dialog = LogDialog(self)
@@ -110,6 +119,17 @@ class MainWindow(QMainWindow):
             refresh_credit()
 
     def _build_ui(self) -> None:
+        self.JOB_COLUMNS = type(self).JOB_COLUMNS + (('進捗', '開始時刻') if self.settings.gui_type == 'PHASE2' else ())
+        if self.settings.gui_type == 'PHASE2':
+            from .hud import HUD_STYLESHEET
+            self.setStyleSheet(HUD_STYLESHEET)
+            self.resize(1600, 950)
+            self._build_phase2()
+        else:
+            self.setStyleSheet('QWidget { background-color: #ffffff; color: #202020; }')
+            self._build_phase1()
+
+    def _build_phase1(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -243,8 +263,6 @@ class MainWindow(QMainWindow):
         deletes.addWidget(self.delete_selected_button)
         deletes.addWidget(self.delete_completed_button)
         root.addLayout(deletes)
-        self.delete_selected_button.clicked.connect(lambda: self._delete_jobs(False))
-        self.delete_completed_button.clicked.connect(lambda: self._delete_jobs(True))
 
         self.completion_group = QGroupBox("授業作成 完了")
         completion_layout = QHBoxLayout(self.completion_group)
@@ -260,29 +278,94 @@ class MainWindow(QMainWindow):
         root.addWidget(self.completion_group)
         self.statusBar().showMessage("待機中")
 
-        self.open_input_button.clicked.connect(lambda: self._open_directory(self.input_path_edit.text()))
-        self.open_raw_folder_button.clicked.connect(lambda: self._open_directory(self.raw_path_edit.text()))
-        self.open_output_button.clicked.connect(lambda: self._open_directory(self.output_path_edit.text()))
-        self.change_ending_button.clicked.connect(self.change_ending)
-        self.preview_ending_button.clicked.connect(self.preview_ending)
-        self.reload_button.clicked.connect(self.reload_jobs)
-        self.start_button.clicked.connect(self.start_processing)
-        self.recover_button.clicked.connect(self.recover_pending)
-        self.pause_button.clicked.connect(self.pause_processing)
-        self.stop_button.clicked.connect(self.stop_processing)
-        self.login_button.clicked.connect(self.start_login)
-        self.details_button.clicked.connect(self.show_selected_job)
-        self.log_button.clicked.connect(self.show_logs)
-        self.settings_button.clicked.connect(self.show_settings)
-        self.completion_output_button.clicked.connect(
-            lambda: self._open_directory(self.output_path_edit.text())
-        )
-        self.completion_raw_button.clicked.connect(
-            lambda: self._open_directory(self.raw_path_edit.text())
-        )
-        self.completion_error_button.clicked.connect(self.show_logs)
+        self._connect_local_controls()
+
+    def _connect_local_controls(self):
+        self.resume_button = QPushButton('再開')
+        self.gui_type_switch = QComboBox()
+        self.gui_type_switch.addItems(['PHASE1', 'PHASE2'])
+        self.gui_type_switch.setCurrentText(self.settings.gui_type)
+        self.limit_label = QLabel('AI使用量上限: 未検出')
+        self.limit_label.setWordWrap(True)
+        tools = QHBoxLayout()
+        tools.addWidget(QLabel('GUIタイプ'))
+        tools.addWidget(self.gui_type_switch)
+        tools.addWidget(self.resume_button)
+        tools.addWidget(self.limit_label, 1)
+        self.centralWidget().layout().addLayout(tools)
+        commands = {
+            CommandId.SETTINGS_OPEN: lambda _: self.show_settings(),
+            CommandId.GOOGLE_LOGIN: lambda _: self.start_login(),
+            CommandId.CLASS_VIDEO_START: lambda _: self.start_processing(),
+            CommandId.SCRIPT_RELOAD: lambda _: self.reload_jobs(),
+            CommandId.RECOVERY_START: lambda _: self.recover_pending(),
+            CommandId.PAUSE: lambda _: self.pause_processing(),
+            CommandId.RESUME: lambda _: self.controller.resume(),
+            CommandId.STOP: lambda _: self.stop_processing(),
+            CommandId.LOG_OPEN: lambda _: self.show_logs(),
+            CommandId.JOB_DETAIL_OPEN: lambda _: self.show_selected_job(),
+            CommandId.DELETE_SELECTED: lambda p: self._delete_jobs(False, p['job_ids']),
+            CommandId.DELETE_COMPLETED: lambda p: self._delete_jobs(True, p['job_ids']),
+            CommandId.GUI_SWITCH_PHASE1: lambda p: self.switch_gui(p['gui_type']),
+            CommandId.GUI_SWITCH_PHASE2: lambda p: self.switch_gui(p['gui_type']),
+            CommandId.INPUT_OPEN: lambda _: self._open_directory(self.input_path_edit.text()),
+            CommandId.RAW_OPEN: lambda _: self._open_directory(self.raw_path_edit.text()),
+            CommandId.OUTPUT_OPEN: lambda _: self._open_directory(self.output_path_edit.text()),
+            CommandId.ENDING_CHANGE: lambda _: self.change_ending(),
+            CommandId.ENDING_PREVIEW: lambda _: self.preview_ending(),
+        }
+        self.command_router = CommandRouter(commands.items())
+        self.bound_commands = frozenset(commands)
+        for attribute, command in BUTTON_COMMANDS.items():
+            button = getattr(self, attribute)
+            button.setProperty('command_id', command.value)
+            button.clicked.connect(lambda checked=False, cmd=command: self.dispatch_command(cmd))
+        self.gui_type_switch.currentTextChanged.connect(lambda value: self.dispatch_command(
+            CommandId.GUI_SWITCH_PHASE1 if value == 'PHASE1' else CommandId.GUI_SWITCH_PHASE2, {'gui_type': value}))
         self.job_table.itemSelectionChanged.connect(self._update_action_state)
-        self.job_table.itemDoubleClicked.connect(lambda _item: self.show_selected_job())
+        self.job_table.itemDoubleClicked.connect(lambda _item: self.dispatch_command(CommandId.JOB_DETAIL_OPEN))
+
+    def dispatch_command(self, command, payload=None):
+        if self._dispatch_disabled:
+            return False
+        if payload is None and command in {CommandId.DELETE_SELECTED, CommandId.DELETE_COMPLETED}:
+            payload = {'job_ids': sorted(self._checked_job_ids) if command == CommandId.DELETE_SELECTED else [j.id for j in self.jobs if j.state is JobState.COMPLETED]}
+        try:
+            result = self.command_router.dispatch(command, payload)
+            self.last_command = command
+            return result
+        except InterfaceError as exc:
+            self._dispatch_disabled = True
+            for attribute in BUTTON_COMMANDS:
+                getattr(self, attribute).setEnabled(False)
+            self.gui_type_switch.setEnabled(False)
+            self._log_dialog.append_record({'level': 'CRITICAL', 'message': str(exc)})
+            self.statusBar().showMessage(str(exc))
+            return False
+
+    def switch_gui(self, gui_type):
+        if self._active_run or self._running or self._paused or self.controller.busy:
+            self.statusBar().showMessage('GUI切替は処理停止中のみ可能です。実行中の表示接続を保持します。')
+            self.gui_type_switch.blockSignals(True)
+            self.gui_type_switch.setCurrentText(self.settings.gui_type)
+            self.gui_type_switch.blockSignals(False)
+            return False
+        selected = self._selected_job()
+        self.settings_repository.save(replace(self.settings, gui_type=gui_type))
+        self.settings = self.settings_repository.load()
+        self._runtime_timer.stop()
+        self._runtime_timer.deleteLater()
+        old = self.takeCentralWidget()
+        self._build_ui()
+        self.apply_settings(self.settings)
+        self.set_jobs(self.jobs)
+        self._display_limit(self._limit_status)
+        if selected:
+            for row in range(self.job_table.rowCount()):
+                if self.job_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == selected.id:
+                    self.job_table.selectRow(row)
+        old.deleteLater()
+        return True
 
     @staticmethod
     def _path_row(layout: QGridLayout, row: int, label: str) -> tuple[QLineEdit, QPushButton]:
@@ -295,14 +378,53 @@ class MainWindow(QMainWindow):
         return edit, button
 
     def _connect_controller(self) -> None:
-        self.controller.jobs_changed.connect(self.set_jobs)
-        self.controller.job_changed.connect(self.update_job, Qt.ConnectionType.QueuedConnection)
-        self.controller.status_changed.connect(self._apply_runtime_status)
-        self.controller.log_received.connect(self._log_dialog.append_record)
+        self.controller.presentation_event.connect(self.consume_event, Qt.ConnectionType.QueuedConnection)
+        self.controller.log_received.connect(self._append_log_record)
         self.controller.log_received.connect(self._append_runtime_message)
         self.controller.operation_started.connect(self._operation_started)
         self.controller.operation_finished.connect(self._operation_finished)
         self.controller.operation_failed.connect(self._operation_failed)
+
+    def consume_event(self, event):
+        if event.id == EventId.JOBS_UPDATED:
+            self.set_jobs(event.payload)
+        elif event.id == EventId.JOB_UPDATED:
+            self.update_job(event.payload)
+        elif event.id == EventId.RUNTIME_STATUS:
+            self._apply_runtime_status(event.payload)
+        elif event.id in {EventId.LIMIT_DETECTED, EventId.LIMIT_WAITING, EventId.LIMIT_RELEASED}:
+            self._display_limit(event.payload)
+        elif event.id == EventId.PAUSED:
+            self.statusBar().showMessage('PAUSED / 一時停止中。次のNotebook操作は行いません')
+        elif event.id == EventId.PHASE_CHANGED:
+            self.statusBar().showMessage(str(event.payload.get('phase') or '待機中'))
+        elif event.id == EventId.ERROR:
+            self._append_log_record({'level': 'ERROR', **event.payload})
+
+    def _append_log_record(self, record):
+        self._log_dialog.append_record(record)
+        if self.settings.gui_type != 'PHASE2':
+            return
+        if isinstance(record, dict):
+            level, message = str(record.get('level','INFO')), str(record.get('message',''))
+            if str(record.get('stage', '')).startswith('browser-'):
+                auth = re.search(r'(?:^|, )authentication_result=([^,]+)', message)
+                preflight = re.search(r'(?:^|, )preflight_result=([^,]+)', message)
+                self.browser_status_label.setText('● ' + {'authenticated':'認証確認済み', 'login-required':'ログインが必要'}.get(auth.group(1) if auth else '', '認証状態: 未確認'))
+                self.browser_detail_label.setText('Pre-flight: ' + (preflight.group(1) if preflight else 'NOT_RUN'))
+            runtime = record.get('runtime')
+            if isinstance(runtime, dict):
+                message = f"[{runtime.get('job', '－')}] {operation_text(runtime.get('stage', ''))} / {operation_text(runtime.get('decision', ''))}"
+        else:
+            level, message = 'INFO', str(record)
+        table = self.execution_log_table
+        row = table.rowCount()
+        table.insertRow(row)
+        for column,value in enumerate((datetime.now().strftime('%H:%M:%S'),level,sanitize_log_text(message))):
+            table.setItem(row,column,QTableWidgetItem(value))
+        while table.rowCount()>200:
+            table.removeRow(0)
+        table.scrollToBottom()
 
     def _resolve_setting_path(self, value: str) -> Path:
         path = Path(value)
@@ -396,7 +518,13 @@ class MainWindow(QMainWindow):
             checkbox.setData(Qt.ItemDataRole.UserRole, job.id)
             checkbox.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
             checkbox.setCheckState(Qt.CheckState.Checked if job.id in self._checked_job_ids else Qt.CheckState.Unchecked)
-            self.job_table.setItem(row, len(self.JOB_COLUMNS) - 1, checkbox)
+            self.job_table.setItem(row, 6, checkbox)
+            if self.settings.gui_type == 'PHASE2':
+                model = JobViewModel.from_job(job)
+                for column, value in ((7, f'{model.progress}%'), (8, model.started)):
+                    item = NaturalItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole, job.id)
+                    self.job_table.setItem(row, column, item)
         self.job_table.setSortingEnabled(True)
         self.job_table.blockSignals(False)
         self._refresh_summary()
@@ -422,7 +550,10 @@ class MainWindow(QMainWindow):
         if row is None:
             row = self.job_table.rowCount()
             self.job_table.insertRow(row)
-        values = (str(row+1), job.script_name, *job_stage_texts(job), state_display(job), '')
+        model = JobViewModel.from_job(job)
+        values = (str(row+1), model.name, *model.stages, model.state, '')
+        if self.settings.gui_type == 'PHASE2':
+            values += (f'{model.progress}%', model.started)
         for column, value in enumerate(values):
             item = self.job_table.item(row,column)
             if item is None:
@@ -431,7 +562,7 @@ class MainWindow(QMainWindow):
                 self.job_table.setItem(row,column,item)
             else:
                 item.setText(value)
-            if column == len(self.JOB_COLUMNS)-1:
+            if column == 6:
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if job.id in self._checked_job_ids else Qt.CheckState.Unchecked)
         self.job_table.setSortingEnabled(sorting)
@@ -477,6 +608,20 @@ class MainWindow(QMainWindow):
             + (f" / 状態保存保留 {len(self._deferred_overlays)}件（完全成功ではありません）" if self._deferred_overlays else '')
         )
         self.completion_group.setVisible(all_finished or bool(self._deferred_overlays))
+        if self.settings.gui_type == 'PHASE2':
+            self.total_metric.setValue(summary.total)
+            self.complete_metric.setValue(summary.zip_complete)
+            self.error_metric.setValue(summary.errors)
+            self.active_metric.setValue(summary.active)
+            self.job_total_badge.setText(f'TOTAL {summary.total}')
+            self.progress_bar.setValue(int(current.progress_percent) if current else 0)
+            for key, state in (JobViewModel.from_job(current).timeline if current else [(k,'waiting') for k in self.pipeline_steps]):
+                self.pipeline_steps[key].setState(state)
+            import shutil
+            try:
+                self.storage_free_label.setText(f'空き容量: {shutil.disk_usage(self.app_root).free // (1024**3)} GiB')
+            except OSError:
+                self.storage_free_label.setText('空き容量: 取得不可')
         self._update_action_state()
 
     def _selected_job(self) -> Job | None:
@@ -489,7 +634,7 @@ class MainWindow(QMainWindow):
         return next((job for job in self.jobs if job.id == item.data(Qt.ItemDataRole.UserRole)), None)
 
     def _check_changed(self, item) -> None:
-        if item.column() != len(self.JOB_COLUMNS) - 1:
+        if item.column() != 6:
             return
         job_id = item.data(Qt.ItemDataRole.UserRole)
         if item.checkState() is Qt.CheckState.Checked:
@@ -497,8 +642,8 @@ class MainWindow(QMainWindow):
         else:
             self._checked_job_ids.discard(job_id)
 
-    def _delete_jobs(self, all_completed: bool) -> None:
-        selected = [job for job in self.jobs if (job.state is JobState.COMPLETED if all_completed else job.id in self._checked_job_ids)]
+    def _delete_jobs(self, all_completed: bool, job_ids=None) -> None:
+        selected = [job for job in self.jobs if (job.id in job_ids if job_ids is not None else (job.state is JobState.COMPLETED if all_completed else job.id in self._checked_job_ids))]
         if not selected:
             return
         if self._running or any(job.state is not JobState.COMPLETED for job in selected):
@@ -569,7 +714,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("安全な工程境界で一時停止します")
 
     def stop_processing(self) -> None:
-        if self._running and not self._stopping:
+        if (self._running or self._paused or self._active_run) and not self._stopping:
             self._stopping = True
             self.stop_button.setEnabled(False)
             self.controller.stop()
@@ -620,6 +765,10 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_status(self, status: object) -> None:
         if isinstance(status, dict):
+            self._paused = bool(status.get('paused', False))
+            self._active_run = bool(status.get('active', status.get('running', False)))
+            limit = status.get('cloud_limit', {})
+            self._display_limit(limit)
             record = status.get('runtime')
             if isinstance(record, dict) and str(record.get('stage', '')).startswith('save.'):
                 job_id = record.get('job_id')
@@ -667,6 +816,9 @@ class MainWindow(QMainWindow):
             self.credit_reset_label.setText(
                 f"リセット時刻: {credit_reset_at or '－'}"
             )
+            if limit.get('active'):
+                self.credit_state_label.setText('AI LIMIT / CLOUD PAUSED')
+                self.credit_reset_label.setText(f"Notebook再開予定: {limit.get('cloud_resume_at') or '時刻確認必要'}")
             self._update_action_state()
 
     def _render_deferred_overlays(self):
@@ -683,7 +835,19 @@ class MainWindow(QMainWindow):
                 item.setForeground(QBrush())
         self.job_table.setSortingEnabled(sorting)
 
+    def _display_limit(self, state):
+        self._limit_status = dict(state)
+        self.limit_label.setText(CreditLimitViewModel.from_status(state).text)
+
     def _refresh_runtime_elapsed(self):
+        limit = dict(self._limit_status)
+        if limit.get('active') and limit.get('cloud_resume_at'):
+            try:
+                deadline = datetime.fromisoformat(limit['cloud_resume_at'])
+                limit['remaining_seconds'] = max(0, int((deadline-datetime.now().astimezone()).total_seconds()))
+            except (ValueError, TypeError):
+                pass
+            self._display_limit(limit)
         record = self._runtime_record
         elapsed = record.get('elapsed', 0)
         if self._running and record.get('started') and record.get('stage') not in {'job.next', 'stop.complete'}:
@@ -702,6 +866,10 @@ class MainWindow(QMainWindow):
         self.runtime_messages.appendPlainText(sanitize_log_text(text))
 
     def _update_action_state(self) -> None:
+        if self._dispatch_disabled:
+            return
+        self.resume_button.setEnabled(self._paused)
+        self.gui_type_switch.setEnabled(not (self._active_run or self._running or self._paused))
         self.start_button.setEnabled(not self._running)
         self.recover_button.setEnabled(
             not self._running
@@ -717,7 +885,7 @@ class MainWindow(QMainWindow):
             )
         )
         self.pause_button.setEnabled(self._running)
-        self.stop_button.setEnabled(self._running and not self._stopping)
+        self.stop_button.setEnabled((self._running or self._paused or self._active_run) and not self._stopping)
         self.login_button.setEnabled(not self._running)
         self.details_button.setEnabled(self._selected_job() is not None)
 

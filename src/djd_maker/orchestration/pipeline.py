@@ -19,6 +19,7 @@ from djd_maker.core.interfaces import (
 from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.core.cancellation import RunCancelled, checkpoint
+from djd_maker.core.cloud_limit import CloudLimitGate, CloudLimitReached
 from djd_maker.adapters.notebook_modal import BlockingModalError
 from djd_maker.core.runtime_operation import operation_scope, report_operation
 
@@ -121,6 +122,7 @@ class PipelineCoordinator(DeferredRecovery):
         ffmpeg_concurrency: int = 1,
         scheduler: PollSchedulerPort | None = None,
         generation_preset: Preset | None = None,
+        cloud_limit: CloudLimitGate | None = None,
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
@@ -136,6 +138,8 @@ class PipelineCoordinator(DeferredRecovery):
         self.ffmpeg_concurrency = ffmpeg_concurrency
         self.scheduler = scheduler
         self.generation_preset = generation_preset
+        self.cloud_limit = cloud_limit or CloudLimitGate(
+            Path(getattr(jobs, 'directory', paths.work_directory / 'jobs')).parent / 'cloud-limit.json')
         self.runtime_callback = lambda _record: None
         self.job_callback = lambda _job: None
         self.phase = 'GENERATION_DISPATCH'
@@ -175,7 +179,7 @@ class PipelineCoordinator(DeferredRecovery):
         jobs = list(self._progress_jobs.values())
         if self._dispatch_only:
             generated = sum(j.state in {JobState.GENERATING,JobState.WAITING_VIDEO,JobState.DOWNLOAD_PENDING,JobState.DOWNLOADING,JobState.COMPLETED} or bool(j.raw_path) for j in jobs)
-            return f'生成開始済: {generated}/{len(jobs)} / 予約済: {sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)} / 残り: {sum(self._needs_dispatch(j) for j in jobs)}'
+            return f'生成開始済: {generated}/{len(jobs)} / 旧予約: {sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)} / 残り: {sum(self._needs_dispatch(j) for j in jobs)}'
         return f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}'
 
     def _stage_event(self, job: Job, stage: str) -> None:
@@ -244,6 +248,8 @@ class PipelineCoordinator(DeferredRecovery):
                         if job.edited_path and Path(job.edited_path).is_file() and getattr(self.validator.validate(Path(job.edited_path)), "valid", True):
                             target = JobState.ZIPPING if job.resume_checkpoint == "ZIPPING" else JobState.HLS_ENCODING
                 elif job.notebook_id and job.notebook_url:
+                    if self.cloud_limit.blocked:
+                        continue
                     diagnose = getattr(self.notebook, "diagnose_resume", None)
                     diagnosis = diagnose(job) if callable(diagnose) else {"artifact": self.notebook.inspect_status(job)}
                     status = diagnosis["artifact"]
@@ -294,16 +300,37 @@ class PipelineCoordinator(DeferredRecovery):
         generated = sum(j.state in {JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} or j.raw_path is not None or j.state is JobState.COMPLETED for j in jobs)
         reserved = sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)
         remaining = sum(self._needs_dispatch(j) for j in jobs)
-        summary = (f'生成開始済: {generated}/{len(jobs)} / 予約済: {reserved} / 残り: {remaining}' if phase == 'GENERATION_DISPATCH'
+        summary = (f'生成開始済: {generated}/{len(jobs)} / 旧予約: {reserved} / 残り: {remaining}' if phase == 'GENERATION_DISPATCH'
                    else f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}')
         summary += f' / 状態保存保留: {len(self.deferred_ids)}'
         decision = ('保存保留jobは未解決のまま隔離し、安全な他jobの回収を続行します' if self.deferred_ids
-                    else '全jobの動画生成開始/予約が完了しました')
+                    else '全jobの生成投入判定が完了しました')
         self.runtime_callback(dict(phase='動画生成開始フェーズ' if phase == 'GENERATION_DISPATCH' else '動画回収・変換フェーズ',
                                    stage='phase.a' if phase == 'GENERATION_DISPATCH' else 'phase.b', phase_counts=summary,
                                    next_action=summary, decision=decision if phase == 'COLLECT_LOCAL' else '未生成jobを先に処理'))
 
     def run_cycle(self) -> None:
+        checkpoint('pipeline.cycle')
+        if self.cloud_limit.blocked:
+            if self.cloud_limit.due:
+                recheck = getattr(self.notebook, 'recheck_cloud_limit', None)
+                if callable(recheck):
+                    try:
+                        if recheck(self.cloud_limit.state.get('notebook_url')):
+                            self.cloud_limit.release()
+                        else:
+                            self.cloud_limit.defer_recheck()
+                    except CloudLimitReached as exc:
+                        self.cloud_limit.block(exc.observation)
+                    except BlockingModalError:
+                        raise
+                    except Exception as exc:
+                        self.cloud_limit.defer_recheck()
+                        self.runtime_callback(dict(stage='limit.recheck.failed', level='WARNING',
+                            message=f'上限解除を確認できません。待機を維持して再確認します: {type(exc).__name__}'))
+            if self.cloud_limit.blocked:
+                self._drain_limit_local()
+                return
         self._reject_output_name_collisions()
         self._progress_jobs = {j.id:j for j in self.jobs.list()}
         if any(self._needs_dispatch(j) for j in self.jobs.list()):
@@ -313,6 +340,9 @@ class PipelineCoordinator(DeferredRecovery):
                 self._run_cycle_lane()
             finally:
                 self._dispatch_only = False
+            if self.cloud_limit.blocked:
+                self._drain_limit_local()
+                return
             checkpoint('phase.dispatch.complete')
             self._retry_deferred()
             if any(self._needs_dispatch(j) for j in self.jobs.list()):
@@ -323,6 +353,43 @@ class PipelineCoordinator(DeferredRecovery):
             self._phase_event('COLLECT_LOCAL')
         self._run_cycle_lane()
         self._retry_deferred()
+
+    def _drain_limit_local(self):
+        self._reject_output_name_collisions()
+        self._retry_deferred(local_only=True)
+        # Downloaded files still pass the existing RAW safety gate. A known
+        # ready artifact may be collected only by an adapter with live evidence.
+        for job in self.jobs.list():
+            if job.id in self.deferred_ids or job.state not in {JobState.DOWNLOADING, JobState.DOWNLOAD_PENDING}:
+                continue
+            download = self.paths.work_directory / job.id / 'download' / f'{job.script_name}.mp4'
+            if not download.is_file() and not getattr(self.notebook, 'download_during_limit_verified', False):
+                continue
+            with self._job_boundary(job):
+                checkpoint('limit.download.dequeue', job.id)
+                def update(stage, fields):
+                    self._local_checkpoint_fields(job, fields)
+                    self._stage_event(job, stage)
+                    self.runtime_callback(dict(fields, stage=stage, job=job.script_name, job_id=job.id,
+                        phase='LIMIT_LOCAL_DRAIN', notebook=job.notebook_url or '－'))
+                with operation_scope(update):
+                    self._run_notebook_job(job)
+        local = [j for j in self.jobs.list() if j.state in self.MEDIA_STATES and j.id not in self.deferred_ids]
+        self.phase = 'LIMIT_LOCAL_DRAIN' if local else 'LIMIT_WAIT'
+        self.runtime_callback(dict(stage='limit.wait', phase=self.phase, cloud_limit=self.cloud_limit.status(),
+            message='AI使用量上限によりNotebook処理を待機中。現在はローカル処理を優先しています。'))
+        if local:
+            self._media_completed = 0
+            with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency) as pool:
+                futures = []
+                for i, job in enumerate(local, 1):
+                    checkpoint('media.dequeue', job.id)
+                    futures.append(pool.submit(copy_context().run, self._local_media_with_progress, job, i, len(local)))
+                for future in futures:
+                    future.result()
+        checkpoint('completed.txt.reconcile')
+        self.reconcile_completed_txt()
+        self._retry_deferred(local_only=True)
 
     def _run_cycle_lane(self) -> None:
         self._reject_output_name_collisions()
@@ -345,6 +412,8 @@ class PipelineCoordinator(DeferredRecovery):
         # Local ordering only. No remote pre-scan and no second execution queue.
         values.sort(key=lambda j: 0 if j.state in self.MEDIA_STATES or j.state is JobState.DOWNLOAD_PENDING else 1)
         for index, job in enumerate(values, 1):
+            if self.cloud_limit.blocked:
+                break
             if job.id in self.deferred_ids:
                 continue
             with self._job_boundary(job):
@@ -537,6 +606,9 @@ class PipelineCoordinator(DeferredRecovery):
         self._finish_job(job, job.error_code or ('GENERATION_ALREADY_STARTED' if job.state is JobState.WAITING_VIDEO else job.state.value))
 
     def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
+        if self.cloud_limit.blocked:
+            self._drain_limit_local()
+            return []
         """Advance only persisted remote/recovery jobs; never submit new work."""
         self.phase = 'COLLECT_LOCAL'
         current = (now or datetime.now(UTC)).astimezone(UTC)
@@ -774,8 +846,14 @@ class PipelineCoordinator(DeferredRecovery):
                 job.audio_codec = getattr(metadata, "audio_codec", None)
                 job.safety_gate = gate
                 job.raw_status = "READY"
+                if self.cloud_limit.blocked:
+                    job.artifact_status = 'DELETE_PENDING'
                 self._transition(job, JobState.RAW_READY)
                 report_operation('raw.saved', decision='RAW_READY', next_action='artifact削除安全Gateを確認')
+                if self.cloud_limit.blocked:
+                    # Local progress must not depend on another remote action.
+                    # Keep the artifact and the deletion gate for later cleanup.
+                    return
                 try:
                     require_remote_deletion_gate(gate)
                     self.notebook.delete_video_artifact(job, gate)
@@ -789,6 +867,13 @@ class PipelineCoordinator(DeferredRecovery):
                     job.error_code = "REMOTE_ARTIFACT_DELETE_FAILED"
                     job.error_message = str(exc)
                     self._save(job)
+        except CloudLimitReached as exc:
+            self.cloud_limit.block(exc.observation, notebook_url=job.notebook_url)
+            job.state = JobState.WAITING
+            job.credit_state = 'CLOUD_BLOCKED_UNTIL'
+            job.error_code = None
+            job.runtime_reason = 'CLOUD_BLOCKED_UNTIL'
+            self._save(job)
         except (RunCancelled, BlockingModalError):
             job.resume_checkpoint = 'STOPPED:' + job.state.value
             if job.state is JobState.UPLOADING:
@@ -819,7 +904,7 @@ class PipelineCoordinator(DeferredRecovery):
     def _run_media_job(self, job: Job) -> None:
         try:
             checkpoint('media.start', job.id)
-            if job.artifact_status == 'DELETE_PENDING' and job.notebook_id:
+            if job.artifact_status == 'DELETE_PENDING' and job.notebook_id and not self.cloud_limit.blocked:
                 require_remote_deletion_gate(job.safety_gate)
                 try:
                     status = self.notebook.inspect_status(job)

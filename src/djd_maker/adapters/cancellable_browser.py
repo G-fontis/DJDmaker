@@ -1,7 +1,7 @@
 """Owner-thread Playwright boundary with bounded calls and interruptible polling."""
 import time
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from djd_maker.core.cancellation import current_token, checkpoint
+from djd_maker.core.cancellation import current_token, checkpoint, active_monotonic
 
 
 def wrap(value):
@@ -36,10 +36,10 @@ class CancellableBrowserObject:
             checkpoint(f'browser.{name}')
             token = current_token()
             if name == 'wait_for_timeout' and token:
-                deadline = time.monotonic()+args[0]/1000
-                while time.monotonic() < deadline:
+                deadline = active_monotonic()+args[0]/1000
+                while active_monotonic() < deadline:
                     token.check('browser.poll_wait')
-                    self._wrapped.wait_for_timeout(min(100, max(0,(deadline-time.monotonic())*1000)))
+                    self._wrapped.wait_for_timeout(min(100, max(0,(deadline-active_monotonic())*1000)))
                 token.check()
                 return None
             if name == 'goto' and token:
@@ -48,17 +48,17 @@ class CancellableBrowserObject:
             # navigation: those may already have produced a remote side effect.
             if token and name in {'wait_for', 'wait_for_selector', 'wait_for_function', 'wait_for_url', 'wait_for_load_state'}:
                 total_ms = kwargs.get('timeout')
-                deadline = time.monotonic() + (total_ms or 30000) / 1000
+                deadline = active_monotonic() + (total_ms or 30000) / 1000
                 while True:
                     token.check(f'browser.{name}')
-                    remaining_ms = max(1, (deadline - time.monotonic()) * 1000)
+                    remaining_ms = max(1, (deadline - active_monotonic()) * 1000)
                     try:
                         result = value(*args, **{**kwargs, 'timeout': min(2000, remaining_ms)})
                         token.check()
                         return wrap(result)
                     except PlaywrightTimeoutError:
                         token.check()
-                        if time.monotonic() >= deadline:
+                        if active_monotonic() >= deadline:
                             raise
             # Preserve action deadlines: shortening a click/goto can report a
             # failure after the remote action succeeded. On Windows the owned

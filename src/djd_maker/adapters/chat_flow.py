@@ -5,7 +5,7 @@ import time
 import re
 
 from .replies import ReplyKind, classify_reply
-from djd_maker.core.cancellation import checkpoint
+from djd_maker.core.cancellation import checkpoint, active_monotonic
 
 
 # Keep input selection inside the central panel. No page-wide textarea fallback.
@@ -37,6 +37,13 @@ class ChatFlow:
         if len(visible) != 1:
             raise ChatFlowError("WRONG_INPUT_TARGET: 中央Chat panelを一意に確認できません")
         return visible[0]
+
+    def check_limit(self):
+        from .usage_limit import UsageLimitDetector
+        from djd_maker.core.cloud_limit import CloudLimitReached
+        observation, _ = UsageLimitDetector(self.page, self.dom.clock).observe()
+        if observation:
+            raise CloudLimitReached(observation)
 
     def input(self):
         root = self.root()
@@ -79,19 +86,20 @@ class ChatFlow:
         return True, "\n".join(replies)
 
     def wait_reply(self, prompt, baseline):
-        deadline = time.monotonic() + self.reply_timeout
+        deadline = active_monotonic() + self.reply_timeout
         previous = None
-        stable = time.monotonic()
+        stable = active_monotonic()
         message_reported = False
-        while time.monotonic() < deadline:
+        while active_monotonic() < deadline:
+            self.check_limit()
             found, reply = self.correlated_reply(prompt, baseline)
             if found and not message_reported:
                 self.dom.diagnostic("PRESET_SENT:current_user_message_confirmed")
                 message_reported = True
             if reply != previous:
-                previous, stable = reply, time.monotonic()
+                previous, stable = reply, active_monotonic()
             result = classify_reply(reply, now=self.dom.clock())
-            if found and result.kind in {ReplyKind.GENERATION_ACCEPTED, ReplyKind.QUOTA_EXHAUSTED} and time.monotonic() - stable >= 2:
+            if found and result.kind in {ReplyKind.GENERATION_ACCEPTED, ReplyKind.QUOTA_EXHAUSTED} and active_monotonic() - stable >= 2:
                 self.dom.diagnostic(f"REPLY_CLASSIFIED:{result.kind}:score={result.score}:terms={','.join(result.matched_terms)}")
                 return result
             self.page.wait_for_timeout(2000)
@@ -102,6 +110,7 @@ class ChatFlow:
         last_target_error = None
         for attempt in range(1, 4):
             checkpoint('chat.retry')
+            self.check_limit()
             from djd_maker.core.runtime_operation import report_operation
             report_operation('chat.retry', attempt=f'{attempt} / 3')
             if baseline is not None:
@@ -126,13 +135,14 @@ class ChatFlow:
             control.fill(prompt)
             if self.dom._input_text(control) != prompt:
                 raise ChatFlowError("PRESET_APPLY_MISMATCH: 入力本文が一致しません")
-            deadline = time.monotonic() + self.send_timeout
+            deadline = active_monotonic() + self.send_timeout
             sent = False
-            while time.monotonic() < deadline:
+            while active_monotonic() < deadline:
                 buttons = self.root().get_by_role("button", name=re.compile(r"^(送信|Send)$"))
                 active = [buttons.nth(i) for i in range(buttons.count()) if buttons.nth(i).is_visible() and buttons.nth(i).is_enabled()]
                 if len(active) == 1:
                     checkpoint('chat.send')
+                    self.check_limit()
                     self.dom.diagnostic("CHAT_SEND_ENABLED")
                     active[0].click()
                     sent = True

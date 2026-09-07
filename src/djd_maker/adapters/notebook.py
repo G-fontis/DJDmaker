@@ -17,7 +17,7 @@ from djd_maker.core.cancellation import RunCancelled
 from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.adapters.credit import CreditDetector, CreditSnapshot, CreditState
 from djd_maker.media.validator import VideoValidator
-from djd_maker.core.cancellation import checkpoint
+from djd_maker.core.cancellation import checkpoint, active_monotonic
 
 
 class NotebookAdapterError(RuntimeError):
@@ -210,8 +210,8 @@ class PlaywrightArtifactDownload:
             )
             item.click()
             clicked = True
-            deadline = time.monotonic() + self.timeout_ms / 1000
-            while time.monotonic() < deadline:
+            deadline = active_monotonic() + self.timeout_ms / 1000
+            while active_monotonic() < deadline:
                 files = [candidate for candidate in download_dir.iterdir() if candidate.is_file()]
                 completed = [
                     candidate
@@ -232,12 +232,12 @@ class PlaywrightArtifactDownload:
                     current_size = partials[0].stat().st_size
                     if current_size != stable_size:
                         stable_size = current_size
-                        stable_since = time.monotonic()
+                        stable_since = active_monotonic()
                     if (
                         getattr(page, "is_closed", lambda: False)()
                         and current_size > 0
                         and stable_since is not None
-                        and time.monotonic() - stable_since >= 1
+                        and active_monotonic() - stable_since >= 1
                     ):
                         partials[0].replace(temporary)
                         return True
@@ -423,6 +423,14 @@ class NotebookDomAdapter:
         )
         return detector.detect()
 
+    def check_usage_limit(self):
+        from .usage_limit import UsageLimitDetector
+        from djd_maker.core.cloud_limit import CloudLimitReached
+        observation, enabled = UsageLimitDetector(self.page, self.clock).observe()
+        if observation:
+            raise CloudLimitReached(observation)
+        return enabled
+
     def _locator(self, kind: str, role: str, value: str) -> Any:
         if kind == "role":
             return self.page.get_by_role(role, name=value, exact=True)
@@ -437,8 +445,8 @@ class NotebookDomAdapter:
     def _first_visible(self, candidates: Iterable[tuple[str, str, str]], name: str) -> Any:
         # Keep the same delayed-DOM tolerance as GNBCreator.  Notebook's home
         # shell reaches ``domcontentloaded`` before its Angular controls mount.
-        deadline = time.monotonic() + self.timeout_ms / 1000
-        while time.monotonic() < deadline:
+        deadline = active_monotonic() + self.timeout_ms / 1000
+        while active_monotonic() < deadline:
             for candidate in candidates:
                 try:
                     locator = self._locator(*candidate)
@@ -455,8 +463,8 @@ class NotebookDomAdapter:
         candidates: Iterable[tuple[str, str, str]],
         name: str,
     ) -> Any:
-        deadline = time.monotonic() + self.timeout_ms / 1000
-        while time.monotonic() < deadline:
+        deadline = active_monotonic() + self.timeout_ms / 1000
+        while active_monotonic() < deadline:
             for candidate in candidates:
                 try:
                     locator = self._locator(*candidate)
@@ -510,27 +518,28 @@ class NotebookDomAdapter:
         if self.interactable_guard is not None:
             self.ensure_interactable()
             return
-        deadline = time.monotonic() + timeout_ms / 1000
-        quiet_since = time.monotonic()
-        while time.monotonic() < deadline:
+        deadline = active_monotonic() + timeout_ms / 1000
+        quiet_since = active_monotonic()
+        while active_monotonic() < deadline:
             close = self._try_first_visible(INFORMATION_DIALOG_CLOSE)
             if close is not None:
                 close.click()
-                quiet_since = time.monotonic()
+                quiet_since = active_monotonic()
                 self.page.wait_for_timeout(250)
                 continue
-            if time.monotonic() - quiet_since >= 2:
+            if active_monotonic() - quiet_since >= 2:
                 return
             self.page.wait_for_timeout(250)
 
     def create_notebook(self) -> ResumeMetadata:
+        self.check_usage_limit()
         self.page.goto(self.HOME_URL, wait_until="domcontentloaded")
         self._first_visible(CREATE_NOTEBOOK, "Notebook作成ボタン").click()
         self.page.wait_for_url("**/notebook/**", timeout=self.timeout_ms)
-        deadline = time.monotonic() + self.timeout_ms / 1000
+        deadline = active_monotonic() + self.timeout_ms / 1000
         notebook_id = ""
         url = self.page.url
-        while time.monotonic() < deadline:
+        while active_monotonic() < deadline:
             url = self.page.url
             parsed = urlparse(url)
             candidate = Path(parsed.path).name
@@ -549,8 +558,8 @@ class NotebookDomAdapter:
         editor = self._first_visible(TITLE_INPUT, "Notebookタイトル入力")
         editor.fill(title)
         editor.press("Enter")
-        deadline = time.monotonic() + self.timeout_ms / 1000
-        while time.monotonic() < deadline:
+        deadline = active_monotonic() + self.timeout_ms / 1000
+        while active_monotonic() < deadline:
             actual = ""
             page_title = ""
             try:
@@ -570,6 +579,7 @@ class NotebookDomAdapter:
         raise DomMismatchError("Notebook名の確定をreadbackできません")
 
     def upload_txt(self, source_path: Path) -> None:
+        self.check_usage_limit()
         from djd_maker.core.runtime_operation import report_operation
         report_operation('source.upload')
         self.ensure_interactable()
@@ -703,9 +713,9 @@ class NotebookDomAdapter:
         timeout_ms: int = SOURCE_READY_TIMEOUT_MS,
     ) -> None:
         """Wait for indexing and the right-side Studio card to become active."""
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = active_monotonic() + timeout_ms / 1000
         stable_since: float | None = None
-        while time.monotonic() < deadline:
+        while active_monotonic() < deadline:
             checkpoint('source.wait')
             self.ensure_interactable()
             if self.source_state(filename) == "ERROR":
@@ -719,8 +729,8 @@ class NotebookDomAdapter:
             )
             if ready:
                 if stable_since is None:
-                    stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= 2:
+                    stable_since = active_monotonic()
+                elif active_monotonic() - stable_since >= 2:
                     self.diagnostic("SOURCE_READY_CONFIRMED:studio_video_card_active")
                     return
             else:
@@ -781,6 +791,7 @@ class NotebookDomAdapter:
                 retry = cards.get_by_role("button", name=re.compile(r"^(再試行|もう一度試す|Retry|Try again)$"))
                 if retry.count() != 1 or not retry.first.is_visible() or not retry.first.is_enabled():
                     raise SourceProcessingError("SOURCE_UPLOAD_FAILED: source再試行UIを確認できません。Notebook/sourceは保持")
+                self.check_usage_limit()
                 retry.first.click()
             try:
                 self.wait_for_source_ready(source.name)
@@ -861,8 +872,8 @@ class NotebookDomAdapter:
             ) from exc
         created_at = self.clock()
         schedule.click()
-        deadline = time.monotonic() + timeout_ms / 1000
-        while time.monotonic() < deadline:
+        deadline = active_monotonic() + timeout_ms / 1000
+        while active_monotonic() < deadline:
             status = self.inspect_status()
             if status is RemoteVideoStatus.WAITING:
                 self.diagnostic("CREDIT_RESERVATION_CONFIRMED:SCHEDULED_REMOTE")
@@ -899,10 +910,10 @@ class NotebookDomAdapter:
         return False
 
     def _wait_for_generation_chat_ready(self, *, timeout_ms: int = 60_000) -> Any:
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = active_monotonic() + timeout_ms / 1000
         stable_since: float | None = None
         textbox: Any = None
-        while time.monotonic() < deadline:
+        while active_monotonic() < deadline:
             textbox = self._try_first_visible(CHAT_INPUT)
             enabled = False
             if textbox is not None:
@@ -915,8 +926,8 @@ class NotebookDomAdapter:
             ready = enabled and self._studio_video_card_active()
             if ready:
                 if stable_since is None:
-                    stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= 2:
+                    stable_since = active_monotonic()
+                elif active_monotonic() - stable_since >= 2:
                     self.diagnostic("GENERATION_CHAT_READY_STABLE")
                     return textbox
             else:
@@ -933,14 +944,14 @@ class NotebookDomAdapter:
         *,
         timeout_ms: int = 60_000,
     ) -> None:
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = active_monotonic() + timeout_ms / 1000
         stable_since: float | None = None
-        while time.monotonic() < deadline:
+        while active_monotonic() < deadline:
             sent = self._input_text(textbox) == "" and self._sent_message_visible(prompt)
             if sent:
                 if stable_since is None:
-                    stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= 2:
+                    stable_since = active_monotonic()
+                elif active_monotonic() - stable_since >= 2:
                     self.diagnostic("PRESET_CHAT_SENT_CONFIRMED_STABLE")
                     return
             else:
@@ -955,8 +966,8 @@ class NotebookDomAdapter:
         *,
         timeout_ms: int = 120_000,
     ) -> GenerationOutcome:
-        deadline = time.monotonic() + timeout_ms / 1000
-        while time.monotonic() < deadline:
+        deadline = active_monotonic() + timeout_ms / 1000
+        while active_monotonic() < deadline:
             status = self.inspect_status()
             if status in {
                 RemoteVideoStatus.GENERATING,
@@ -1005,6 +1016,7 @@ class NotebookDomAdapter:
     def start_video_generation_from_chat(self, prompt: str) -> GenerationOutcome:
         """Send the exact job snapshot to main chat and let Notebook generate."""
         self.ensure_interactable()
+        self.check_usage_limit()
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
         if self.page.locator("artifact-library-item").count():
@@ -1020,7 +1032,8 @@ class NotebookDomAdapter:
             from djd_maker.core.runtime_operation import report_operation
             report_operation('quota.detected')
             credit = CreditSnapshot(CreditState.EXHAUSTED, reset_at=reply.reset_at)
-            return self.request_scheduled_video_generation(prompt, credit)
+            from djd_maker.core.cloud_limit import CloudLimitReached, LimitObservation
+            raise CloudLimitReached(LimitObservation('QUOTA_EXHAUSTED', credit.reset_at, True))
         return GenerationOutcome(RemoteVideoStatus.GENERATING, False, CreditSnapshot())
 
     def inspect_status(self) -> RemoteVideoStatus:
@@ -1065,9 +1078,9 @@ class NotebookDomAdapter:
         # Notebook's Angular artifact list mounts after ``domcontentloaded``.
         # This follows GNBCreator's recovery wait instead of treating the first
         # empty DOM frame after a browser restart as a selector mismatch.
-        deadline = time.monotonic() + min(self.timeout_ms, 60_000) / 1000
+        deadline = active_monotonic() + min(self.timeout_ms, 60_000) / 1000
         all_cards = self.page.locator("artifact-library-item")
-        while all_cards.count() == 0 and time.monotonic() < deadline:
+        while all_cards.count() == 0 and active_monotonic() < deadline:
             try:
                 self.page.wait_for_timeout(2_000)
             except Exception:
@@ -1138,9 +1151,9 @@ class NotebookDomAdapter:
     def _wait_for_artifact_cards(self) -> None:
         """Wait for GNBCreator's delayed Studio artifact mount after navigation."""
 
-        deadline = time.monotonic() + min(self.timeout_ms, 60_000) / 1000
+        deadline = active_monotonic() + min(self.timeout_ms, 60_000) / 1000
         cards = self.page.locator("artifact-library-item")
-        while cards.count() == 0 and time.monotonic() < deadline:
+        while cards.count() == 0 and active_monotonic() < deadline:
             try:
                 self.page.wait_for_timeout(2_000)
             except Exception:
@@ -1249,10 +1262,10 @@ class NotebookDomAdapter:
             # variants; a late dialog remains fail-closed instead of being
             # clicked through speculatively.
             dialog = None
-            probe_deadline = time.monotonic() + min(
+            probe_deadline = active_monotonic() + min(
                 1.0, self.timeout_ms / 1000
             )
-            while time.monotonic() < probe_deadline:
+            while active_monotonic() < probe_deadline:
                 if not self._visible(card):
                     self._verify_absent_after_refresh(artifact_title, title_scoped)
                     return
@@ -1277,8 +1290,8 @@ class NotebookDomAdapter:
                     dialog, "button", selectors.confirm_button_names
                 ).click()
 
-            deadline = time.monotonic() + self.timeout_ms / 1000
-            while time.monotonic() < deadline:
+            deadline = active_monotonic() + self.timeout_ms / 1000
+            while active_monotonic() < deadline:
                 new_success_toast = (
                     not toast_was_visible and self._success_toast_visible(selectors)
                 )
@@ -1300,6 +1313,9 @@ class NotebookDomAdapter:
 
 
 class NotebookEngineAdapter:
+    # 2026-09-08: live AI-limit banner + disabled chat; UI download validated
+    # (1,850,725 bytes, h264/aac, 455.71483s). No generation API is permitted.
+    download_during_limit_verified = True
     """DOM操作をpipeline用のjob単位interfaceへまとめる。"""
 
     def __init__(
@@ -1410,12 +1426,29 @@ class NotebookEngineAdapter:
             outcome,
         )
 
+    def recheck_cloud_limit(self, notebook_url=None):
+        if notebook_url:
+            parsed = urlparse(notebook_url)
+            if parsed.scheme != 'https' or parsed.hostname != 'notebook.google.com':
+                raise NotebookAdapterError('Invalid limit recheck URL')
+            checkpoint('limit.recheck')
+            self.dom.page.goto(notebook_url, wait_until='domcontentloaded')
+        self.dom.ensure_interactable()
+        deadline = active_monotonic() + 30
+        while active_monotonic() < deadline:
+            checkpoint('limit.recheck')
+            if self.dom.check_usage_limit():
+                return True
+            self.dom.page.wait_for_timeout(250)
+        return False
+
     def _open_job(self, job: Job) -> None:
         if not job.notebook_url:
             raise NotebookAdapterError("jobにNotebook URLがありません")
         parsed = urlparse(job.notebook_url)
         if parsed.scheme != "https" or parsed.hostname != "notebook.google.com":
             raise NotebookAdapterError("jobのNotebook URLが不正です")
+
         if job.notebook_id and parsed.path.rstrip("/").split("/")[-1] != job.notebook_id:
             raise NotebookAdapterError("NOTEBOOK_IDENTITY_MISMATCH: Notebook IDとURLが一致しません")
         # Notebook downloads can close their initiating tab. GNBCreator keeps
@@ -1460,9 +1493,9 @@ class NotebookEngineAdapter:
         # GNBCreator's remote recovery observes every two seconds for up to
         # sixty seconds after navigation. This is essential because Angular's
         # artifact cards mount well after ``domcontentloaded``.
-        deadline = time.monotonic() + min(self.dom.timeout_ms, 60_000) / 1000
+        deadline = active_monotonic() + min(self.dom.timeout_ms, 60_000) / 1000
         status = RemoteVideoStatus.UNKNOWN
-        while time.monotonic() < deadline:
+        while active_monotonic() < deadline:
             checkpoint('artifact.poll')
             ensure = getattr(self.dom, 'ensure_interactable', None)
             if callable(ensure):

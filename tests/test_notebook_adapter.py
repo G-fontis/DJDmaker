@@ -868,6 +868,7 @@ def test_exact_test_preset_reaches_main_chat_without_video_card_controls(monkeyp
         events.append("auto_generation")
         return ReplyResult(ReplyKind.GENERATION_ACCEPTED)
     monkeypatch.setattr("djd_maker.adapters.chat_flow.ChatFlow.send", verified_send)
+    monkeypatch.setattr('djd_maker.adapters.usage_limit.UsageLimitDetector.observe', lambda _: (None, True))
 
     adapter.start_video_generation_from_chat(prompt)
 
@@ -882,6 +883,8 @@ def test_exact_test_preset_reaches_main_chat_without_video_card_controls(monkeyp
 
 
 def test_old_exhausted_precheck_does_not_skip_current_chat_attempt(monkeypatch):
+    from djd_maker.core.cloud_limit import CloudLimitReached
+    monkeypatch.setattr('djd_maker.adapters.usage_limit.UsageLimitDetector.observe', lambda _: (None, True))
     jst = timezone(timedelta(hours=9))
     now = datetime(2026, 9, 7, 22, 0, tzinfo=jst)
     credit = CreditSnapshot(
@@ -912,10 +915,10 @@ def test_old_exhausted_precheck_does_not_skip_current_chat_attempt(monkeypatch):
         or GenerationOutcome(RemoteVideoStatus.WAITING, True, snapshot, now)
     )
 
-    outcome = adapter.start_video_generation_from_chat("selected preset")
-
-    assert outcome.reserved is True
-    assert events == [("selected preset", CreditSnapshot(CreditState.EXHAUSTED, reset_at=credit.reset_at))]
+    with pytest.raises(CloudLimitReached) as caught:
+        adapter.start_video_generation_from_chat("selected preset")
+    assert caught.value.observation.blocked_until == credit.reset_at
+    assert events == []  # V1.2.5: current quota suspends cloud; no new reservation.
 
 
 def test_reservation_uses_exact_allowlist_and_requires_waiting_status():
@@ -1037,6 +1040,7 @@ def test_missing_schedule_control_has_specific_failure():
 
 
 def test_chat_input_readback_mismatch_blocks_send(monkeypatch):
+    monkeypatch.setattr('djd_maker.adapters.usage_limit.UsageLimitDetector.observe', lambda _: (None, True))
     events = []
 
     class EmptyCards:

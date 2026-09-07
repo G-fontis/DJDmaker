@@ -48,6 +48,8 @@ def build_desktop(
     from djd_maker.core.completed_txt import reconcile_completed_txt
     migrate_jobs(root / "system")
     settings = settings_repository.load()
+    from djd_maker.core.cloud_limit import CloudLimitGate
+    cloud_limit = CloudLimitGate(root / 'system' / 'cloud-limit.json')
     reconcile_completed_txt(job_repository, _resolved(root, settings.raw_directory))
     browser = browser_manager or BrowserManager(
         root / "browser" / "chrome-profile",
@@ -60,6 +62,7 @@ def build_desktop(
     )
 
     def make_pipeline(*, require_preset: bool) -> PipelineCoordinator:
+        from djd_maker.core.cloud_limit import CloudLimitGate
         from djd_maker.adapters.notebook_modal import ensure_notebook_interactable
         current = settings_repository.load()
         current.validate()
@@ -72,7 +75,15 @@ def build_desktop(
         scheduler.first_poll_seconds = current.first_notebook_check_seconds
         scheduler.subsequent_poll_seconds = current.notebook_poll_seconds
         validator = VideoValidator()
-        page = browser.prepare_for_processing()
+        gate = cloud_limit
+        class DeferredPage:
+            def __init__(self):
+                self.page = None
+            def __getattr__(self, name):
+                if self.page is None:
+                    self.page = browser.prepare_for_processing()
+                return getattr(self.page, name)
+        page = DeferredPage() if gate.blocked else browser.prepare_for_processing()
         notebook = NotebookEngineAdapter(
             NotebookDomAdapter(
                 page,
@@ -99,6 +110,7 @@ def build_desktop(
             ffmpeg_concurrency=current.ffmpeg_concurrency,
             scheduler=scheduler,
             generation_preset=selected_preset,
+            cloud_limit=gate,
         )
 
     def pipeline_factory() -> PipelineCoordinator:
@@ -123,6 +135,7 @@ def build_desktop(
         browser_status_provider=browser.runtime_status,
     )
     bridge = AsyncControllerBridge(service)
+    service.cloud_limit = cloud_limit
     window = MainWindow(
         app_root=root,
         settings_repository=settings_repository,

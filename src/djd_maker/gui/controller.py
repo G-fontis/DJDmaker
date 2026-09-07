@@ -4,7 +4,8 @@ import threading
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, QTimer
+from djd_maker.core.commands import EventId, PresentationEvent
 
 
 class GuiControllerPort(Protocol):
@@ -65,6 +66,7 @@ class AsyncControllerBridge(QObject):
     operation_finished = Signal(str, object)
     operation_failed = Signal(str, str)
     busy_changed = Signal(bool)
+    presentation_event = Signal(object)
 
     def __init__(
         self,
@@ -80,6 +82,17 @@ class AsyncControllerBridge(QObject):
         self._lock = threading.Lock()
         self._closing = False
         self._tasks: set[_ControllerTask] = set()
+        self._limit_active = False
+        self._last_phase = None
+        self._pause_acknowledged = False
+        self._pause_timer = QTimer(self)
+        self._pause_timer.timeout.connect(self._observe_pause)
+        self._pause_timer.start(200)
+        self.operation_failed.connect(lambda name, message: self.presentation_event.emit(
+            PresentationEvent(EventId.ERROR, {'operation': name, 'message': message})))
+        self.jobs_changed.connect(lambda p: self.presentation_event.emit(PresentationEvent(EventId.JOBS_UPDATED, p)))
+        self.job_changed.connect(lambda p: self.presentation_event.emit(PresentationEvent(EventId.JOB_UPDATED, p)))
+        self.status_changed.connect(self._status_event)
         bind_job = getattr(controller, 'bind_job', None)
         if callable(bind_job):
             bind_job(self.publish_job)
@@ -133,7 +146,13 @@ class AsyncControllerBridge(QObject):
         return self._invoke("start", self.controller.start)
 
     def pause(self) -> bool:
+        request = getattr(self.controller, 'request_pause', None)
+        if callable(request):
+            request()
         return self._invoke("pause", self.controller.pause)
+
+    def resume(self) -> bool:
+        return self._invoke("resume", self.controller.resume)
 
     def stop(self) -> bool:
         request = getattr(self.controller, 'request_stop', None)
@@ -169,12 +188,41 @@ class AsyncControllerBridge(QObject):
     def publish_status(self, status: object) -> None:
         self.status_changed.emit(status)
 
+    def _status_event(self, status):
+        self.presentation_event.emit(PresentationEvent(EventId.RUNTIME_STATUS, status))
+        if not isinstance(status, dict):
+            return
+        phase = status.get('runtime', {}).get('phase', status.get('phase'))
+        if phase != self._last_phase:
+            self._last_phase = phase
+            self.presentation_event.emit(PresentationEvent(EventId.PHASE_CHANGED, {'phase': phase}))
+        active = bool(status.get('cloud_limit', {}).get('active'))
+        if active:
+            event = EventId.LIMIT_WAITING if self._limit_active else EventId.LIMIT_DETECTED
+            self.presentation_event.emit(PresentationEvent(event, status['cloud_limit']))
+        elif self._limit_active:
+            self.presentation_event.emit(PresentationEvent(EventId.LIMIT_RELEASED, {}))
+        self._limit_active = active
+        if status.get('pause_state') == 'PAUSED':
+            self.presentation_event.emit(PresentationEvent(EventId.PAUSED, status))
+        if status.get('phase') == 'STOPPED':
+            self.presentation_event.emit(PresentationEvent(EventId.STOPPED, status))
+
+    def _observe_pause(self):
+        # Read-only acknowledgment on the Qt thread; never access Playwright.
+        token = getattr(self.controller, 'cancellation', None)
+        acknowledged = bool(token and token.paused.is_set())
+        if acknowledged and not self._pause_acknowledged and not self._closing:
+            self.publish_status(self.controller.status())
+        self._pause_acknowledged = acknowledged
+
     @Slot(object)
     def publish_log(self, record: object) -> None:
         self.log_received.emit(record)
 
     def shutdown(self, timeout_ms: int = 5000) -> bool:
         """Reject new work, request controller shutdown, then drain owned workers."""
+        self._pause_timer.stop()
         with self._lock:
             self._closing = True
         try:
