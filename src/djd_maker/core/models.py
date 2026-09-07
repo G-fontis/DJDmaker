@@ -43,7 +43,7 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         {JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.FAILED}
     ),
     JobState.GENERATING: frozenset(
-        {JobState.WAITING_VIDEO, JobState.DOWNLOADING, JobState.FAILED}
+        {JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING, JobState.FAILED}
     ),
     JobState.WAITING_VIDEO: frozenset(
         {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING, JobState.FAILED}
@@ -162,6 +162,9 @@ class Job:
     resume_checkpoint: str | None = None
     runtime_outcome: str | None = None
     runtime_reason: str | None = None
+    presentation_stage: str = ""
+    presentation_phase: str = ""
+    presentation_revision: int = 0
     txt_move_status: str = "PENDING"
     archived_txt_path: str | None = None
     source_sha256: str | None = None

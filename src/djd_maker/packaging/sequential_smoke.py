@@ -8,7 +8,7 @@ from pathlib import Path
 def run_sequential_smoke(root: Path, report: Path) -> int:
     if os.environ.get('DJD_PACKAGING_SMOKE') != '1':
         return 3
-    from PySide6.QtCore import QTimer
+    from PySide6.QtCore import QTimer, QObject, Slot
     from PySide6.QtWidgets import QApplication
     from djd_maker.gui.app import build_desktop
     from djd_maker.gui.dialogs import PresetDialog
@@ -34,19 +34,27 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
     app.setQuitOnLastWindowClosed(False)
     preset = window.preset_repository.create('release fixture', 'never sent to Google')
     window.preset_repository.select(preset.id)
-    calls, runtime, errors, dialogs = [], [], [], []
+    calls, runtime, errors, dialogs, table_updates = [], [], [], [], []
+    from djd_maker.core.runtime_operation import report_operation
+    from types import SimpleNamespace
     sources = {}
     for index in range(2):
         source = root/'input'/f'lesson{index}.txt'
         source.parent.mkdir(exist_ok=True)
         source.write_text('release fixture', encoding='utf-8')
-        job = Job(str(source), id=f'release{index}', state=JobState.WAITING_VIDEO,
+        job = Job(str(source), id=f'release{index}', state=JobState.WAITING,
                   notebook_id=f'fake{index}', notebook_url=f'https://notebook.google.com/notebook/fake{index}',
                   next_poll_at='2020-01-01T00:00:00+00:00')
         job.snapshot_preset(preset)
         service.jobs.save(job)
         sources[str(source)] = fixture
     class Remote(FakeNotebookAdapter):
+        def submit(self, job):
+            calls.append(['submit',job.id])
+            report_operation('chat.send')
+            report_operation('chat.sent')
+            report_operation('generation.accepted')
+            return SimpleNamespace(notebook_id=job.notebook_id,notebook_url=job.notebook_url,remote_status='READY',reserved=False)
         def inspect_status(self, job):
             calls.append(['check', job.id])
             return 'READY'
@@ -69,6 +77,13 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
     def observe(record):
         runtime.append(dict(record));update(record)
     service._runtime_update=observe
+    class TableProbe(QObject):
+        @Slot(object)
+        def receive(self, job):
+            table_updates.append({'job':job.id,'stage':job.presentation_stage,'state':job.state.value,
+                                  'display':next(j.presentation_stage for j in window.jobs if j.id==job.id)})
+    probe=TableProbe()
+    window.controller.job_changed.connect(probe.receive)
     window.controller.operation_failed.disconnect(window._operation_failed)
     window.controller.operation_failed.connect(lambda op,msg:errors.append([op,msg]))
     def close_modal():
@@ -90,14 +105,15 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
             errors.append(['timeout']);service.stop()
         if time.monotonic()-start>3 and service._worker is None:
             jobs=service.jobs.list()
-            expected=[[action,f'release{i}'] for i in range(2) for action in ('check','download','delete')]
+            expected=[['submit',f'release{i}'] for i in range(2)]+[[action,f'release{i}'] for i in range(2) for action in ('download','delete')]
             stages={r.get('stage') for r in runtime}
             required={'artifact.ready','download.start','raw.saved','ending.skip','hls.start','zip.start','job.next'}
-            passed=(calls==expected and required<=stages and not errors and len(dialogs)==4
+            refreshed={entry['stage'] for entry in table_updates if entry['stage']==entry['display']}
+            passed=(calls==expected and required<=stages and {'chat.send','generation.accepted','hls.start','COMPLETED'}<=refreshed and not errors and len(dialogs)==4
                     and all(j.state is JobState.COMPLETED and j.txt_move_status=='MOVED'
                             and j.safety_gate.remote_deletion_allowed and j.ending_result.startswith('SKIPPED') for j in jobs))
             window.grab().save(str(root/'runtime.png'))
-            result=dict(passed=passed,calls=calls,runtime=runtime,dialogs=dialogs,errors=errors,
+            result=dict(passed=passed,calls=calls,runtime=runtime,dialogs=dialogs,errors=errors,table_updates=table_updates,
                         runtime_labels={key:label.text() for key,(_,label) in window.runtime_labels.items()},
                         jobs=[dict(id=j.id,state=j.state.value,ending=j.ending_result,hls=j.hls_result,txt=j.txt_move_status) for j in jobs])
             report.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')

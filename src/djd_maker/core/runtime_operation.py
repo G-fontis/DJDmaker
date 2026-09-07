@@ -5,6 +5,17 @@ from contextvars import ContextVar
 _sink = ContextVar('runtime_sink', default=None)
 
 LABELS = {
+    'phase.a': '動画生成開始フェーズ', 'phase.b': '動画回収・変換フェーズ',
+    'REMOTE_ARTIFACT_READY': '動画完成・回収待ち',
+    'notebook.create': 'Notebook作成中', 'notebook.created': 'Notebook作成完了',
+    'source.upload': 'ソースアップロード中', 'source.uploaded': 'ソースアップロード完了',
+    'source.error': 'ソース読み込みエラー', 'chat.sent': 'プリセット送信完了',
+    'quota.detected': 'クレジット不足', 'reservation.start': '予約処理中', 'reservation.complete': '予約済み',
+    'generation.accepted': '動画生成中',
+    'download.complete': '動画回収完了', 'raw.validate': 'RAW安全検証中',
+    'artifact.deleted': '動画artifact削除完了', 'ending.complete': 'Ending処理完了',
+    'hls.complete': 'HLS変換完了', 'zip.complete': 'ZIP作成完了',
+    'pause': '一時停止', 'resume': '再開',
     'artifact.ready': '動画完成を確認', 'READY': 'artifact ready（動画完成）',
     'raw.saved': 'RAW保存・安全検証完了', 'ending.skip': 'Ending未選択のためスキップ',
     'ending.start': 'Ending結合', 'hls.start': 'HLS変換', 'zip.start': 'ZIP作成',
@@ -23,7 +34,7 @@ LABELS = {
     'notebook.submit': 'ソース・Preset処理を開始',
     'source.check': 'ソース状態確認', 'source.wait': 'ソース読み込み完了待ち',
     'source.ready': 'ソース確認済み', 'chat.interactable': '中央Chat入力欄を準備',
-    'chat.send': 'Preset送信', 'chat.reply': 'Notebook返信待ち',
+    'chat.send': 'プリセット送信中', 'chat.reply': 'Notebook返信待ち',
     'chat.retry': 'Preset送信前の返信・状態確認',
     'artifact.poll': '動画の完成状態を確認', 'download.start': '完成動画をダウンロード',
     'media.start': 'RAWからEnding・HLS・ZIP処理',

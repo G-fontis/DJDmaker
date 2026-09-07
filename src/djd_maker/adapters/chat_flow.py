@@ -139,6 +139,7 @@ class ChatFlow:
                     break
                 self.page.wait_for_timeout(250)
             if sent:
+                report_operation('chat.sent')
                 report_operation('chat.reply', next_action='今回送信に対応する返信を確認')
                 result = self.wait_reply(prompt, baseline)
                 if result is not None:

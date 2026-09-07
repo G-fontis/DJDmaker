@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver1.2.2
+# 台本から授業動画つくるマシーン Ver1.2.3
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.2.2。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.2.3。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,13 +33,15 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.2.2`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.2.3`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 Ver1.2.1ではStop/Window ×の協調停止と所有automation process限定の終了処理を追加しています。告知modalは既知の安全な情報dialogだけを閉じ、未知・確認dialogは自動で閉じず停止します。告知のlive自動dismissは自然再現せず未確認（ユーザー承認済みの既知事項）であり、fixtureで検証しています。
 
 ## Ver1.2 再開・移行
 
-Ver1.2.2では全jobの事前巡回を廃止し、1件ずつ確認→判断保存→必要処理→結果保存→次jobの順で処理します。生成待機は保存した次回確認時刻までNotebookを開かず、完成を検出したjobはその場でDownload・RAW検証・HLS/ZIP・TXT移動まで進めます。白GUIに現在Job・Notebook・工程・判断・次処理・結果・Attempt・経過時間・処理件数と日本語メッセージを表示します。
+Ver1.2.3は生成投入を優先します。Phase Aで未生成jobを1件ずつ確認→生成開始または予約→保存→次jobへ進め、全対象の投入完了後にPhase BでDownload・RAW検証・Ending（任意）・HLS/ZIP・TXT移動を行います。Phase AではDownload・ローカル変換を開始しません。生成待機は保存した次回確認時刻までNotebookを開かず、Phase Bで完成を検出したjobはその場で回収します。全jobの確認だけを先に行う事前巡回はしません。
+
+工程ごとにJSON保存成功後、状態表の該当行・集計・Runtime表示を即時更新します。Stopや全件終了まで古い表示を残さず、ソート・チェック選択・スクロール位置を保持します。白GUIには現在Phase・Job・Notebook・工程・判断・次処理・結果・Attempt・経過時間・処理件数と日本語メッセージを表示します。検証記録は[Ver1.2.3](docs/v123-generation-first-live-status.md)を参照してください。
 
 既知事項: `ANNOUNCEMENT_MODAL_LIVE_AUTO_DISMISS: UNVERIFIED_LIVE`（fixture PASS）、`SOURCE_UPLOAD_ERROR_LIVE_RECOVERY: UNVERIFIED_LIVE`。自然再現していないため実機修正成功とは扱いません。詳細は[Ver1.2.2 release記録](docs/v122-final-release.md)を参照してください。
 

@@ -271,10 +271,12 @@ class HlsAdapter:
                     "HLS codecs are invalid: "
                     f"video={output_probe.video_codec!r}, audio={output_probe.audio_codec!r}"
                 )
+            report_operation('hls.complete', next_action='ZIP作成')
             report_operation('zip.start', next_action='ZIP整合性検証・完成保存')
             create_and_validate_zip(playlist, segments, temporary_zip)
             _publish_without_overwrite(temporary_zip, output_zip)
             published = True
+            report_operation('zip.complete', next_action='完成状態保存')
             return HlsResult(hls_directory, playlist, segments, output_zip)
         finally:
             temporary_zip.unlink(missing_ok=True)

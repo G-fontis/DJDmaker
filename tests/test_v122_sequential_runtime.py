@@ -64,21 +64,21 @@ def test_inspect_then_act_same_job_no_full_prescan(tmp_path, error):
     assert len(events) == 4  # no double pass or reopening before deadline
 
 
-def test_ready_artifact_download_and_completion_before_next_job(tmp_path):
+def test_ready_artifact_deferred_until_next_job_dispatched(tmp_path):
     a, b = failed('ready'), failed('next')
     jobs = MemoryJobs(a, b)
     events = []
     class CheckCompletion(Remote):
         def diagnose_resume(self, job):
             if job.id == b.id:
-                assert jobs.get(a.id).state is JobState.COMPLETED
-                assert jobs.get(a.id).runtime_outcome == 'COMPLETED'
+                assert jobs.get(a.id).state is JobState.DOWNLOAD_PENDING
+                assert jobs.get(a.id).runtime_reason == 'REMOTE_ARTIFACT_READY'
             return super().diagnose_resume(job)
     pipeline = coordinator(tmp_path, jobs, CheckCompletion(events, {a.id: 'READY'}))
     pipeline.scheduler = PersistentPollScheduler(jobs)
     pipeline.run_cycle()
-    assert events.index(('download', a.id)) < events.index(('check', b.id))
-    assert events.index(('delete', a.id)) < events.index(('check', b.id))
+    assert events.index(('check', b.id)) < events.index(('download', a.id))
+    assert events.index(('submit', b.id)) < events.index(('delete', a.id))
 
 
 @pytest.mark.parametrize('state,reason', [(JobState.COMPLETED, 'COMPLETED_SKIP'), (JobState.FAILED, 'FATAL_FAILED')])

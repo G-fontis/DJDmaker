@@ -1,5 +1,12 @@
 # 開発ルール
 
+## Ver1.2.3候補：生成優先と状態表即時更新
+
+- 最新正式指示`DJD-CHAPPY-V123-GENERATION-FIRST-CLOUD-THEN-LOCAL-LIVE-STATUS-REFRESH-FULL-001`を優先する。過去の完成artifact即回収規則はPhase B内に限定する。
+- Phase Aは未生成jobを1件ずつcheck→生成開始/予約→保存→next。全jobの投入完了または理由確定terminal後にPhase Bへ進む。Phase A中のDownload/Ending/HLS/ZIPは禁止。
+- 状態と工程をatomic JSONへ保存成功後、snapshot eventをQt signalでGUI threadへ渡し、job_idで該当rowと集計を即更新する。全表再構築・workerからQt widget直接操作・保存失敗時の成功表示は禁止。
+- sort/checkbox/scroll/選択rowを保持し、stop/close/RAW gate/Ending任意/元3engine機能を維持する。本番JSONは変更せず、test/copyで検証する。全Gate通過前のversion bump/build/commit/pushは禁止。
+
 ## Ver1.2.2候補：逐次再開と可視化
 
 - 最終release指示`DJD-CHAPPY-V122-FINAL-RELEASE-BUILD-COMMIT-PUSH-FULL-001`では、既存live証跡を引き継ぎ、source/portable/移行/監査Gate通過後にVer1.2.2としてcommit・main通常pushする。追加の動画生成やPhase2統合は行わない。旧配布物cleanupが環境ポリシーに拒否された場合は迂回せず、対象・容量・保持理由をrelease記録へ残す。

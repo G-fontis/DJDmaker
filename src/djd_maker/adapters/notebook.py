@@ -13,6 +13,8 @@ from uuid import uuid4
 
 from djd_maker.core.interfaces import require_remote_deletion_gate
 from djd_maker.core.models import DownloadSafetyGate, Job, preset_body_sha256
+from djd_maker.core.cancellation import RunCancelled
+from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.adapters.credit import CreditDetector, CreditSnapshot, CreditState
 from djd_maker.media.validator import VideoValidator
 from djd_maker.core.cancellation import checkpoint
@@ -568,6 +570,8 @@ class NotebookDomAdapter:
         raise DomMismatchError("Notebook名の確定をreadbackできません")
 
     def upload_txt(self, source_path: Path) -> None:
+        from djd_maker.core.runtime_operation import report_operation
+        report_operation('source.upload')
         self.ensure_interactable()
         source = source_path.resolve()
         if not source.is_file() or source.suffix.casefold() != ".txt":
@@ -591,8 +595,10 @@ class NotebookDomAdapter:
             with self.page.expect_file_chooser(timeout=self.timeout_ms) as chooser_info:
                 upload_button.click()
             chooser_info.value.set_files(str(source))
+            report_operation('source.uploaded')
             return
         file_input.set_input_files(str(source))
+        report_operation('source.uploaded')
 
     @staticmethod
     def _normalize_text(value: str) -> str:
@@ -825,6 +831,8 @@ class NotebookDomAdapter:
         timeout_ms: int = 120_000,
     ) -> GenerationOutcome:
         """Use only a verified schedule action and require its remote status."""
+        from djd_maker.core.runtime_operation import report_operation
+        report_operation('reservation.start')
         self.ensure_interactable()
         if credit.state is not CreditState.EXHAUSTED:
             raise ReservationFailedError(
@@ -1009,6 +1017,8 @@ class NotebookDomAdapter:
         self._wait_for_generation_chat_ready()
         reply = ChatFlow(self).send(prompt)
         if reply.kind is ReplyKind.QUOTA_EXHAUSTED:
+            from djd_maker.core.runtime_operation import report_operation
+            report_operation('quota.detected')
             credit = CreditSnapshot(CreditState.EXHAUSTED, reset_at=reply.reset_at)
             return self.request_scheduled_video_generation(prompt, credit)
         return GenerationOutcome(RemoteVideoStatus.GENERATING, False, CreditSnapshot())
@@ -1339,6 +1349,7 @@ class NotebookEngineAdapter:
             self.persist_identity(job)
 
     def submit(self, job: Job) -> NotebookSubmissionResult:
+        from djd_maker.core.runtime_operation import report_operation
         try:
             prompt = job.require_preset_body_snapshot()
         except ValueError as exc:
@@ -1359,15 +1370,23 @@ class NotebookEngineAdapter:
             if status not in {"NOT_STARTED"}:
                 raise NotebookAdapterError("REMOTE_DIAGNOSIS_UNCERTAIN: 既存artifact状態を確定できません")
         else:
+            report_operation('notebook.create')
             metadata = self.dom.create_notebook()
             # Persist before rename/upload, not only before generation.
             job.notebook_id, job.notebook_url = metadata.notebook_id, metadata.notebook_url
             if self.persist_identity is not None:
                 self.persist_identity(job)
             self.dom.rename_notebook(job.script_name)
+            report_operation('notebook.created')
         from djd_maker.core.runtime_operation import report_operation
         report_operation('source.check')
-        self.dom.ensure_source(source)
+        try:
+            self.dom.ensure_source(source)
+        except (RunCancelled, JobStateSaveError):
+            raise
+        except Exception:
+            report_operation('source.error')
+            raise
         job.source_status = "READY"
         report_operation('source.ready', decision='SOURCE_ALREADY_READY', next_action='中央ChatへPreset送信')
         # Persist/adopt the remote identity before the irreversible generation
@@ -1384,6 +1403,7 @@ class NotebookEngineAdapter:
                 CreditSnapshot(),
             )
         self._record_submission(job, metadata, outcome)
+        report_operation('reservation.complete' if outcome.reserved else 'generation.accepted')
         return NotebookSubmissionResult(
             metadata.notebook_id,
             metadata.notebook_url,

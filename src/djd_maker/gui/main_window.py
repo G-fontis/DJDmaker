@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Protocol
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -65,7 +65,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.2"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.3"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -213,7 +213,9 @@ class MainWindow(QMainWindow):
         self.runtime_messages.setReadOnly(True)
         self.runtime_messages.setMaximumBlockCount(300)
         self.runtime_messages.setMaximumHeight(100)
-        runtime_grid.addWidget(self.runtime_messages, 5, 0, 1, 2)
+        self.phase_counts_label = QLabel('生成・回収集計: －')
+        runtime_grid.addWidget(self.phase_counts_label, 5, 0, 1, 2)
+        runtime_grid.addWidget(self.runtime_messages, 6, 0, 1, 2)
         root.addWidget(runtime)
         self._runtime_record = {}
         self._runtime_timer = QTimer(self)
@@ -292,6 +294,7 @@ class MainWindow(QMainWindow):
 
     def _connect_controller(self) -> None:
         self.controller.jobs_changed.connect(self.set_jobs)
+        self.controller.job_changed.connect(self.update_job, Qt.ConnectionType.QueuedConnection)
         self.controller.status_changed.connect(self._apply_runtime_status)
         self.controller.log_received.connect(self._log_dialog.append_record)
         self.controller.log_received.connect(self._append_runtime_message)
@@ -394,13 +397,63 @@ class MainWindow(QMainWindow):
             self.job_table.setItem(row, len(self.JOB_COLUMNS) - 1, checkbox)
         self.job_table.setSortingEnabled(True)
         self.job_table.blockSignals(False)
+        self._refresh_summary()
+
+    @Slot(object)
+    def update_job(self, job: object) -> None:
+        if not isinstance(job, Job) or getattr(self, '_closing', False):
+            return
+        old = next((j for j in self.jobs if j.id == job.id), None)
+        if old and old.presentation_revision > job.presentation_revision:
+            return
+        selected = self._selected_job()
+        selected_id = selected.id if selected else None
+        scroll = self.job_table.verticalScrollBar().value()
+        horizontal = self.job_table.horizontalScrollBar().value()
+        self.jobs = [job if j.id == job.id else j for j in self.jobs]
+        if old is None:
+            self.jobs.append(job)
+        self.job_table.blockSignals(True)
+        sorting = self.job_table.isSortingEnabled()
+        self.job_table.setSortingEnabled(False)
+        row = next((r for r in range(self.job_table.rowCount()) if self.job_table.item(r,0).data(Qt.ItemDataRole.UserRole)==job.id), None)
+        if row is None:
+            row = self.job_table.rowCount()
+            self.job_table.insertRow(row)
+        values = (str(row+1), job.script_name, *job_stage_texts(job), state_display(job), '')
+        for column, value in enumerate(values):
+            item = self.job_table.item(row,column)
+            if item is None:
+                item = NaturalItem(value)
+                item.setData(Qt.ItemDataRole.UserRole,job.id)
+                self.job_table.setItem(row,column,item)
+            else:
+                item.setText(value)
+            if column == len(self.JOB_COLUMNS)-1:
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked if job.id in self._checked_job_ids else Qt.CheckState.Unchecked)
+        self.job_table.setSortingEnabled(sorting)
+        if selected_id:
+            for r in range(self.job_table.rowCount()):
+                if self.job_table.item(r,0).data(Qt.ItemDataRole.UserRole)==selected_id:
+                    self.job_table.selectRow(r)
+                    break
+        self.job_table.verticalScrollBar().setValue(scroll)
+        self.job_table.horizontalScrollBar().setValue(horizontal)
+        self.job_table.blockSignals(False)
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
         summary = summarize_jobs(self.jobs)
         self.total_label.setText(f"全Job: {summary.total}")
         self.active_label.setText(f"処理中: {summary.active}")
         self.notebook_complete_label.setText(f"Notebook完了: {summary.notebook_complete}/{summary.total}")
         self.zip_complete_label.setText(f"ZIP完了: {summary.zip_complete}/{summary.total}")
         self.error_label.setText(f"Error: {summary.errors}")
-        current = next((job for job in self.jobs if job.state in ACTIVE_STATES), None)
+        runtime_id = getattr(self, '_runtime_record', {}).get('job_id')
+        current = next((job for job in self.jobs if job.id == runtime_id), None)
+        if current is None:
+            current = next((job for job in self.jobs if job.state in ACTIVE_STATES), None)
         self.current_job_label.setText(
             f"現在ジョブ: {current.script_name if current else '－'}"
         )
@@ -563,7 +616,16 @@ class MainWindow(QMainWindow):
         if isinstance(status, dict):
             record = status.get('runtime')
             if isinstance(record, dict) and record:
+                if record.get('phase_counts'):
+                    self.phase_counts_label.setText(str(record['phase_counts']))
+                if record.get('stage') in {'stop.requested','stop.wait','stop.complete','pause','resume'}:
+                    for row in range(self.job_table.rowCount()):
+                        if self.job_table.item(row,0).data(Qt.ItemDataRole.UserRole) == record.get('job_id'):
+                            self.job_table.item(row,5).setText('－ ' + operation_text(record['stage']))
                 self._runtime_record = dict(record)
+                if record.get('job_id'):
+                    self.current_job_label.setText(f"現在ジョブ: {record.get('job', '－')}")
+                    self.current_stage_label.setText(f"現在工程: {operation_text(record.get('stage', ''))}")
                 for key, (caption, label) in self.runtime_labels.items():
                     value = record.get(key, '－')
                     if key == 'count':

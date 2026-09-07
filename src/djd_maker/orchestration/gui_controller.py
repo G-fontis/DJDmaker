@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from djd_maker.core.models import Job, JobState
+from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.core.settings import AppSettings
 from djd_maker.core.cancellation import CancellationToken, RunCancelled, cancellation_scope, checkpoint
 from djd_maker.adapters.notebook_modal import BlockingModalError
@@ -72,13 +73,26 @@ class GuiPipelineController:
         self._error_callback: Callable[[str, str], None] = lambda _op, _message: None
         self._last_states: dict[str, JobState] = {}
         self._runtime: dict[str, object] = {}
+        self._job_callback = lambda _job: None
+        self._job_updates_bound = False
+        self._job_snapshots = {job.id:job for job in self.jobs.list()}
+
+    def bind_job(self, callback) -> None:
+        self._job_callback = callback
+        self._job_updates_bound = True
+
+    def _job_update(self, job: Job) -> None:
+        with self._guard:
+            self._job_snapshots[job.id] = job
+        self._job_callback(job)
 
     def _runtime_update(self, record: dict) -> None:
         with self._guard:
             previous = self._runtime
             self._runtime = dict(record)
+            snapshots = list(self._job_snapshots.values())
         if any(previous.get(k) != record.get(k) for k in ('job_id', 'stage', 'decision', 'attempt')):
-            self._status_callback({**self.status(), 'runtime': dict(record)})
+            self._status_callback({**self.status(snapshots), 'runtime': dict(record)})
             self._log_callback({'level': 'INFO', 'stage': record.get('stage', ''),
                                 'message': record.get('message', record.get('stage', '')),
                                 'runtime': dict(record)})
@@ -151,6 +165,7 @@ class GuiPipelineController:
             if self._worker is not None and self._worker.is_alive():
                 self._paused = False
                 self.scheduler.resume()
+                self._runtime_update({**self._runtime, 'stage': 'resume'})
                 return self.status()
             # A completed run owns a pipeline assembled with that run's preset
             # snapshot and browser page. Recompose on every new Start so a GUI
@@ -189,6 +204,7 @@ class GuiPipelineController:
         try:
             pipeline = factory()
             pipeline.runtime_callback = self._runtime_update
+            pipeline.job_callback = self._job_update
             pending_before = [
                 job
                 for job in self.jobs.list()
@@ -225,6 +241,7 @@ class GuiPipelineController:
         with self._guard:
             self._paused = True
             self.scheduler.pause()
+        self._runtime_update({**self._runtime, 'stage': 'pause'})
         self._publish_status()
         return self.status()
 
@@ -318,6 +335,7 @@ class GuiPipelineController:
             if callable(reconcile):
                 reconcile()
             self.pipeline.runtime_callback = self._runtime_update
+            self.pipeline.job_callback = self._job_update
             begin = getattr(self.pipeline, 'begin_run', None)
             if callable(begin):
                 begin()
@@ -329,7 +347,7 @@ class GuiPipelineController:
                 if not paused:
                     try:
                         self.pipeline.run_cycle()
-                    except (BlockingModalError, NoOpJobTransitionError):
+                    except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError):
                         raise
                     except Exception as exc:
                         self._log_callback(
@@ -358,7 +376,9 @@ class GuiPipelineController:
                                 }
                             )
                             self._last_states[job.id] = job.state
-                    self._jobs_callback(values)
+                    # Persisted per-job snapshots are emitted during the cycle.
+                    if not self._job_updates_bound:
+                        self._jobs_callback(values)
                     self._publish_status(values)
                     if values and all(
                         job.state
@@ -371,7 +391,7 @@ class GuiPipelineController:
                     ):
                         break
                 self._stop_event.wait(self.cycle_interval_seconds)
-        except (BlockingModalError, NoOpJobTransitionError) as exc:
+        except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError) as exc:
             self.cancellation.request()
             self._error_callback('modal' if isinstance(exc, BlockingModalError) else 'pipeline', str(exc))
         except RunCancelled:
@@ -396,8 +416,8 @@ class GuiPipelineController:
                 self._phase = "STOPPED" if self._stop_event.is_set() else "idle"
             self._publish_status()
 
-    def status(self) -> dict[str, object]:
-        values = self.jobs.list()
+    def status(self, values: list[Job] | None = None) -> dict[str, object]:
+        values = self.jobs.list() if values is None else values
         with self._guard:
             worker_running = self._worker is not None and self._worker.is_alive()
             recovering = self._recovering
@@ -439,4 +459,7 @@ class GuiPipelineController:
         }
 
     def _publish_status(self, values: list[Job] | None = None) -> None:
-        self._status_callback(self.status())
+        if values is not None:
+            with self._guard:
+                self._job_snapshots = {job.id:job for job in values}
+        self._status_callback(self.status(values))

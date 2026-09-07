@@ -133,6 +133,10 @@ class PipelineCoordinator:
         self.scheduler = scheduler
         self.generation_preset = generation_preset
         self.runtime_callback = lambda _record: None
+        self.job_callback = lambda _job: None
+        self.phase = 'GENERATION_DISPATCH'
+        self._dispatch_only = False
+        self._progress_jobs = {}
         self._resume_attempted: set[str] = set()
         self._no_op_count = 0
         self._idle_announced: dict[str, tuple] = {}
@@ -146,10 +150,34 @@ class PipelineCoordinator:
         self._idle_announced.clear()
 
     def _save(self, job: Job) -> None:
+        job.presentation_revision += 1
         self.jobs.save(job)
+        self._progress_jobs[job.id] = Job.from_dict(job.to_dict())
+        self.job_callback(Job.from_dict(job.to_dict()))
+
+    def _counts(self) -> str:
+        jobs = list(self._progress_jobs.values())
+        if self._dispatch_only:
+            generated = sum(j.state in {JobState.GENERATING,JobState.WAITING_VIDEO,JobState.DOWNLOAD_PENDING,JobState.DOWNLOADING,JobState.COMPLETED} or bool(j.raw_path) for j in jobs)
+            return f'生成開始済: {generated}/{len(jobs)} / 予約済: {sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)} / 残り: {sum(self._needs_dispatch(j) for j in jobs)}'
+        return f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}'
+
+    def _stage_event(self, job: Job, stage: str) -> None:
+        if stage in {'state.saved', 'job.start', 'job.result', 'job.next'} or job.state is JobState.COMPLETED:
+            return
+        if job.presentation_stage != stage or job.presentation_phase != self.phase:
+            if stage == 'zip.start' and job.state is JobState.HLS_ENCODING:
+                job.transition_to(JobState.ZIPPING)
+            if stage == 'hls.complete':
+                job.hls_result = 'PASS'
+            job.presentation_stage = stage
+            job.presentation_phase = self.phase
+            self._save(job)
 
     def _transition(self, job: Job, target: JobState) -> None:
         job.transition_to(target)
+        job.presentation_stage = target.value
+        job.presentation_phase = self.phase
         if target in self.STATE_PROGRESS:
             job.progress_percent = self.STATE_PROGRESS[target]
         self._save(job)
@@ -161,6 +189,7 @@ class PipelineCoordinator:
                 job.txt_move_status = archived.txt_move_status
                 job.archived_txt_path = archived.archived_txt_path
                 job.source_sha256 = archived.source_sha256
+                self.job_callback(Job.from_dict(archived.to_dict()))
 
     def reconcile_completed_txt(self) -> int:
         from djd_maker.core.completed_txt import reconcile_completed_txt
@@ -225,11 +254,48 @@ class PipelineCoordinator:
             self._save(job)
         return resumed
 
+    def _needs_dispatch(self, job: Job) -> bool:
+        if job.state in {JobState.WAITING, JobState.UPLOADING}:
+            return True
+        if job.state is JobState.FAILED:
+            from djd_maker.core.job_migration import failure_class
+            return job.id not in self._resume_attempted and failure_class(job) != 'FATAL_FAILED' and job.error_code != 'OUTPUT_NAME_COLLISION'
+        return job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:') and job.id not in self._resume_attempted
+
+    def _phase_event(self, phase: str) -> None:
+        self.phase = phase
+        jobs = self.jobs.list()
+        generated = sum(j.state in {JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} or j.raw_path is not None or j.state is JobState.COMPLETED for j in jobs)
+        reserved = sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)
+        remaining = sum(self._needs_dispatch(j) for j in jobs)
+        summary = (f'生成開始済: {generated}/{len(jobs)} / 予約済: {reserved} / 残り: {remaining}' if phase == 'GENERATION_DISPATCH'
+                   else f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}')
+        self.runtime_callback(dict(phase='動画生成開始フェーズ' if phase == 'GENERATION_DISPATCH' else '動画回収・変換フェーズ',
+                                   stage='phase.a' if phase == 'GENERATION_DISPATCH' else 'phase.b', phase_counts=summary,
+                                   next_action=summary, decision='全jobの動画生成開始/予約が完了しました' if phase == 'COLLECT_LOCAL' else '未生成jobを先に処理'))
+
     def run_cycle(self) -> None:
+        self._reject_output_name_collisions()
+        self._progress_jobs = {j.id:j for j in self.jobs.list()}
+        if any(self._needs_dispatch(j) for j in self.jobs.list()):
+            self._phase_event('GENERATION_DISPATCH')
+            self._dispatch_only = True
+            try:
+                self._run_cycle_lane()
+            finally:
+                self._dispatch_only = False
+            checkpoint('phase.dispatch.complete')
+            if any(self._needs_dispatch(j) for j in self.jobs.list()):
+                return
+        if self.phase != 'COLLECT_LOCAL':
+            self._phase_event('COLLECT_LOCAL')
+        self._run_cycle_lane()
+
+    def _run_cycle_lane(self) -> None:
         self._reject_output_name_collisions()
         # Preserve the existing bounded FFmpeg lane for RAW already on disk.
         # This is local-only: no Notebook is inspected/opened by these workers.
-        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
+        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and not self._dispatch_only]
         if local_media:
             self._media_completed = 0
             with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency, thread_name_prefix='djd-ffmpeg') as pool:
@@ -241,6 +307,8 @@ class PipelineCoordinator:
                 for future in futures:
                     future.result()
         values = self.jobs.list()
+        if self._dispatch_only:
+            values = [job for job in values if self._needs_dispatch(job)]
         # Local ordering only. No remote pre-scan and no second execution queue.
         values.sort(key=lambda j: 0 if j.state in self.MEDIA_STATES or j.state is JobState.DOWNLOAD_PENDING else 1)
         for index, job in enumerate(values, 1):
@@ -255,11 +323,13 @@ class PipelineCoordinator:
                 self._idle_announced.pop(job.id, None)
             started = time.monotonic()
             record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
-                          phase='逐次処理', decision='－', next_action='状態確認', outcome='－',
+                          phase='動画生成開始フェーズ' if self._dispatch_only else '動画回収・変換フェーズ', decision='－', next_action='状態確認', outcome='－',
                           attempt='－', processed=index-1, total=len(values), started=started)
             def update(stage, fields):
+                self._stage_event(job, stage)
                 record.update(fields)
-                record.update(stage=stage, elapsed=time.monotonic()-started)
+                record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
+                record['phase_counts'] = self._counts()
                 self.runtime_callback(dict(record))
             with operation_scope(update):
                 report_operation('job.start')
@@ -287,8 +357,10 @@ class PipelineCoordinator:
         record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
                       phase='保存済みRAWの変換', processed=self._media_completed, total=total, started=started)
         def update(stage, fields):
+            self._stage_event(job, stage)
             record.update(fields)
-            record.update(stage=stage, elapsed=time.monotonic()-started)
+            record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
+            record['phase_counts'] = self._counts()
             self.runtime_callback(dict(record))
         with operation_scope(update):
             try:
@@ -336,6 +408,8 @@ class PipelineCoordinator:
             self._no_op_count = 0
             return
         previous = (job.runtime_outcome, job.runtime_reason)
+        previous_stage = job.presentation_stage
+        job.presentation_stage = job.state.value
         if no_op:
             job.error_code = 'NO_OP_JOB_TRANSITION'
             job.error_message = reason
@@ -344,7 +418,7 @@ class PipelineCoordinator:
         job.runtime_outcome = 'FAILED_WITH_REASON' if job.state is JobState.FAILED else job.state.value
         job.runtime_reason = reason
         # Completed records must remain immutable (TXT reconciliation is local).
-        if previous != (job.runtime_outcome, job.runtime_reason):
+        if previous != (job.runtime_outcome, job.runtime_reason) or previous_stage != job.presentation_stage:
             self._save(job)
         report_operation('job.result', decision=reason, outcome=job.runtime_outcome,
                          notebook=job.notebook_url or '－')
@@ -366,7 +440,7 @@ class PipelineCoordinator:
                 self._finish_job(job, 'RETRY_REQUIRES_START')
                 return
             self._resume_attempted.add(job.id)
-            report_operation('resume.check', phase='再開処理')
+            report_operation('resume.check')
             self.resume_failed_jobs({job.id})
             resumed = self.jobs.get(job.id)
             assert resumed is not None
@@ -382,6 +456,13 @@ class PipelineCoordinator:
                     self.scheduler.schedule_generation(job, force=True)
                 self._finish_job(job, 'GENERATION_ALREADY_STARTED')
                 return
+
+        if self._dispatch_only and job.state not in {JobState.WAITING, JobState.UPLOADING}:
+            if job.state is JobState.DOWNLOAD_PENDING:
+                job.artifact_status = 'READY'
+                self._save(job)
+            self._finish_job(job, 'REMOTE_ARTIFACT_READY' if job.state is JobState.DOWNLOAD_PENDING else job.state.value)
+            return
 
         if job.state is JobState.WAITING_VIDEO and self.scheduler is not None:
             self.scheduler.ensure_scheduled(job)
@@ -407,15 +488,16 @@ class PipelineCoordinator:
             before = job.to_dict()
             self._resume_attempted.add(job.id)
             self._run_notebook_job(job)
-            if job.to_dict() == before and job.state is not JobState.WAITING_VIDEO:
+            if all(job.to_dict()[key] == value for key,value in before.items() if not key.startswith('presentation_')) and job.state is not JobState.WAITING_VIDEO:
                 self._finish_job(job, 'NO_OP_JOB_TRANSITION', no_op=True)
                 return
-        if job.state in self.MEDIA_STATES:
+        if job.state in self.MEDIA_STATES and not self._dispatch_only:
             self._run_media_job(job)
         self._finish_job(job, job.error_code or ('GENERATION_ALREADY_STARTED' if job.state is JobState.WAITING_VIDEO else job.state.value))
 
     def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
         """Advance only persisted remote/recovery jobs; never submit new work."""
+        self.phase = 'COLLECT_LOCAL'
         current = (now or datetime.now(UTC)).astimezone(UTC)
         processed: list[str] = []
         values = self.jobs.list()
@@ -435,8 +517,9 @@ class PipelineCoordinator:
             record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
                           phase='回収処理', processed=index-1, total=len(values), started=started)
             def update(stage, fields):
+                self._stage_event(job, stage)
                 record.update(fields)
-                record.update(stage=stage, elapsed=time.monotonic()-started)
+                record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
                 self.runtime_callback(dict(record))
             with operation_scope(update):
                 report_operation('job.start')
@@ -551,15 +634,26 @@ class PipelineCoordinator:
                     )
                     job.expected_generation_after = job.credit_reset_at
                     job.artifact_status = "SCHEDULED_REMOTE"
+                    # Newly reserved jobs must not be re-polled immediately
+                    # when Phase B begins, even if Google omits reset time.
+                    now = datetime.now(UTC)
+                    reset = self._parse_utc(job.credit_reset_at)
+                    job.next_poll_at = max(now + timedelta(seconds=getattr(self.scheduler, 'subsequent_poll_seconds', 120)), reset or now).isoformat()
                     self._transition(job, JobState.CREDIT_EXHAUSTED)
                     self._transition(job, JobState.RESERVED_WAITING_CREDIT_RESET)
                     return
                 self._transition(job, JobState.GENERATING)
                 if getattr(submission, 'remote_status', None) == 'READY':
-                    self._transition(job, JobState.DOWNLOADING)
+                    job.artifact_status = 'READY'
+                    self._transition(job, JobState.DOWNLOAD_PENDING)
+                    report_operation('artifact.ready', decision='READY', next_action='Phase BでDownload開始')
                 if self.scheduler is not None:
                     if job.state is JobState.GENERATING:
                         self.scheduler.schedule_generation(job)
+                        self._save(job)
+
+            if self._dispatch_only and job.state not in {JobState.UPLOADING, JobState.GENERATING}:
+                return
 
             if job.state is JobState.UPLOADING:
                 # A crash without persisted remote identity cannot safely retry:
@@ -575,6 +669,8 @@ class PipelineCoordinator:
                 self._transition(job, JobState.WAITING_VIDEO)
                 if self.scheduler is not None:
                     self.scheduler.ensure_scheduled(job)
+                    return
+                if self._dispatch_only:
                     return
 
             if job.state is JobState.WAITING_VIDEO:
@@ -605,6 +701,8 @@ class PipelineCoordinator:
                 if not download.exists():
                     self.notebook.download_artifact(job, download)
                 job.download_status = "DOWNLOADED"
+                report_operation('download.complete')
+                report_operation('raw.validate')
                 raw_path = self.paths.raw_directory / f"{job.script_name}.mp4"
                 if raw_path.exists():
                     stored = self.raw_store.verify_existing(download, raw_path)
@@ -628,6 +726,7 @@ class PipelineCoordinator:
                 try:
                     require_remote_deletion_gate(gate)
                     self.notebook.delete_video_artifact(job, gate)
+                    report_operation('artifact.deleted')
                 except BlockingModalError:
                     raise
                 except Exception as exc:
@@ -709,12 +808,11 @@ class PipelineCoordinator:
                 else:
                     job.edited_path = str(edited)
                     job.ending_result = "PASS (checkpoint)"
+                report_operation('ending.complete')
                 self._transition(job, JobState.HLS_ENCODING)
 
             if job.state in {JobState.HLS_ENCODING, JobState.ZIPPING}:
                 resuming_zip_publish = job.state is JobState.ZIPPING
-                if job.state is JobState.HLS_ENCODING:
-                    self._transition(job, JobState.ZIPPING)
                 if output_zip.exists():
                     if not resuming_zip_publish:
                         raise FileExistsError(
@@ -729,6 +827,8 @@ class PipelineCoordinator:
                     )
                     job.zip_path = str(result.zip_path)
                 job.hls_result = "PASS"
+                if job.state is JobState.HLS_ENCODING:
+                    self._transition(job, JobState.ZIPPING)
                 self._transition(job, JobState.COMPLETED)
         except RunCancelled:
             job.resume_checkpoint = 'STOPPED:' + job.state.value
