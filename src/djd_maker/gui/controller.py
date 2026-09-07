@@ -143,6 +143,9 @@ class AsyncControllerBridge(QObject):
     def refresh_credit(self) -> bool:
         return self._invoke("credit", self.controller.refresh_credit)
 
+    def delete_completed(self, job_ids: list[str]) -> bool:
+        return self._invoke("delete_completed", lambda: self.controller.delete_completed(job_ids))
+
     def retry(self, job_id: str, stage: str) -> bool:
         return self._invoke(f"retry:{stage}", lambda: self.controller.retry(job_id, stage))
 

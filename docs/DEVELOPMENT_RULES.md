@@ -39,6 +39,12 @@
 
 ## Credit reservation / recovery
 
+- 最終Gate補正`DJD-CHAPPY-V12-FINAL-RELEASE-GATE-CONTINUE-FULL-001`ではsource upload errorのlive復旧だけを`UNVERIFIED_LIVE`として許容する。原因不明の完了を修正成功とせず、fixture安全性確認と自然再発時の追加Acceptanceを維持する。現在のrelease記録は`docs/v12-final-release-gate.md`を参照する。
+- Ver1.2候補（指示002）では、human Start時に過去のquota返信だけで予約へ送らない。既存artifactを先に診断し、生成未開始なら中央Chatへ今回のpreset snapshotを送信し、そのuser message以降の返信だけを分類する。現行候補のrelease判定は`docs/v12-quota-resume-migration.md`に記録する。
+- 中央Chatのcontainer配下で入力先を確定する。source検索欄を除外し、全文readback、送信button有効化、今回user message、今回replyを順に確認する。最大3attempt、返信待機は元GNBの180秒を基準とし、再送直前に遅延返信を確認する。
+- FAILEDを一律に新規job/Notebookへ置換しない。既存remote・RAW等を診断し、同じjob IDとpreset snapshotを保持して再開する。COMPLETEDは再生成しない。
+- 完成TXTの移動失敗はCOMPLETEDを変更しない。同名異内容は上書きせず補助状態を記録する。完成job一覧削除では成果物とremoteを保持し、削除記録をJSONへ残して再読込による復活を防ぐ。
+
 - NotebookLMのクレジット枯渇はsource本文ではなく、visibleなstatus/alert/live surfaceの明示表示だけで判定する。残量percentageが取得できなくても枯渇表示を優先する。
 - 枯渇時に即時生成を反復しない。同一jobで即時生成と予約生成を二重実行しない。
 - 予約成功は完全一致した予約actionの実行後、remoteの予約待機状態を確認して確定する。

@@ -116,13 +116,13 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.1"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
     assert window.CREDIT == "Created by 福ゼミ塾長"
-    assert window.job_table.columnCount() == 6
-    assert [window.job_table.horizontalHeaderItem(i).text() for i in range(6)] == list(window.JOB_COLUMNS)
+    assert window.job_table.columnCount() == 7
+    assert [window.job_table.horizontalHeaderItem(i).text() for i in range(7)] == list(window.JOB_COLUMNS)
     assert window.job_table.item(0, 1).text() == "日本語の台本"
     assert window.total_label.text() == "全Job: 1"
     assert window.zip_complete_label.text() == "ZIP完了: 1/1"

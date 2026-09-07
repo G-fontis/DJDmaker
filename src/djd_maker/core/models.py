@@ -156,6 +156,13 @@ class Job:
     progress_percent: float = 0.0
     error_code: str | None = None
     error_message: str | None = None
+    resume_schema_version: int = 1
+    failure_class: str | None = None
+    source_status: str = "UNKNOWN"
+    resume_checkpoint: str | None = None
+    txt_move_status: str = "PENDING"
+    archived_txt_path: str | None = None
+    source_sha256: str | None = None
     attempt_by_stage: dict[str, int] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)

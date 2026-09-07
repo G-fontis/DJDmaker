@@ -685,8 +685,7 @@ class NotebookDomAdapter:
         deadline = time.monotonic() + timeout_ms / 1000
         stable_since: float | None = None
         while time.monotonic() < deadline:
-            body = self._body_text().casefold()
-            if any(marker in body for marker in SOURCE_ERROR_MARKERS):
+            if self.source_state(filename) == "ERROR":
                 self.diagnostic("SOURCE_PROCESSING_FAILED")
                 raise SourceProcessingError("Notebookのソース処理に失敗しました")
             ready = (
@@ -706,6 +705,65 @@ class NotebookDomAdapter:
             self.page.wait_for_timeout(500)
         self.diagnostic("SOURCE_READY_TIMEOUT:300s")
         raise SourceReadyTimeoutError("TXT sourceの解析が5分以内に完了しませんでした")
+
+    def source_state(self, filename: str) -> str:
+        panels = self.page.locator("source-panel, sources-panel, .source-panel, [data-testid='source-panel']")
+        errors = (*SOURCE_ERROR_MARKERS, "ソースのアップロード中にエラー", "アップロード中にエラー")
+        for index in range(panels.count()):
+            panel = panels.nth(index)
+            if not panel.is_visible():
+                continue
+            source_cards = panel.locator(".single-source-container")
+            if source_cards.count():
+                matches = source_cards.filter(has=self.page.get_by_role("button", name=Path(filename).name, exact=True))
+                if matches.count() > 1:
+                    raise SourceProcessingError("SOURCE_IDENTITY_AMBIGUOUS: 同名sourceが複数存在します")
+                if not matches.count():
+                    continue
+                panel = matches.first
+            # Include accessible tooltips, not just the rendered caption.
+            text = panel.inner_text().replace(Path(filename).name, "").casefold()
+            if any(marker in text for marker in errors):
+                return "ERROR"
+            titles = panel.locator("[title], [aria-label], [aria-describedby]")
+            for i in range(titles.count()):
+                node = titles.nth(i)
+                tooltip = (node.get_attribute("title") or "") + (node.get_attribute("aria-label") or "")
+                if node.get_attribute("aria-describedby"):
+                    tooltip += node.evaluate("e => (e.getAttribute('aria-describedby') || '').split(/\\s+/).map(id => e.ownerDocument.getElementById(id)?.textContent || '').join(' ')")
+                tooltip = tooltip.replace(Path(filename).name, "")
+                if any(marker in tooltip.casefold() for marker in errors):
+                    return "ERROR"
+        if not self._source_registered(filename):
+            return "MISSING"
+        if not self._source_processing() and self._chat_source_count_positive() and self._studio_video_card_active():
+            return "READY"
+        return "PROCESSING"
+
+    def ensure_source(self, source: Path) -> None:
+        for attempt in range(1, 4):
+            state = self.source_state(source.name)
+            self.diagnostic(f"SOURCE_ATTEMPT:{attempt}:state={state}")
+            if state == "READY":
+                self.wait_for_source_ready(source.name)
+                return
+            if state == "MISSING":
+                self.upload_txt(source)
+            elif state == "ERROR":
+                panels = self.page.locator("source-panel, sources-panel, .source-panel, [data-testid='source-panel']")
+                cards = panels.locator(".single-source-container").filter(has=self.page.get_by_role("button", name=source.name, exact=True))
+                if cards.count() != 1:
+                    raise SourceProcessingError("SOURCE_UPLOAD_FAILED: 再試行対象sourceを一意に確認できません")
+                retry = cards.get_by_role("button", name=re.compile(r"^(再試行|もう一度試す|Retry|Try again)$"))
+                if retry.count() != 1 or not retry.first.is_visible() or not retry.first.is_enabled():
+                    raise SourceProcessingError("SOURCE_UPLOAD_FAILED: source再試行UIを確認できません。Notebook/sourceは保持")
+                retry.first.click()
+            try:
+                self.wait_for_source_ready(source.name)
+                return
+            except (SourceProcessingError, SourceReadyTimeoutError):
+                if attempt == 3:
+                    raise
 
     def start_video_generation(self, prompt: str) -> GenerationOutcome | None:
         """Legacy diagnostic path; production submission uses chat instead."""
@@ -925,37 +983,15 @@ class NotebookDomAdapter:
             raise NotebookAdapterError(
                 "チャット送信前に動画artifactが存在するため重複生成を停止しました"
             )
-        credit = self.inspect_credit()
-        if credit.state is CreditState.EXHAUSTED:
+        from .chat_flow import ChatFlow
+        from .replies import ReplyKind
+
+        self._wait_for_generation_chat_ready()
+        reply = ChatFlow(self).send(prompt)
+        if reply.kind is ReplyKind.QUOTA_EXHAUSTED:
+            credit = CreditSnapshot(CreditState.EXHAUSTED, reset_at=reply.reset_at)
             return self.request_scheduled_video_generation(prompt, credit)
-        textbox = self._wait_for_generation_chat_ready()
-        self.diagnostic(
-            "PRESET_CHAT_EXPECTED:"
-            f"sha256={preset_body_sha256(prompt)},length={len(prompt)}"
-        )
-        textbox.fill(prompt)
-        readback = self._input_text(textbox)
-        self.diagnostic(
-            "PRESET_CHAT_READBACK:"
-            f"sha256={preset_body_sha256(readback)},length={len(readback)}"
-        )
-        if readback != prompt:
-            raise PresetApplyMismatchError(
-                "PRESET_APPLY_MISMATCH: preset snapshot and main chat readback differ"
-            )
-        send = self._first_enabled_visible(CHAT_SEND, "Notebookメインチャット送信ボタン")
-        send.click()
-        self._wait_for_chat_message_sent(prompt, textbox)
-        self._generation_prompt_for_fallback = prompt
-        try:
-            outcome = self._wait_for_notebook_auto_generation()
-        finally:
-            self._generation_prompt_for_fallback = None
-        if isinstance(outcome, GenerationOutcome):
-            return outcome
-        # Compatibility with diagnostic/test doubles written before outcomes
-        # were structured. Production always returns the branch above.
-        return GenerationOutcome(RemoteVideoStatus.UNKNOWN, False, credit)
+        return GenerationOutcome(RemoteVideoStatus.GENERATING, False, CreditSnapshot())
 
     def inspect_status(self) -> RemoteVideoStatus:
         cards = self.page.locator("artifact-library-item")
@@ -986,6 +1022,8 @@ class NotebookDomAdapter:
             return RemoteVideoStatus.WAITING
         if any(item.casefold() in text for item in self.ACTIVE_MARKERS):
             return RemoteVideoStatus.GENERATING
+        if count == 0 and any(marker in text for marker in ("スタジオの出力はここに保存されます", "studio output will be saved here")):
+            return RemoteVideoStatus.NOT_STARTED
         return RemoteVideoStatus.NOT_STARTED if not text else RemoteVideoStatus.UNKNOWN
 
     def download_artifact(self, artifact_title: str, destination: Path) -> Path:
@@ -1285,21 +1323,29 @@ class NotebookEngineAdapter:
         except ValueError as exc:
             raise NotebookAdapterError(str(exc)) from exc
         source = Path(job.source_path)
-        metadata = self.dom.create_notebook()
-        self.dom.rename_notebook(job.script_name)
-        self.dom.upload_txt(source)
-        try:
-            self.dom.wait_for_source_ready(source.name)
-        except SourceReadyTimeoutError:
-            self.dom.rename_notebook(f"FAILED_{job.script_name}")
+        from hashlib import sha256
+        source_hash = sha256(source.read_bytes()).hexdigest()
+        if job.source_sha256 and job.source_sha256 != source_hash:
+            raise NotebookAdapterError("SOURCE_IDENTITY_CHANGED: 開始時のTXTと内容が異なります")
+        job.source_sha256 = source_hash
+        if job.notebook_id and job.notebook_url:
+            self._open_job(job)
+            metadata = ResumeMetadata(job.notebook_id, job.notebook_url, job.script_name)
+            status = self.inspect_status(job)
+            if status in {"READY", "GENERATING", "WAITING"}:
+                outcome = GenerationOutcome(RemoteVideoStatus(status), status == "WAITING", CreditSnapshot())
+                return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
+            if status not in {"NOT_STARTED"}:
+                raise NotebookAdapterError("REMOTE_DIAGNOSIS_UNCERTAIN: 既存artifact状態を確定できません")
+        else:
             metadata = self.dom.create_notebook()
+            # Persist before rename/upload, not only before generation.
+            job.notebook_id, job.notebook_url = metadata.notebook_id, metadata.notebook_url
+            if self.persist_identity is not None:
+                self.persist_identity(job)
             self.dom.rename_notebook(job.script_name)
-            self.dom.upload_txt(source)
-            try:
-                self.dom.wait_for_source_ready(source.name)
-            except SourceReadyTimeoutError:
-                self.dom.rename_notebook(f"FAILED_{job.script_name}")
-                raise
+        self.dom.ensure_source(source)
+        job.source_status = "READY"
         # Persist/adopt the remote identity before the irreversible generation
         # action when the caller supplied a repository callback.
         job.notebook_id = metadata.notebook_id
@@ -1326,6 +1372,8 @@ class NotebookEngineAdapter:
         parsed = urlparse(job.notebook_url)
         if parsed.scheme != "https" or parsed.hostname != "notebook.google.com":
             raise NotebookAdapterError("jobのNotebook URLが不正です")
+        if job.notebook_id and parsed.path.rstrip("/").split("/")[-1] != job.notebook_id:
+            raise NotebookAdapterError("NOTEBOOK_IDENTITY_MISMATCH: Notebook IDとURLが一致しません")
         # Notebook downloads can close their initiating tab. GNBCreator keeps
         # a second tab alive; adopt it before cleanup and navigate back to the
         # same persisted Notebook identity.
@@ -1374,6 +1422,27 @@ class NotebookEngineAdapter:
                 return status.value
             self.dom.page.wait_for_timeout(2_000)
         return status.value
+
+    def diagnose_resume(self, job: Job) -> dict[str, str]:
+        """Read existing Notebook stages; historical quota is never a new limit."""
+        from .chat_flow import ChatFlow
+        from .replies import classify_reply
+        status = self.inspect_status(job)
+        if status in {"READY", "GENERATING", "WAITING"}:
+            return {"artifact": status}
+        source_state = self.dom.source_state(Path(job.source_path).name)
+        reply_kind = "NO_RESPONSE"
+        sent = False
+        if job.preset_body_snapshot:
+            turns = ChatFlow(self.dom).turns()
+            for i in range(len(turns) - 1, -1, -1):
+                if turns[i]["role"] == "user":
+                    if turns[i]["text"] == job.preset_body_snapshot:
+                        sent = True
+                        reply = "\n".join(turn["text"] for turn in turns[i + 1:] if turn["role"] == "assistant")
+                        reply_kind = classify_reply(reply, now=self.dom.clock()).kind.value
+                    break
+        return {"artifact": status, "source": source_state, "preset": "SENT" if sent else "NOT_SENT", "reply": reply_kind}
 
     def download_artifact(self, job: Job, destination: Path) -> Path:
         self._open_job(job)

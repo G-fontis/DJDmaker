@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver1.1
+# 台本から授業動画つくるマシーン Ver1.2
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.1.0。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.2.0。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,7 +33,16 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.1`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.2`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+
+## Ver1.2 再開・移行
+
+- 生成前のFAILEDは［授業動画作成開始］で既存Notebookとsourceを診断し、同じjob ID・保存済みpreset本文で再開します。過去のquota返信を現在の不足判定に流用しません。
+- ［未回収動画のチェックから続ける］は生成済み／予約済み／未回収専用で、新規Notebookやpreset送信を行いません。
+- COMPLETEDは再生成しません。完成時・起動時・Start時に残っている対応TXTをRAW保存先へ補完移動します。同名異内容を上書きせず、移動失敗でもCOMPLETEDを維持します。
+- checkboxで完成jobを選択削除、または完成jobを一括削除できます。成果物・Notebook・sourceは削除しません。列見出しで全件を自然順に並べ替えできます。
+- 旧版へ上書きせず、[Ver1.1→Ver1.2移行手順](docs/v12-final-release-gate.md)を確認してください。旧runtimeの自動importは行いません。
+- 既知事項：`SOURCE_UPLOAD_ERROR_LIVE_RECOVERY: UNVERIFIED_LIVE`。upload完了の経緯は不明で、live retry成功とは扱っていません。安全性fixtureを確認済みで、自然再発時に追加検証します。
 
 初回は設定画面でEnding動画を指定し、「動画生成プリセット」からプリセット名と本文を登録してください。プリセット一覧は保存されますが、選択状態は起動をまたいで保持しません。起動ごとに使用するプリセットを選択してください。未選択のまま開始した場合はNotebook作成前にエラー停止し、default・test・前回選択presetの自動投入はありません。選択本文はjob開始時にsnapshotされ、source ready後にメインチャットへ入力します。入力直後のDOM readback完全一致、送信後のuser message安定表示、Notebook側の動画artifact生成開始を確認します。通常pipelineは動画解説カードやGenerateボタンを直接操作しません。
 

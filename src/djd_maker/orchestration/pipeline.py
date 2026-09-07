@@ -62,6 +62,7 @@ class PipelineCoordinator:
             JobState.WAITING_VIDEO,
             JobState.DOWNLOADING,
             JobState.DOWNLOAD_VERIFY_FAILED,
+            JobState.DOWNLOAD_PENDING,
         }
     )
     RECOVERY_STATES = frozenset(
@@ -130,6 +131,58 @@ class PipelineCoordinator:
         if target in self.STATE_PROGRESS:
             job.progress_percent = self.STATE_PROGRESS[target]
         self._save(job)
+        if target is JobState.COMPLETED:
+            self.reconcile_completed_txt()
+
+    def reconcile_completed_txt(self) -> int:
+        from djd_maker.core.completed_txt import reconcile_completed_txt
+        return reconcile_completed_txt(self.jobs, self.paths.raw_directory)
+
+    def resume_failed_jobs(self, job_ids: set[str] | None = None) -> list[str]:
+        """Once per human Start; keep identity and original preset snapshot."""
+        from djd_maker.core.job_migration import failure_class
+        resumed = []
+        for job in self.jobs.list():
+            if job.state is not JobState.FAILED:
+                continue
+            if job_ids is not None and job.id not in job_ids:
+                continue
+            job.failure_class = failure_class(job)
+            target = None
+            try:
+                if job.raw_path and Path(job.raw_path).is_file():
+                    if getattr(self.validator.validate(Path(job.raw_path)), "valid", True):
+                        target = JobState.RAW_READY
+                        if job.edited_path and Path(job.edited_path).is_file() and getattr(self.validator.validate(Path(job.edited_path)), "valid", True):
+                            target = JobState.ZIPPING if job.resume_checkpoint == "ZIPPING" else JobState.HLS_ENCODING
+                elif job.notebook_id and job.notebook_url:
+                    diagnose = getattr(self.notebook, "diagnose_resume", None)
+                    diagnosis = diagnose(job) if callable(diagnose) else {"artifact": self.notebook.inspect_status(job)}
+                    status = diagnosis["artifact"]
+                    job.source_status = diagnosis.get("source", job.source_status)
+                    if job.failure_class != "FATAL_FAILED":
+                        if job.source_status in {"ERROR", "MISSING"}:
+                            job.failure_class = "SOURCE_UPLOAD_FAILED"
+                        elif diagnosis.get("reply") == "QUOTA_EXHAUSTED":
+                            job.failure_class = "QUOTA_RECOVERY_PENDING"
+                        elif diagnosis.get("preset") == "NOT_SENT":
+                            job.failure_class = "PRESET_SEND_FAILED"
+                        elif diagnosis.get("reply") == "NO_RESPONSE":
+                            job.failure_class = "PRESET_RESPONSE_TIMEOUT"
+                    job.artifact_status = status
+                    target = {"READY": JobState.DOWNLOAD_PENDING, "GENERATING": JobState.WAITING_VIDEO, "WAITING": JobState.RESERVED_WAITING_CREDIT_RESET}.get(status)
+                    if status == "NOT_STARTED" and job.failure_class != "FATAL_FAILED":
+                        target = JobState.WAITING_VIDEO if diagnosis.get("reply") == "GENERATION_ACCEPTED" else JobState.WAITING
+            except Exception as exc:
+                job.error_message = f"RESUME_DIAGNOSIS_FAILED: {exc}"
+            if target is not None:
+                job.state = target
+                job.resume_checkpoint = target.value
+                job.error_code = None
+                job.error_message = None
+                resumed.append(job.id)
+            self._save(job)
+        return resumed
 
     def run_cycle(self) -> None:
         self._reject_output_name_collisions()
@@ -238,7 +291,8 @@ class PipelineCoordinator:
             if job.state is JobState.WAITING:
                 if self.generation_preset is None:
                     raise RuntimeError("PRESET_NOT_SELECTED")
-                job.snapshot_preset(self.generation_preset)
+                if job.preset_body_snapshot is None:
+                    job.snapshot_preset(self.generation_preset)
                 self._transition(job, JobState.UPLOADING)
                 submission = self.notebook.submit(job)
                 if hasattr(submission, "notebook_id"):
@@ -336,12 +390,19 @@ class PipelineCoordinator:
             raise
         except Exception as exc:
             job.error_message = str(exc)
+            job.resume_checkpoint = job.state.value
             if job.state is JobState.DOWNLOADING:
                 job.error_code = "DOWNLOAD_VERIFY_FAILED"
                 self._transition(job, JobState.DOWNLOAD_VERIFY_FAILED)
             elif job.state not in {JobState.FAILED, JobState.COMPLETED}:
-                if str(exc).startswith("PRESET_APPLY_MISMATCH"):
-                    job.error_code = "PRESET_APPLY_MISMATCH"
+                failure_code = str(exc).split(":", 1)[0]
+                if failure_code in {
+                    "PRESET_APPLY_MISMATCH", "PRESET_RESPONSE_TIMEOUT",
+                    "WRONG_INPUT_TARGET", "CHAT_HISTORY_CHANGED",
+                    "SOURCE_UPLOAD_FAILED", "SOURCE_IDENTITY_CHANGED",
+                    "SOURCE_IDENTITY_AMBIGUOUS", "GENERATION_STATE_UNCERTAIN",
+                }:
+                    job.error_code = failure_code
                 else:
                     job.error_code = job.error_code or "NOTEBOOK_STAGE_FAILED"
                 self._transition(job, JobState.FAILED)
@@ -405,6 +466,7 @@ class PipelineCoordinator:
             raise
         except Exception as exc:
             job.error_code = "MEDIA_STAGE_FAILED"
+            job.resume_checkpoint = job.state.value
             job.error_message = str(exc)
             if job.state not in {JobState.FAILED, JobState.COMPLETED}:
                 self._transition(job, JobState.FAILED)
@@ -475,24 +537,11 @@ class PipelineCoordinator:
         allowed = {JobState.WAITING, JobState.RAW_READY, JobState.ENDING, JobState.HLS_ENCODING}
         if restart_at not in allowed:
             raise ValueError(f"unsupported retry state: {restart_at}")
-        retried = Job(
-            source_path=previous.source_path,
-            parent_job_id=previous.id,
-            state=restart_at,
-            notebook_id=previous.notebook_id,
-            notebook_url=previous.notebook_url,
-            preset_id=previous.preset_id,
-            preset_name=previous.preset_name,
-            preset_body_snapshot=previous.preset_body_snapshot,
-            preset_body_sha256=previous.preset_body_sha256,
-            generation_prompt=previous.generation_prompt,
-            raw_path=previous.raw_path,
-            edited_path=previous.edited_path,
-            safety_gate=previous.safety_gate,
-            attempt_by_stage={
-                **previous.attempt_by_stage,
-                restart_at.value: previous.attempt_by_stage.get(restart_at.value, 0) + 1,
-            },
-        )
+        self.resume_failed_jobs({previous.id})
+        retried = self.jobs.get(previous.id)
+        assert retried is not None
+        if retried.state is JobState.FAILED:
+            raise ValueError("再開checkpointを確認できません。既存jobと成果物は保持しました")
+        retried.attempt_by_stage[retried.state.value] = retried.attempt_by_stage.get(retried.state.value, 0) + 1
         self._save(retried)
         return retried

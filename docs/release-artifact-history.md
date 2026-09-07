@@ -18,3 +18,12 @@
 | Ver1.1 credit/recovery/storage release | this release | `DJDmaker_Ver1.1.zip` | 271,708,073 | `FF2E97E60A43C1ABF98E74850CA1CC14831C5F2C797B89FA82E56C5A88995ABD` |
 
 PyInstallerと依存packageはbyte-for-byte再現を保証していないため、source commit、build script、spec、FFmpeg license/inputを合わせて保全する。
+
+## Ver1.2（本release commitの成果物）
+
+- main基準: `a8c16b4325e4e1f4c591a15a3c90f8ade06e0a46`＋本release commitの変更。build後の変更はrelease記録のみ。
+- EXE: 3,837,248 bytes / `7F0FFC7E6719F6DB93DC484566AB7F636C75BE5392346F9DB579514235560837`
+- ZIP: 277,615,541 bytes / `D7727920988FC6ECE5255B0140D68FBCB59E3FACC7238FE14E57FF72A06FDB7F`
+- onedir再build: `packaging/build_windows.ps1`へ検証済みFFmpeg/ffprobeとlicenseを渡す。候補の`dist/DJDmaker_Ver1.2/runtime/ffmpeg`と`licenses/FFmpeg-LICENSE.txt`にも同一依存物を保持。
+- 旧main Ver1.1 EXE/ZIPは上表SHAと一致、runtime dataなし。ただし削除コマンドは環境ポリシーにより拒否され、旧成果物は未削除。
+- 旧配布物は再生成可能・非ユーザーデータであることを確認し、今回のみ保持する例外をユーザーが承認。source upload errorのlive復旧は引き続き`UNVERIFIED_LIVE`として記録。

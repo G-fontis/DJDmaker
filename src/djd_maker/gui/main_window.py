@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import re
 from typing import Protocol
 
 from PySide6.QtCore import Qt
@@ -48,11 +49,21 @@ class PresetRepositoryPort(Protocol):
     def selected(self) -> Preset | None: ...
 
 
+class NaturalItem(QTableWidgetItem):
+    def __lt__(self, other):
+        if self.flags() & Qt.ItemFlag.ItemIsUserCheckable and other.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            if self.checkState() != other.checkState():
+                return self.checkState().value < other.checkState().value
+        def key(value):
+            return [(0, int(part)) if part.isdigit() else (1, part.casefold()) for part in re.split(r"(\d+)", value)]
+        return key(self.text()) < key(other.text())
+
+
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.1"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
-    JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態")
+    JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
 
     def __init__(
         self,
@@ -72,6 +83,7 @@ class MainWindow(QMainWindow):
         self.preset_repository = preset_repository
         self.settings = self.settings_repository.load()
         self.jobs: list[Job] = []
+        self._checked_job_ids: set[str] = set()
         self._running = False
         self._log_dialog = LogDialog(self)
         self._preview_player = EndingPreviewPlayer(
@@ -187,6 +199,17 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.job_table, 1)
+        self.job_table.setSortingEnabled(True)
+        header.setSortIndicatorShown(True)
+        self.job_table.itemChanged.connect(self._check_changed)
+        deletes = QHBoxLayout()
+        self.delete_selected_button = QPushButton("選択したものを削除")
+        self.delete_completed_button = QPushButton("完成したジョブを削除")
+        deletes.addWidget(self.delete_selected_button)
+        deletes.addWidget(self.delete_completed_button)
+        root.addLayout(deletes)
+        self.delete_selected_button.clicked.connect(lambda: self._delete_jobs(False))
+        self.delete_completed_button.clicked.connect(lambda: self._delete_jobs(True))
 
         self.completion_group = QGroupBox("授業作成 完了")
         completion_layout = QHBoxLayout(self.completion_group)
@@ -321,14 +344,24 @@ class MainWindow(QMainWindow):
         if not isinstance(jobs, (list, tuple)) or not all(isinstance(job, Job) for job in jobs):
             return
         self.jobs = list(jobs)
+        self._checked_job_ids.intersection_update(job.id for job in self.jobs)
+        self.job_table.blockSignals(True)
+        self.job_table.setSortingEnabled(False)
         self.job_table.setRowCount(len(self.jobs))
         for row, job in enumerate(self.jobs):
             notebook, ending, hls = job_stage_texts(job)
             values = (str(row + 1), job.script_name, notebook, ending, hls, state_display(job))
             for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = NaturalItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, job.id)
                 self.job_table.setItem(row, column, item)
+            checkbox = NaturalItem("")
+            checkbox.setData(Qt.ItemDataRole.UserRole, job.id)
+            checkbox.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            checkbox.setCheckState(Qt.CheckState.Checked if job.id in self._checked_job_ids else Qt.CheckState.Unchecked)
+            self.job_table.setItem(row, len(self.JOB_COLUMNS) - 1, checkbox)
+        self.job_table.setSortingEnabled(True)
+        self.job_table.blockSignals(False)
         summary = summarize_jobs(self.jobs)
         self.total_label.setText(f"全Job: {summary.total}")
         self.active_label.setText(f"処理中: {summary.active}")
@@ -361,7 +394,30 @@ class MainWindow(QMainWindow):
         row = self.job_table.currentRow()
         if row < 0 or row >= len(self.jobs):
             return None
-        return self.jobs[row]
+        item = self.job_table.item(row, 0)
+        if item is None:
+            return None
+        return next((job for job in self.jobs if job.id == item.data(Qt.ItemDataRole.UserRole)), None)
+
+    def _check_changed(self, item) -> None:
+        if item.column() != len(self.JOB_COLUMNS) - 1:
+            return
+        job_id = item.data(Qt.ItemDataRole.UserRole)
+        if item.checkState() is Qt.CheckState.Checked:
+            self._checked_job_ids.add(job_id)
+        else:
+            self._checked_job_ids.discard(job_id)
+
+    def _delete_jobs(self, all_completed: bool) -> None:
+        selected = [job for job in self.jobs if (job.state is JobState.COMPLETED if all_completed else job.id in self._checked_job_ids)]
+        if not selected:
+            return
+        if self._running or any(job.state is not JobState.COMPLETED for job in selected):
+            QMessageBox.warning(self, "削除できません", "処理停止後、完成ジョブだけを選択してください。")
+            return
+        if QMessageBox.question(self, "完成ジョブ削除", f"{len(selected)}件の一覧記録を削除します。RAW・TXT・ZIP・Notebookは保持します。よろしいですか？") != QMessageBox.StandardButton.Yes:
+            return
+        self.controller.delete_completed([job.id for job in selected])
 
     def show_selected_job(self) -> None:
         job = self._selected_job()
@@ -485,7 +541,6 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(not self._running and self._ending_path() is not None)
         self.recover_button.setEnabled(
             not self._running
-            and self._ending_path() is not None
             and any(
                 job.state
                 in {

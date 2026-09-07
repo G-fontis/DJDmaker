@@ -84,6 +84,9 @@ class GuiPipelineController:
         source_root = self._input_directory()
         source_root.mkdir(parents=True, exist_ok=True)
         existing = {str(Path(job.source_path).resolve()) for job in self.jobs.list()}
+        deleted = getattr(self.jobs, "deleted_source_paths", None)
+        if callable(deleted):
+            existing.update(deleted())
         for source in sorted(source_root.glob("*.txt"), key=lambda item: item.name.casefold()):
             resolved = str(source.resolve())
             if resolved not in existing and source.is_file():
@@ -93,6 +96,13 @@ class GuiPipelineController:
         self._jobs_callback(values)
         self._publish_status(values)
         return values
+
+    def delete_completed(self, job_ids: list[str]) -> None:
+        with self._guard:
+            if self._recovering or (self._worker is not None and self._worker.is_alive()):
+                raise RuntimeError("処理停止後にジョブを削除してください")
+            self.jobs.delete_completed(job_ids)
+        self._jobs_callback(self.jobs.list())
 
     def login(self) -> Any:
         if self.status()["running"]:
@@ -246,6 +256,12 @@ class GuiPipelineController:
                 # pre-existing input TXT internally after the side-effect-free
                 # browser gate succeeds, before the first pipeline cycle.
                 self.reload()
+            reconcile = getattr(self.pipeline, "reconcile_completed_txt", None)
+            if callable(reconcile):
+                reconcile()
+            resume = getattr(self.pipeline, "resume_failed_jobs", None)
+            if callable(resume):
+                resume()
             self.scheduler.start()
             self._phase = "processing"
             while not self._stop_event.is_set():
@@ -289,6 +305,7 @@ class GuiPipelineController:
                             JobState.COMPLETED,
                             JobState.FAILED,
                             JobState.RESERVED_WAITING_CREDIT_RESET,
+                            JobState.RECOVERY_PENDING,
                         }
                         for job in values
                     ):

@@ -44,7 +44,11 @@ def build_desktop(
     settings_repository = SettingsRepository(root / "system" / "settings.json")
     preset_repository = PresetRepository(root / "system" / "presets.json")
     job_repository = JobRepository(root / "system" / "jobs")
+    from djd_maker.core.job_migration import migrate_jobs
+    from djd_maker.core.completed_txt import reconcile_completed_txt
+    migrate_jobs(root / "system")
     settings = settings_repository.load()
+    reconcile_completed_txt(job_repository, _resolved(root, settings.raw_directory))
     browser = browser_manager or BrowserManager(
         root / "browser" / "chrome-profile",
         selector_probe=NotebookDomAdapter.preflight_home_page,
