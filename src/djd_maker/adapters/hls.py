@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 from djd_maker.core.cancellation import run_process, checkpoint
+from djd_maker.core.runtime_operation import report_operation
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -256,6 +257,7 @@ class HlsAdapter:
                 str(hls_directory / "segment%05d.ts"),
                 str(hls_directory / "playlist.m3u8"),
             ]
+            report_operation('hls.start', next_action='HLS検証後ZIP作成')
             conversion = _run(command, self.conversion_timeout_seconds)
             if conversion.returncode != 0:
                 raise HlsAdapterError(
@@ -269,6 +271,7 @@ class HlsAdapter:
                     "HLS codecs are invalid: "
                     f"video={output_probe.video_codec!r}, audio={output_probe.audio_codec!r}"
                 )
+            report_operation('zip.start', next_action='ZIP整合性検証・完成保存')
             create_and_validate_zip(playlist, segments, temporary_zip)
             _publish_without_overwrite(temporary_zip, output_zip)
             published = True

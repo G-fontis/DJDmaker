@@ -700,6 +700,7 @@ class NotebookDomAdapter:
         deadline = time.monotonic() + timeout_ms / 1000
         stable_since: float | None = None
         while time.monotonic() < deadline:
+            checkpoint('source.wait')
             self.ensure_interactable()
             if self.source_state(filename) == "ERROR":
                 self.diagnostic("SOURCE_PROCESSING_FAILED")
@@ -1364,8 +1365,11 @@ class NotebookEngineAdapter:
             if self.persist_identity is not None:
                 self.persist_identity(job)
             self.dom.rename_notebook(job.script_name)
+        from djd_maker.core.runtime_operation import report_operation
+        report_operation('source.check')
         self.dom.ensure_source(source)
         job.source_status = "READY"
+        report_operation('source.ready', decision='SOURCE_ALREADY_READY', next_action='中央ChatへPreset送信')
         # Persist/adopt the remote identity before the irreversible generation
         # action when the caller supplied a repository callback.
         job.notebook_id = metadata.notebook_id

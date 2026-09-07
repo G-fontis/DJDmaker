@@ -3,7 +3,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import time
+import threading
 from pathlib import Path
 from typing import Any, Protocol
 from zipfile import BadZipFile, ZipFile
@@ -18,6 +20,11 @@ from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.core.cancellation import RunCancelled, checkpoint
 from djd_maker.adapters.notebook_modal import BlockingModalError
+from djd_maker.core.runtime_operation import operation_scope, report_operation
+
+
+class NoOpJobTransitionError(RuntimeError):
+    pass
 
 
 class JobRepositoryPort(Protocol):
@@ -125,6 +132,18 @@ class PipelineCoordinator:
         self.ffmpeg_concurrency = ffmpeg_concurrency
         self.scheduler = scheduler
         self.generation_preset = generation_preset
+        self.runtime_callback = lambda _record: None
+        self._resume_attempted: set[str] = set()
+        self._no_op_count = 0
+        self._idle_announced: dict[str, tuple] = {}
+        self._media_progress_lock = threading.Lock()
+        self._media_completed = 0
+
+    def begin_run(self) -> None:
+        """Reset local queue bookkeeping only; never opens a Notebook."""
+        self._resume_attempted.clear()
+        self._no_op_count = 0
+        self._idle_announced.clear()
 
     def _save(self, job: Job) -> None:
         self.jobs.save(job)
@@ -134,8 +153,14 @@ class PipelineCoordinator:
         if target in self.STATE_PROGRESS:
             job.progress_percent = self.STATE_PROGRESS[target]
         self._save(job)
+        report_operation('state.saved', decision=target.value, notebook=job.notebook_url or '－')
         if target is JobState.COMPLETED:
             self.reconcile_completed_txt()
+            archived = self.jobs.get(job.id)
+            if archived is not None:
+                job.txt_move_status = archived.txt_move_status
+                job.archived_txt_path = archived.archived_txt_path
+                job.source_sha256 = archived.source_sha256
 
     def reconcile_completed_txt(self) -> int:
         from djd_maker.core.completed_txt import reconcile_completed_txt
@@ -145,14 +170,21 @@ class PipelineCoordinator:
         """Once per human Start; keep identity and original preset snapshot."""
         from djd_maker.core.job_migration import failure_class
         resumed = []
-        for job in self.jobs.list():
+        candidates = self.jobs.list() if job_ids is None else [self.jobs.get(job_id) for job_id in sorted(job_ids)]
+        for job in candidates:
+            if job is None:
+                continue
             checkpoint('resume.dequeue', job.id)
             interrupted = job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:')
             if job.state is not JobState.FAILED and not interrupted:
                 continue
             if job_ids is not None and job.id not in job_ids:
                 continue
+            if job.failure_class == 'FATAL_FAILED':
+                continue
             job.failure_class = failure_class(job)
+            if job.failure_class == 'FATAL_FAILED':
+                continue
             target = None
             try:
                 if job.raw_path and Path(job.raw_path).is_file():
@@ -180,6 +212,8 @@ class PipelineCoordinator:
                         target = JobState.WAITING_VIDEO if diagnosis.get("reply") == "GENERATION_ACCEPTED" else JobState.WAITING
             except BlockingModalError:
                 raise
+            except JobStateSaveError:
+                raise
             except Exception as exc:
                 job.error_message = f"RESUME_DIAGNOSIS_FAILED: {exc}"
             if target is not None:
@@ -193,43 +227,224 @@ class PipelineCoordinator:
 
     def run_cycle(self) -> None:
         self._reject_output_name_collisions()
-        # Browser automation remains serialized. Waiting in this lane never
-        # prevents already downloaded jobs from entering the media pool below.
-        for job in self.jobs.list():
+        # Preserve the existing bounded FFmpeg lane for RAW already on disk.
+        # This is local-only: no Notebook is inspected/opened by these workers.
+        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
+        if local_media:
+            self._media_completed = 0
+            with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency, thread_name_prefix='djd-ffmpeg') as pool:
+                futures = []
+                for index, job in enumerate(local_media, 1):
+                    checkpoint('media.dequeue', job.id)
+                    self._resume_attempted.add(job.id)
+                    futures.append(pool.submit(copy_context().run, self._local_media_with_progress, job, index, len(local_media)))
+                for future in futures:
+                    future.result()
+        values = self.jobs.list()
+        # Local ordering only. No remote pre-scan and no second execution queue.
+        values.sort(key=lambda j: 0 if j.state in self.MEDIA_STATES or j.state is JobState.DOWNLOAD_PENDING else 1)
+        for index, job in enumerate(values, 1):
             checkpoint('queue.dequeue', job.id)
-            if job.state in self.NOTEBOOK_STATES and not (
-                self.scheduler is not None and job.state is JobState.WAITING_VIDEO
-            ):
-                self._run_notebook_job(job)
+            idle = self._idle_reason(job)
+            signature = (idle, job.state, job.next_poll_at, job.credit_reset_at, job.error_code)
+            if idle and self._idle_announced.get(job.id) == signature:
+                continue
+            if idle:
+                self._idle_announced[job.id] = signature
+            else:
+                self._idle_announced.pop(job.id, None)
+            started = time.monotonic()
+            record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
+                          phase='逐次処理', decision='－', next_action='状態確認', outcome='－',
+                          attempt='－', processed=index-1, total=len(values), started=started)
+            def update(stage, fields):
+                record.update(fields)
+                record.update(stage=stage, elapsed=time.monotonic()-started)
+                self.runtime_callback(dict(record))
+            with operation_scope(update):
+                report_operation('job.start')
+                try:
+                    if idle:
+                        self._finish_job(job, idle)
+                    else:
+                        self._check_act_job(job)
+                except RunCancelled:
+                    job.runtime_outcome = 'STOPPED'
+                    job.runtime_reason = 'STOP_REQUESTED'
+                    self._save(job)
+                    report_operation('stop.complete', outcome='STOPPED')
+                    raise
+                except BlockingModalError:
+                    job.runtime_outcome = 'STOPPED'
+                    job.runtime_reason = 'BLOCKING_MODAL'
+                    self._save(job)
+                    report_operation('modal.blocked', outcome='STOPPED')
+                    raise
+                report_operation('job.next', processed=index, next_action='次のジョブ')
 
-        if self.scheduler is not None:
-            self.scheduler.poll_due(self._run_notebook_job)
+    def _local_media_with_progress(self, job: Job, index: int, total: int) -> None:
+        started = time.monotonic()
+        record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
+                      phase='保存済みRAWの変換', processed=self._media_completed, total=total, started=started)
+        def update(stage, fields):
+            record.update(fields)
+            record.update(stage=stage, elapsed=time.monotonic()-started)
+            self.runtime_callback(dict(record))
+        with operation_scope(update):
+            try:
+                self._run_media_job(job)
+            except RunCancelled:
+                job.runtime_outcome = 'STOPPED'
+                job.runtime_reason = 'STOP_REQUESTED'
+                self._save(job)
+                report_operation('stop.complete', outcome='STOPPED')
+                raise
+            job.runtime_outcome = job.state.value
+            job.runtime_reason = job.error_code or job.state.value
+            self._save(job)
+            # Media state is already durably saved; queue bookkeeping stays on
+            # the Notebook owner thread and is not shared across FFmpeg workers.
+            with self._media_progress_lock:
+                self._media_completed += 1
+                report_operation('job.result', outcome=job.state.value, processed=self._media_completed)
 
-        media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
-        with ThreadPoolExecutor(
-            max_workers=self.ffmpeg_concurrency, thread_name_prefix="djd-ffmpeg"
-        ) as pool:
-            futures = []
-            for job in media_jobs:
-                checkpoint('media.dequeue')
-                futures.append(pool.submit(copy_context().run, self._run_media_job, job))
-            for future in futures:
-                future.result()
+    def _idle_reason(self, job: Job) -> str | None:
+        if job.state is JobState.COMPLETED:
+            return 'COMPLETED_SKIP'
+        if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
+            return 'DOWNLOAD_RETRY_REQUIRED'
+        if job.state is JobState.FAILED:
+            from djd_maker.core.job_migration import failure_class
+            if job.failure_class == 'FATAL_FAILED' or failure_class(job) == 'FATAL_FAILED' or job.error_code == 'OUTPUT_NAME_COLLISION':
+                return 'FATAL_FAILED'
+            if job.id in self._resume_attempted:
+                return 'RETRY_REQUIRES_START'
+        if job.state is JobState.WAITING_VIDEO and self.scheduler is not None:
+            self.scheduler.ensure_scheduled(job)
+            if not self.scheduler.is_due(job):
+                return 'WAITING_FOR_NEXT_CHECK'
+        if job.state in {JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING} and not (job.resume_checkpoint or '').startswith('STOPPED:'):
+            now = datetime.now(UTC)
+            deadlines = [self._parse_utc(v) for v in (job.next_poll_at, job.credit_reset_at)]
+            if any(deadline and now < deadline for deadline in deadlines):
+                return 'RESERVED_WAITING_RESET'
+        return None
+
+    def _finish_job(self, job: Job, reason: str, *, no_op: bool = False) -> None:
+        if reason == 'COMPLETED_SKIP':
+            report_operation('job.result', decision=reason, outcome='COMPLETED')
+            self._no_op_count = 0
+            return
+        previous = (job.runtime_outcome, job.runtime_reason)
+        if no_op:
+            job.error_code = 'NO_OP_JOB_TRANSITION'
+            job.error_message = reason
+            if job.state is not JobState.FAILED:
+                self._transition(job, JobState.FAILED)
+        job.runtime_outcome = 'FAILED_WITH_REASON' if job.state is JobState.FAILED else job.state.value
+        job.runtime_reason = reason
+        # Completed records must remain immutable (TXT reconciliation is local).
+        if previous != (job.runtime_outcome, job.runtime_reason):
+            self._save(job)
+        report_operation('job.result', decision=reason, outcome=job.runtime_outcome,
+                         notebook=job.notebook_url or '－')
+        self._no_op_count = self._no_op_count + 1 if no_op else 0
+        if self._no_op_count >= 3:
+            raise NoOpJobTransitionError('NO_OP_JOB_TRANSITION: Notebookを開きましたが処理工程を開始できない状態が3件続いています')
+
+    def _check_act_job(self, job: Job) -> None:
+        if job.state is JobState.COMPLETED:
+            self._finish_job(job, 'COMPLETED_SKIP')
+            return
+        interrupted = job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:')
+        if job.state is JobState.FAILED or interrupted:
+            from djd_maker.core.job_migration import failure_class
+            if failure_class(job) == 'FATAL_FAILED':
+                self._finish_job(job, 'FATAL_FAILED')
+                return
+            if job.id in self._resume_attempted:
+                self._finish_job(job, 'RETRY_REQUIRES_START')
+                return
+            self._resume_attempted.add(job.id)
+            report_operation('resume.check', phase='再開処理')
+            self.resume_failed_jobs({job.id})
+            resumed = self.jobs.get(job.id)
+            assert resumed is not None
+            # Keep the current object so cancellation persists this same job.
+            for field in job.__dataclass_fields__:
+                setattr(job, field, getattr(resumed, field))
+            report_operation('resume.decision', decision=job.state.value, next_action='必要工程を即実行')
+            if job.state is JobState.FAILED:
+                self._finish_job(job, 'REMOTE_STATE_UNKNOWN', no_op=True)
+                return
+            if job.state is JobState.WAITING_VIDEO:
+                if self.scheduler is not None:
+                    self.scheduler.schedule_generation(job, force=True)
+                self._finish_job(job, 'GENERATION_ALREADY_STARTED')
+                return
+
+        if job.state is JobState.WAITING_VIDEO and self.scheduler is not None:
+            self.scheduler.ensure_scheduled(job)
+            if not self.scheduler.claim_next_poll(job):
+                self._finish_job(job, 'WAITING_FOR_NEXT_CHECK')
+                return
+
+        if job.state in {JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING}:
+            now = datetime.now(UTC)
+            deadline = self._parse_utc(job.next_poll_at)
+            reset = self._parse_utc(job.credit_reset_at)
+            if (deadline and now < deadline) or (reset and now < reset):
+                self._finish_job(job, 'RESERVED_WAITING_RESET')
+                return
+            self._recover_remote_job(job, checked_at=now)
+            if job.state in self.RECOVERY_STATES:
+                job.next_poll_at = (now + timedelta(seconds=getattr(self.scheduler, 'subsequent_poll_seconds', 120))).isoformat()
+                self._save(job)
+        elif job.state in self.NOTEBOOK_STATES:
+            if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
+                self._finish_job(job, 'DOWNLOAD_RETRY_REQUIRED')
+                return
+            before = job.to_dict()
+            self._resume_attempted.add(job.id)
+            self._run_notebook_job(job)
+            if job.to_dict() == before and job.state is not JobState.WAITING_VIDEO:
+                self._finish_job(job, 'NO_OP_JOB_TRANSITION', no_op=True)
+                return
+        if job.state in self.MEDIA_STATES:
+            self._run_media_job(job)
+        self._finish_job(job, job.error_code or ('GENERATION_ALREADY_STARTED' if job.state is JobState.WAITING_VIDEO else job.state.value))
 
     def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
         """Advance only persisted remote/recovery jobs; never submit new work."""
         current = (now or datetime.now(UTC)).astimezone(UTC)
         processed: list[str] = []
-        for job in self.jobs.list():
+        values = self.jobs.list()
+        for index, job in enumerate(values, 1):
             checkpoint('recovery.dequeue', job.id)
             if job.state not in self.RECOVERY_STATES:
+                continue
+            deadline = self._parse_utc(job.next_poll_at)
+            if deadline is not None and current < deadline:
                 continue
             if job.state is JobState.RESERVED_WAITING_CREDIT_RESET:
                 reset_at = self._parse_utc(job.credit_reset_at)
                 if reset_at is not None and current < reset_at:
                     continue
             processed.append(job.id)
-            self._recover_remote_job(job, checked_at=current)
+            started = time.monotonic()
+            record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
+                          phase='回収処理', processed=index-1, total=len(values), started=started)
+            def update(stage, fields):
+                record.update(fields)
+                record.update(stage=stage, elapsed=time.monotonic()-started)
+                self.runtime_callback(dict(record))
+            with operation_scope(update):
+                report_operation('job.start')
+                self._recover_remote_job(job, checked_at=current)
+                if job.state in self.MEDIA_STATES:
+                    self._run_media_job(job)
+                self._finish_job(job, job.error_code or job.state.value)
+                report_operation('job.next', processed=index)
 
         media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
         with ThreadPoolExecutor(
@@ -265,12 +480,16 @@ class PipelineCoordinator:
             job.last_checked_at = checked_at.isoformat()
             job.artifact_status = status
             if status == "READY":
+                report_operation('artifact.ready', decision='READY', next_action='Download開始')
                 if job.state is not JobState.DOWNLOAD_PENDING:
                     self._transition(job, JobState.DOWNLOAD_PENDING)
                 self._run_notebook_job(job)
                 return
             if status == "FAILED":
                 raise RuntimeError("remote video generation failed")
+            if status == 'GENERATING' and job.state in {JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING}:
+                self._transition(job, JobState.WAITING_VIDEO)
+            job.next_poll_at = (checked_at + timedelta(seconds=getattr(self.scheduler, 'subsequent_poll_seconds', 120))).isoformat()
             self._save(job)
         except BlockingModalError:
             # An ambiguous dialog stops the run, not just this recovery item.
@@ -336,8 +555,11 @@ class PipelineCoordinator:
                     self._transition(job, JobState.RESERVED_WAITING_CREDIT_RESET)
                     return
                 self._transition(job, JobState.GENERATING)
+                if getattr(submission, 'remote_status', None) == 'READY':
+                    self._transition(job, JobState.DOWNLOADING)
                 if self.scheduler is not None:
-                    self.scheduler.schedule_generation(job)
+                    if job.state is JobState.GENERATING:
+                        self.scheduler.schedule_generation(job)
 
             if job.state is JobState.UPLOADING:
                 # A crash without persisted remote identity cannot safely retry:
@@ -358,10 +580,14 @@ class PipelineCoordinator:
             if job.state is JobState.WAITING_VIDEO:
                 checkpoint('artifact.poll')
                 status = self.notebook.inspect_status(job)
+                job.artifact_status = status
+                job.last_checked_at = datetime.now(UTC).isoformat()
+                self._save(job)
                 if status != "READY":
                     if status == "FAILED":
                         raise RuntimeError("remote video generation failed")
                     return
+                report_operation('artifact.ready', decision='READY', next_action='Download開始')
                 self._transition(job, JobState.DOWNLOAD_PENDING)
 
             if job.state is JobState.DOWNLOAD_PENDING:
@@ -398,9 +624,12 @@ class PipelineCoordinator:
                 job.safety_gate = gate
                 job.raw_status = "READY"
                 self._transition(job, JobState.RAW_READY)
+                report_operation('raw.saved', decision='RAW_READY', next_action='artifact削除安全Gateを確認')
                 try:
                     require_remote_deletion_gate(gate)
                     self.notebook.delete_video_artifact(job, gate)
+                except BlockingModalError:
+                    raise
                 except Exception as exc:
                     # RAW is already durable and verified. Remote cleanup can be
                     # retried independently and must not destroy local progress.
@@ -453,6 +682,7 @@ class PipelineCoordinator:
                         raise ValueError('Endingスキップ元RAWの検証に失敗しました')
                     job.edited_path = str(raw)
                     job.ending_result = 'SKIPPED (not configured)'
+                    report_operation('ending.skip', decision='RAW_READY', next_action='HLS変換')
                     self._transition(job, JobState.HLS_ENCODING)
 
             if job.state is JobState.ENDING:
@@ -464,6 +694,7 @@ class PipelineCoordinator:
                     except Exception:
                         existing_is_valid = False
                 if not existing_is_valid:
+                    report_operation('ending.start', next_action='Ending結合後HLS変換')
                     if edited.exists():
                         edited.unlink()
                     result = self.ending.process(
@@ -507,6 +738,8 @@ class PipelineCoordinator:
             raise
         except Exception as exc:
             job.error_code = "MEDIA_STAGE_FAILED"
+            if isinstance(exc, FileExistsError):
+                job.failure_class = 'FATAL_FAILED'
             job.resume_checkpoint = job.state.value
             job.error_message = str(exc)
             if job.state not in {JobState.FAILED, JobState.COMPLETED}:

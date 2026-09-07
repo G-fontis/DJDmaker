@@ -1,5 +1,19 @@
 # 開発ルール
 
+## Ver1.2.2候補：逐次再開と可視化
+
+- 最終release指示`DJD-CHAPPY-V122-FINAL-RELEASE-BUILD-COMMIT-PUSH-FULL-001`では、既存live証跡を引き継ぎ、source/portable/移行/監査Gate通過後にVer1.2.2としてcommit・main通常pushする。追加の動画生成やPhase2統合は行わない。旧配布物cleanupが環境ポリシーに拒否された場合は迂回せず、対象・容量・保持理由をrelease記録へ残す。
+
+- 指示 `DJD-CHAPPY-V121-SEQUENTIAL-RESUME-RUNTIME-VISIBILITY-MODAL-FULL-001` を適用する。通常Startの全件remote pre-scanは禁止。各jobを確認・判断保存・必要工程実行・結果保存してから次Notebookへ進む。
+- COMPLETEDと自動再開不可FAILEDはremoteを開かない。待機は既存の永続`next_poll_at`（要求のnext_check_atに相当）を使う。期限前に開かない。
+- 白GUIへ現在job/Notebook/phase/stage/decision/next action/outcome/attempt/elapsed/countと一般利用者向けmessageを表示する。Phase2 HUDは変更しない。
+- 完成artifactは同一jobでDownload→RAW gate→artifact削除→Ending任意→HLS/ZIP→TXT移動まで進める。すでにローカルにあるRAWのFFmpeg並列数1/2は維持する。
+- 不明状態・no-opを黙って巡回しない。理由をJSONとGUIへ残し、3件連続なら安全停止する。告知modalで次Notebookへskipせず、閉じて操作可能を確認するか安全停止する。
+- 本番JSONをAcceptanceで書き換えない。コピー側で本番artifactを削除すると本番側が未回収になるため、live削除試験は本番処理から切り離した対象で行う。
+- 2026-09-07追加承認: 本番の既存生成失敗Notebookをlive送信試験に使用可。まず1件、Quota履歴/未送信を両方確認できない場合のみ最大2件。state保存はtest/copy側だけとし、原本177 JSONを保持する。生成成功後の動画はremoteに残し、後から通常の未回収/Download処理で回収する。
+- 続行指示`DJD-CHAPPY-V122-SEQUENTIAL-RECOVERY-LIVE-CONTINUE-FULL-001`: TAX120/HT075はcopy側の保存済み期限到達後に再確認する。完成を検出した1件について実Download→12項目RAW gate→artifact削除→Ending任意→HLS/ZIP→TXT moveを許可する。原本JSONは変更せず、完成RAW/ZIPとcopy checkpointの所在を必ず引き継ぐ。Notebook/sourceの削除はしない。
+- source/live Gateをすべて満たすまでVersion変更・build・commit・pushを行わない。modal自然再現がない場合の`UNVERIFIED_LIVE`は許容するが、他の4種live Gateを免除しない。
+
 ## 作業終了通知音
 
 - 開発作業を中断するとき、および依頼された作業を完了するときは、次の音源を再生する。

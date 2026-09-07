@@ -59,6 +59,7 @@ def run_shutdown_smoke(root: Path, report: Path) -> int:
         if state['stage'] in (1,3) and state['worker'] and not state['worker'].is_alive():
             results.append({'operation':'stop' if state['stage']==1 else 'close',
                 'seconds':time.monotonic()-state['requested'],'worker_alive':False,
+                'cancellation':service.cancellation.diagnostic(),
                 'owned_job_closed':browser._owned_process_job is None,
                 'owned_processes':browser.shutdown_diagnostic()['owned_processes']})
             if state['stage']==1:
@@ -71,7 +72,8 @@ def run_shutdown_smoke(root: Path, report: Path) -> int:
     QTimer.singleShot(200,window.start_processing)
     app.exec();timer.stop()
     service.shutdown()
-    passed=(len(results)==2 and all(r['seconds']<10 and r['owned_job_closed'] and r['owned_processes']==0 for r in results)
+    passed=(len(results)==2 and all(r['seconds']<10 and r['owned_job_closed'] and r['owned_processes']==0
+            and r['cancellation']['navigation_count_before']==r['cancellation']['navigation_count_after'] for r in results)
             and not errors and len([e for e in events if e.startswith('MODAL_DISMISSED')])==2)
     report.write_text(json.dumps({'passed':passed,'results':results,'events':events,'errors':errors,
         'live_google_modal':False,'fixture_only':True},ensure_ascii=False,indent=2),encoding='utf-8')

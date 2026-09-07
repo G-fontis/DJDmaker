@@ -3,6 +3,7 @@ from enum import StrEnum
 import re
 import time
 from djd_maker.core.cancellation import checkpoint
+from djd_maker.core.runtime_operation import report_operation
 
 
 class ModalKind(StrEnum):
@@ -51,7 +52,14 @@ def ensure_notebook_interactable(page, *, diagnostic=lambda _: None, target=None
                 if target is None:
                     raise BlockingModalError('BLOCKING_MODAL_TARGET_UNVERIFIED')
                 target.click(trial=True, timeout=1000)
+                # When both surfaces exist, verify both; never click an action.
+                controls = page.locator('chat-panel textarea, section.source-panel button[aria-label="ソースを追加"], section.source-panel button[aria-label="Add source"]')
+                for i in range(controls.count()):
+                    control = controls.nth(i)
+                    if control.is_visible() and control.is_enabled():
+                        control.click(trial=True, timeout=1000)
                 diagnostic('MODAL_DISMISSED:dialog_hidden:scrim_gone')
+                report_operation('modal.ready')
                 return
         else:
             # Nested or concurrent dialogs are ambiguous; do not guess an X.
@@ -59,6 +67,7 @@ def ensure_notebook_interactable(page, *, diagnostic=lambda _: None, target=None
                 raise BlockingModalError('BLOCKING_MODAL_UNKNOWN: multiple dialogs')
             dialog = visible[0]
             kind = classify_modal(dialog.inner_text())
+            report_operation('modal.found', decision=kind.value)
             diagnostic(f'BLOCKING_MODAL:{kind.value}')
             if kind in {ModalKind.UNKNOWN, ModalKind.ACTION_CONFIRMATION}:
                 raise BlockingModalError(f'BLOCKING_MODAL_{kind.value}: 自動で閉じず停止します')

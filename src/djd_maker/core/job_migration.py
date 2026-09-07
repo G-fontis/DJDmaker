@@ -10,6 +10,8 @@ from .repositories import JobRepository
 
 
 def failure_class(job: Job) -> str:
+    if job.failure_class == 'FATAL_FAILED':
+        return 'FATAL_FAILED'
     text = f"{job.error_code or ''} {job.error_message or ''}".casefold()
     if "fatal" in text:
         return "FATAL_FAILED"

@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import re
+import time
+from datetime import datetime
 from typing import Protocol
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -31,6 +34,8 @@ from .controller import AsyncControllerBridge
 from .dialogs import JobDetailDialog, LogDialog, SettingsDialog, open_local_path
 from .preview import EndingPreviewPlayer
 from .viewmodels import ACTIVE_STATES, job_stage_texts, state_display, summarize_jobs
+from .viewmodels import sanitize_log_text
+from djd_maker.core.runtime_operation import operation_text
 
 
 class SettingsRepositoryPort(Protocol):
@@ -60,7 +65,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.1"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.2"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -191,6 +196,30 @@ class MainWindow(QMainWindow):
             summary_layout.addWidget(label)
         root.addWidget(summary)
 
+        runtime = QGroupBox('現在の処理')
+        runtime_grid = QGridLayout(runtime)
+        self.runtime_labels = {}
+        for index, (key, caption) in enumerate((
+            ('job', '現在Job'), ('notebook', '現在Notebook'), ('phase', '現在フェーズ'),
+            ('stage', '現在工程'), ('decision', '直前の判断'), ('next_action', '次の処理'),
+            ('outcome', '判定結果'), ('attempt', 'Attempt'), ('elapsed', '経過時間'),
+            ('count', '処理済み / 対象件数'),
+        )):
+            label = QLabel(caption + ': －')
+            label.setWordWrap(True)
+            self.runtime_labels[key] = (caption, label)
+            runtime_grid.addWidget(label, index // 2, index % 2)
+        self.runtime_messages = QPlainTextEdit()
+        self.runtime_messages.setReadOnly(True)
+        self.runtime_messages.setMaximumBlockCount(300)
+        self.runtime_messages.setMaximumHeight(100)
+        runtime_grid.addWidget(self.runtime_messages, 5, 0, 1, 2)
+        root.addWidget(runtime)
+        self._runtime_record = {}
+        self._runtime_timer = QTimer(self)
+        self._runtime_timer.timeout.connect(self._refresh_runtime_elapsed)
+        self._runtime_timer.start(1000)
+
         self.job_table = QTableWidget(0, len(self.JOB_COLUMNS))
         self.job_table.setHorizontalHeaderLabels(self.JOB_COLUMNS)
         self.job_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -265,6 +294,7 @@ class MainWindow(QMainWindow):
         self.controller.jobs_changed.connect(self.set_jobs)
         self.controller.status_changed.connect(self._apply_runtime_status)
         self.controller.log_received.connect(self._log_dialog.append_record)
+        self.controller.log_received.connect(self._append_runtime_message)
         self.controller.operation_started.connect(self._operation_started)
         self.controller.operation_finished.connect(self._operation_finished)
         self.controller.operation_failed.connect(self._operation_failed)
@@ -451,7 +481,7 @@ class MainWindow(QMainWindow):
             return
         if self.controller.start():
             self._running = True
-            self.statusBar().showMessage("準備確認中...")
+            self.statusBar().showMessage("認証・プロファイル・Notebookホーム画面を確認しています")
             self._update_action_state()
 
     def start_login(self) -> None:
@@ -488,7 +518,7 @@ class MainWindow(QMainWindow):
 
     def _operation_started(self, operation: str) -> None:
         if operation == "start":
-            self.statusBar().showMessage("準備確認中...")
+            self.statusBar().showMessage("認証・プロファイル・Notebookホーム画面を確認しています")
         elif operation == "login":
             self.statusBar().showMessage(
                 "Googleログイン用Chromeでログインし、完了後にChromeを閉じてください"
@@ -509,7 +539,8 @@ class MainWindow(QMainWindow):
         if operation == "login":
             self.statusBar().showMessage("ログイン確認待ち。［授業動画作成開始］で自動確認します")
         elif operation == "start":
-            self.statusBar().showMessage("準備確認中...")
+            if not self._runtime_record:
+                self.statusBar().showMessage("認証・プロファイル・Notebookホーム画面を確認しています")
         elif operation == "recover":
             self.statusBar().showMessage("未回収動画の確認が完了しました")
         elif operation == "stop" and self._running:
@@ -530,6 +561,18 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_status(self, status: object) -> None:
         if isinstance(status, dict):
+            record = status.get('runtime')
+            if isinstance(record, dict) and record:
+                self._runtime_record = dict(record)
+                for key, (caption, label) in self.runtime_labels.items():
+                    value = record.get(key, '－')
+                    if key == 'count':
+                        value = f"{record.get('processed', 0)} / {record.get('total', 0)}"
+                    label.setText(f'{caption}: {operation_text(value)}')
+                self._refresh_runtime_elapsed()
+                self.statusBar().showMessage(
+                    f"{record.get('phase', '処理中')} {record.get('processed', 0)}/{record.get('total', 0)}: "
+                    f"{record.get('job', '－')} / {operation_text(record.get('stage', ''))}")
             self._running = bool(status.get("running", self._running))
             next_check = status.get("next_check", "－")
             self.next_check_label.setText(f"次回確認: {next_check}")
@@ -546,6 +589,22 @@ class MainWindow(QMainWindow):
                 f"リセット時刻: {credit_reset_at or '－'}"
             )
             self._update_action_state()
+
+    def _refresh_runtime_elapsed(self):
+        record = self._runtime_record
+        elapsed = record.get('elapsed', 0)
+        if self._running and record.get('started') and record.get('stage') not in {'job.next', 'stop.complete'}:
+            elapsed = max(0, time.monotonic() - record['started'])
+        self.runtime_labels['elapsed'][1].setText(f'経過時間: {int(elapsed)}秒')
+
+    def _append_runtime_message(self, value):
+        if not isinstance(value, dict) or not isinstance(value.get('runtime'), dict):
+            return
+        record = value['runtime']
+        stage = operation_text(record.get('stage', ''))
+        decision = operation_text(record.get('decision', ''))
+        text = f"{datetime.now():%H:%M:%S} [{record.get('job', '－')}] {stage} / {decision}"
+        self.runtime_messages.appendPlainText(sanitize_log_text(text))
 
     def _update_action_state(self) -> None:
         self.start_button.setEnabled(not self._running)

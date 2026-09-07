@@ -160,6 +160,8 @@ class Job:
     failure_class: str | None = None
     source_status: str = "UNKNOWN"
     resume_checkpoint: str | None = None
+    runtime_outcome: str | None = None
+    runtime_reason: str | None = None
     txt_move_status: str = "PENDING"
     archived_txt_path: str | None = None
     source_sha256: str | None = None

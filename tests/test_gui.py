@@ -116,7 +116,7 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2.1"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2.2"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
@@ -180,7 +180,7 @@ def test_normal_ux_is_login_then_start_with_no_extra_gui_operation(tmp_path: Pat
     window.start_button.click()
     _drain_until(lambda: not bridge.busy)
     assert controller.calls == ["login", "start"]
-    assert window.statusBar().currentMessage() == "準備確認中..."
+    assert window.statusBar().currentMessage() == "認証・プロファイル・Notebookホーム画面を確認しています"
     window.close()
 
 

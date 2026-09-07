@@ -89,6 +89,9 @@ def _preset_smoke(report_path: Path) -> int:
 
 
 def _dispatch() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-sequential-smoke':
+        from djd_maker.packaging.sequential_smoke import run_sequential_smoke
+        return run_sequential_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) == 4 and sys.argv[1] == '--packaging-shutdown-smoke':
         from djd_maker.packaging.shutdown_smoke import run_shutdown_smoke
         return run_shutdown_smoke(Path(sys.argv[2]), Path(sys.argv[3]))

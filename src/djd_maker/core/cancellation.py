@@ -75,6 +75,9 @@ def checkpoint(operation=None, job_id=None):
         if job_id is not None:
             token.current_jobs[threading.get_ident()] = job_id
         token.check(operation)
+    if operation:
+        from .runtime_operation import report_operation
+        report_operation(operation)
 
 
 @contextmanager

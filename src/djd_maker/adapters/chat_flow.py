@@ -102,6 +102,8 @@ class ChatFlow:
         last_target_error = None
         for attempt in range(1, 4):
             checkpoint('chat.retry')
+            from djd_maker.core.runtime_operation import report_operation
+            report_operation('chat.retry', attempt=f'{attempt} / 3')
             if baseline is not None:
                 # Read again just before retransmission to catch delayed replies.
                 found, reply = self.correlated_reply(prompt, baseline)
@@ -137,6 +139,7 @@ class ChatFlow:
                     break
                 self.page.wait_for_timeout(250)
             if sent:
+                report_operation('chat.reply', next_action='今回送信に対応する返信を確認')
                 result = self.wait_reply(prompt, baseline)
                 if result is not None:
                     return result

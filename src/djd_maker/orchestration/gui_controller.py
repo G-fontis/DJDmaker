@@ -11,7 +11,7 @@ from djd_maker.core.settings import AppSettings
 from djd_maker.core.cancellation import CancellationToken, RunCancelled, cancellation_scope, checkpoint
 from djd_maker.adapters.notebook_modal import BlockingModalError
 
-from .pipeline import PipelineCoordinator
+from .pipeline import PipelineCoordinator, NoOpJobTransitionError
 from .scheduler import PersistentPollScheduler, SchedulerMode
 
 
@@ -71,6 +71,17 @@ class GuiPipelineController:
         self._log_callback: Callable[[object], None] = lambda _value: None
         self._error_callback: Callable[[str, str], None] = lambda _op, _message: None
         self._last_states: dict[str, JobState] = {}
+        self._runtime: dict[str, object] = {}
+
+    def _runtime_update(self, record: dict) -> None:
+        with self._guard:
+            previous = self._runtime
+            self._runtime = dict(record)
+        if any(previous.get(k) != record.get(k) for k in ('job_id', 'stage', 'decision', 'attempt')):
+            self._status_callback({**self.status(), 'runtime': dict(record)})
+            self._log_callback({'level': 'INFO', 'stage': record.get('stage', ''),
+                                'message': record.get('message', record.get('stage', '')),
+                                'runtime': dict(record)})
 
     def bind(
         self,
@@ -177,6 +188,7 @@ class GuiPipelineController:
             self._phase = "recovery"
         try:
             pipeline = factory()
+            pipeline.runtime_callback = self._runtime_update
             pending_before = [
                 job
                 for job in self.jobs.list()
@@ -220,9 +232,11 @@ class GuiPipelineController:
         self.scheduler.stop()
         self.cancellation.request()
         self._phase = 'STOP_REQUESTED'
+        self._runtime_update({**self._runtime, 'stage': 'stop.requested'})
 
     def stop(self) -> dict[str, object]:
         self.request_stop()
+        self._runtime_update({**self._runtime, 'stage': 'stop.wait'})
         with self._guard:
             worker = self._worker or self._retiring_worker
         if (worker is None or not worker.is_alive()) and not self._recovering:
@@ -244,6 +258,8 @@ class GuiPipelineController:
                 self._phase = 'STOPPED'
             self._paused = False
         self._publish_status()
+        if self._phase == 'STOPPED':
+            self._runtime_update({**self._runtime, 'stage': 'stop.complete'})
         return self.status()
 
     def shutdown(self) -> None:
@@ -277,6 +293,7 @@ class GuiPipelineController:
         cleanup_browser = True
         try:
             checkpoint('pipeline.start')
+            self._runtime_update({'stage': 'preflight', 'phase': '開始前確認', 'job': '－'})
             if self.pipeline is None:
                 assert self.pipeline_factory is not None
                 try:
@@ -300,9 +317,10 @@ class GuiPipelineController:
             reconcile = getattr(self.pipeline, "reconcile_completed_txt", None)
             if callable(reconcile):
                 reconcile()
-            resume = getattr(self.pipeline, "resume_failed_jobs", None)
-            if callable(resume):
-                resume()
+            self.pipeline.runtime_callback = self._runtime_update
+            begin = getattr(self.pipeline, 'begin_run', None)
+            if callable(begin):
+                begin()
             self.scheduler.start()
             self._phase = "processing"
             while not self._stop_event.is_set():
@@ -311,7 +329,7 @@ class GuiPipelineController:
                 if not paused:
                     try:
                         self.pipeline.run_cycle()
-                    except BlockingModalError:
+                    except (BlockingModalError, NoOpJobTransitionError):
                         raise
                     except Exception as exc:
                         self._log_callback(
@@ -347,16 +365,15 @@ class GuiPipelineController:
                         in {
                             JobState.COMPLETED,
                             JobState.FAILED,
-                            JobState.RESERVED_WAITING_CREDIT_RESET,
-                            JobState.RECOVERY_PENDING,
+                            JobState.DOWNLOAD_VERIFY_FAILED,
                         }
                         for job in values
                     ):
                         break
                 self._stop_event.wait(self.cycle_interval_seconds)
-        except BlockingModalError as exc:
+        except (BlockingModalError, NoOpJobTransitionError) as exc:
             self.cancellation.request()
-            self._error_callback('modal', str(exc))
+            self._error_callback('modal' if isinstance(exc, BlockingModalError) else 'pipeline', str(exc))
         except RunCancelled:
             self._log_callback({'level':'INFO', 'stage':'stopped', 'message':json.dumps(self.cancellation.diagnostic())})
         finally:
@@ -401,6 +418,7 @@ class GuiPipelineController:
             "scheduler_mode": self.scheduler.mode.value,
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
             "phase": self._phase,
+            "runtime": dict(self._runtime),
             **self._credit_status(values),
         }
 

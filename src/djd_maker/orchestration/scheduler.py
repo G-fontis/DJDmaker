@@ -152,6 +152,17 @@ class PersistentPollScheduler:
     def is_due(self, job: Job, *, now: datetime | None = None) -> bool:
         return self.remaining_seconds(job, now=now) == 0.0
 
+    def claim_next_poll(self, job: Job) -> bool:
+        """Claim one job in the serialized Check/Act queue before remote I/O."""
+        with self._guard:
+            if self._mode is not SchedulerMode.RUNNING or not self.is_due(job):
+                return False
+            now = _as_utc(self._clock())
+            job.last_polled_at = _format_timestamp(now)
+            job.next_poll_at = _format_timestamp(now + timedelta(seconds=self.subsequent_poll_seconds))
+            self.jobs.save(job)
+            return True
+
     def poll_due(self, poll: Callable[[Job], None]) -> list[str]:
         """Poll each due job at most once during a scheduler tick.
 
