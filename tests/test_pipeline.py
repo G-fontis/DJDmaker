@@ -50,8 +50,8 @@ def test_terminal_job_save_failure_surfaces_without_marking_durable_job_failed(t
     jobs = TerminalSaveFailureJobs(job)
     instance = coordinator(tmp_path, jobs, FakeNotebookAdapter({}))
 
-    with pytest.raises(JobStateSaveError, match="再試行"):
-        instance.run_cycle()
+    instance.run_cycle()
+    assert job.id in instance.deferred_ids
 
     assert jobs.get(job.id).state is JobState.WAITING
 

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 
-def run_sequential_smoke(root: Path, report: Path) -> int:
+def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) -> int:
     if os.environ.get('DJD_PACKAGING_SMOKE') != '1':
         return 3
     from PySide6.QtCore import QTimer, QObject, Slot
@@ -35,6 +35,17 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
     preset = window.preset_repository.create('release fixture', 'never sent to Google')
     window.preset_repository.select(preset.id)
     calls, runtime, errors, dialogs, table_updates = [], [], [], [], []
+    fault = {'enabled': False, 'attempts': 0, 'recovered': False, 'isolation': False, 'overlay': False}
+    original_replace = os.replace
+    def fault_replace(source, destination):
+        if save_fault and fault['enabled'] and Path(destination) == root/'system/jobs/release0.json':
+            fault['attempts'] += 1
+            error = PermissionError('isolated package fixture: sharing violation')
+            error.winerror = 32
+            raise error
+        return original_replace(source, destination)
+    if save_fault:
+        os.replace = fault_replace
     from djd_maker.core.runtime_operation import report_operation
     from types import SimpleNamespace
     sources = {}
@@ -53,6 +64,8 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
             calls.append(['submit',job.id])
             report_operation('chat.send')
             report_operation('chat.sent')
+            if save_fault and job.id == 'release0' and not fault['recovered']:
+                fault['enabled'] = True
             report_operation('generation.accepted')
             return SimpleNamespace(notebook_id=job.notebook_id,notebook_url=job.notebook_url,remote_status='READY',reserved=False)
         def inspect_status(self, job):
@@ -105,15 +118,38 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
             errors.append(['timeout']);service.stop()
         if time.monotonic()-start>3 and service._worker is None:
             jobs=service.jobs.list()
+            if save_fault and not fault['recovered']:
+                fault['isolation'] = (service.jobs.get('release1').state is JobState.COMPLETED
+                    and service.jobs.get('release0').state is not JobState.COMPLETED
+                    and pipeline.deferred_ids == {'release0'} and not errors)
+                fault['overlay'] = any('状態保存待ち' in window.job_table.item(row,5).text()
+                    for row in range(window.job_table.rowCount()))
+                if not fault['isolation']:
+                    errors.append(['isolation failed'])
+                window.grab().save(str(root/'save-deferred.png'))
+                fault['enabled'] = False
+                fault['recovered'] = True
+                from djd_maker.core.deferred_state import DeferredStateStore
+                service.jobs._deferred_state = DeferredStateStore(root/'system/recovery/deferred')
+                pipeline.deferred = service.jobs._deferred_state
+                window.start_processing()
+                return
             expected=[['submit',f'release{i}'] for i in range(2)]+[[action,f'release{i}'] for i in range(2) for action in ('download','delete')]
             stages={r.get('stage') for r in runtime}
             required={'artifact.ready','download.start','raw.saved','ending.skip','hls.start','zip.start','job.next'}
             refreshed={entry['stage'] for entry in table_updates if entry['stage']==entry['display']}
-            passed=(calls==expected and required<=stages and {'chat.send','generation.accepted','hls.start','COMPLETED'}<=refreshed and not errors and len(dialogs)==4
+            actions_ok = calls==expected
+            if save_fault:
+                actions_ok = (all(calls.count([action,f'release{i}']) == 1 for i in range(2)
+                                  for action in ('submit','download','delete'))
+                    and fault['isolation'] and fault['overlay'] and fault['attempts'] >= 7
+                    and {'save.deferred','save.summary','save.recovered'} <= stages
+                    and not pipeline.deferred_ids)
+            passed=(actions_ok and required<=stages and {'chat.send','generation.accepted','hls.start','COMPLETED'}<=refreshed and not errors and len(dialogs)==4
                     and all(j.state is JobState.COMPLETED and j.txt_move_status=='MOVED'
                             and j.safety_gate.remote_deletion_allowed and j.ending_result.startswith('SKIPPED') for j in jobs))
             window.grab().save(str(root/'runtime.png'))
-            result=dict(passed=passed,calls=calls,runtime=runtime,dialogs=dialogs,errors=errors,table_updates=table_updates,
+            result=dict(passed=passed,calls=calls,runtime=runtime,dialogs=dialogs,errors=errors,table_updates=table_updates,fault=fault,
                         runtime_labels={key:label.text() for key,(_,label) in window.runtime_labels.items()},
                         jobs=[dict(id=j.id,state=j.state.value,ending=j.ending_result,hls=j.hls_result,txt=j.txt_move_status) for j in jobs])
             report.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -121,4 +157,7 @@ def run_sequential_smoke(root: Path, report: Path) -> int:
     window.show()
     timer=QTimer();timer.timeout.connect(tick);timer.start(100)
     QTimer.singleShot(200,begin)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        os.replace = original_replace

@@ -8,6 +8,8 @@ import subprocess
 from djd_maker.core.cancellation import run_process, checkpoint
 from djd_maker.core.runtime_operation import report_operation
 import tempfile
+from hashlib import sha256
+from djd_maker.core.deferred_state import SaveDeferred
 from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_STORED, BadZipFile, ZipFile
@@ -16,6 +18,15 @@ from djd_maker.core.interfaces import HlsResult
 
 
 _SEGMENT_NAME = re.compile(r"segment(\d{5})\.ts")
+
+
+def _source_digest(path: Path) -> str:
+    digest = sha256()
+    with path.open('rb') as stream:
+        while block := stream.read(1024 * 1024):
+            checkpoint('hls.hash')
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class HlsAdapterError(RuntimeError):
@@ -227,6 +238,7 @@ class HlsAdapter:
         )
         temporary_zip = output_zip.parent / f".{output_zip.name}.{os.urandom(8).hex()}.tmp"
         published = False
+        preserve_checkpoint = False
         try:
             command = [
                 str(self.ffmpeg),
@@ -271,17 +283,51 @@ class HlsAdapter:
                     "HLS codecs are invalid: "
                     f"video={output_probe.video_codec!r}, audio={output_probe.audio_codec!r}"
                 )
-            report_operation('hls.complete', next_action='ZIP作成')
-            report_operation('zip.start', next_action='ZIP整合性検証・完成保存')
+            report_operation('hls.complete', next_action='ZIP作成',
+                hls_checkpoint_directory=str(hls_directory), hls_source_sha256=_source_digest(video))
+            report_operation('zip.start', next_action='ZIP整合性検証・完成保存', zip_checkpoint_path=str(temporary_zip))
             create_and_validate_zip(playlist, segments, temporary_zip)
             _publish_without_overwrite(temporary_zip, output_zip)
             published = True
             report_operation('zip.complete', next_action='完成状態保存')
             return HlsResult(hls_directory, playlist, segments, output_zip)
+        except SaveDeferred:
+            preserve_checkpoint = True
+            raise
         finally:
-            temporary_zip.unlink(missing_ok=True)
-            if not published:
+            if not preserve_checkpoint:
+                temporary_zip.unlink(missing_ok=True)
+            if not published and not preserve_checkpoint:
                 shutil.rmtree(hls_directory, ignore_errors=True)
+
+    def resume_validated(self, video: Path, output_zip: Path, directory: Path,
+                         source_sha256: str, temporary_zip: Path | None = None) -> HlsResult:
+        """Revalidate saved HLS; never rerun FFmpeg after a state-save failure."""
+        directory, output_zip = directory.resolve(), output_zip.resolve()
+        if directory.parent != output_zip.parent or not directory.name.startswith(f'.{output_zip.stem}.hls-'):
+            raise HlsAdapterError('HLS_CHECKPOINT_PATH_MISMATCH')
+        if temporary_zip and (temporary_zip.resolve().parent != output_zip.parent or not temporary_zip.name.startswith(f'.{output_zip.name}.')):
+            raise HlsAdapterError('ZIP_CHECKPOINT_PATH_MISMATCH')
+        if _source_digest(video) != source_sha256:
+            raise HlsAdapterError('HLS_CHECKPOINT_SOURCE_CHANGED')
+        playlist, segments = validate_hls(directory)
+        probe = probe_media(self.ffprobe, playlist, self.probe_timeout_seconds)
+        if probe.video_codec != 'h264' or probe.audio_codec != 'aac':
+            raise HlsAdapterError('HLS_CHECKPOINT_CODECS_INVALID')
+        temporary_zip = temporary_zip or output_zip.parent / f'.{output_zip.name}.{os.urandom(8).hex()}.tmp'
+        if temporary_zip.is_file():
+            with ZipFile(temporary_zip) as archive:
+                paths = (playlist, *segments)
+                if archive.testzip() is not None or archive.namelist() != [p.name for p in paths]:
+                    raise HlsAdapterError('ZIP_CHECKPOINT_INVALID')
+                if any(archive.getinfo(p.name).compress_type != ZIP_STORED or archive.read(p.name) != p.read_bytes() for p in paths):
+                    raise HlsAdapterError('ZIP_CHECKPOINT_CONTENT_MISMATCH')
+        else:
+            report_operation('zip.start', zip_checkpoint_path=str(temporary_zip))
+            create_and_validate_zip(playlist, segments, temporary_zip)
+        _publish_without_overwrite(temporary_zip, output_zip)
+        report_operation('zip.complete')
+        return HlsResult(directory, playlist, segments, output_zip)
 
 
 # Compatibility with the engine-oriented name used in design documents.

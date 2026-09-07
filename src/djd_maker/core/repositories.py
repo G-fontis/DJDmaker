@@ -491,6 +491,8 @@ class JobRepository:
     ) -> None:
         self.directory = Path(directory)
         self.retry_observer = retry_observer
+        from .deferred_state import DeferredStateStore
+        self._deferred_state = DeferredStateStore(self.directory.parent / 'recovery' / 'deferred')
 
     def _document(self, job_id: str) -> _VersionedDocument:
         if not job_id or Path(job_id).name != job_id or job_id in {".", ".."}:

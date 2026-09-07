@@ -93,7 +93,7 @@ class GuiPipelineController:
             snapshots = list(self._job_snapshots.values())
         if any(previous.get(k) != record.get(k) for k in ('job_id', 'stage', 'decision', 'attempt')):
             self._status_callback({**self.status(snapshots), 'runtime': dict(record)})
-            self._log_callback({'level': 'INFO', 'stage': record.get('stage', ''),
+            self._log_callback({'level': record.get('level', 'INFO'), 'stage': record.get('stage', ''),
                                 'message': record.get('message', record.get('stage', '')),
                                 'runtime': dict(record)})
 
@@ -117,16 +117,26 @@ class GuiPipelineController:
         return value.resolve() if value.is_absolute() else (self.app_root / value).resolve()
 
     def reload(self) -> list[Job]:
+        from djd_maker.core.deferred_state import store_for
         source_root = self._input_directory()
         source_root.mkdir(parents=True, exist_ok=True)
         existing = {str(Path(job.source_path).resolve()) for job in self.jobs.list()}
+        deferred = store_for(self.jobs)
+        existing.update(str(Path(entry.snapshot['source_path']).resolve())
+                        for entry in deferred.entries.values() if entry.snapshot.get('source_path'))
         deleted = getattr(self.jobs, "deleted_source_paths", None)
         if callable(deleted):
             existing.update(deleted())
         for source in sorted(source_root.glob("*.txt"), key=lambda item: item.name.casefold()):
             resolved = str(source.resolve())
             if resolved not in existing and source.is_file():
-                self.jobs.save(Job(resolved))
+                job = Job(resolved)
+                try:
+                    self.jobs.save(job)
+                except JobStateSaveError as error:
+                    deferred.record(job, type(error).__name__)
+                    self._runtime_update(dict(stage='save.deferred', job_id=job.id, job=job.script_name,
+                        level='WARNING', message='新規jobの状態保存を保留しました。他の台本を続行します。'))
                 existing.add(resolved)
         values = self.jobs.list()
         self._jobs_callback(values)
@@ -211,6 +221,9 @@ class GuiPipelineController:
                 if job.state in PipelineCoordinator.RECOVERY_STATES
             ]
             processed = pipeline.run_recovery_cycle()
+            summary = getattr(pipeline, 'deferred_summary', None)
+            if callable(summary):
+                summary()
             values = self.jobs.list()
             self._jobs_callback(values)
             self._publish_status(values)
@@ -288,17 +301,25 @@ class GuiPipelineController:
     def retry(self, job_id: str, stage: str) -> Job:
         if self.pipeline is None:
             raise RuntimeError("pipeline must be started before retry")
-        if stage == "download":
-            result = self.pipeline.retry_download(job_id)
-        else:
-            restart = {
-                "job": JobState.WAITING,
-                "ending": JobState.RAW_READY,
-                "hls": JobState.HLS_ENCODING,
-            }.get(stage)
-            if restart is None:
-                raise ValueError(f"unsupported retry stage: {stage}")
-            result = self.pipeline.create_retry(job_id, restart)
+        if job_id in getattr(self.pipeline, 'deferred_ids', set()):
+            # A deferred job cannot enter a manual resend path. Start performs
+            # the bounded remote/local reconciliation, not an arbitrary retry.
+            return self.jobs.get(job_id)
+        from djd_maker.core.deferred_state import SaveDeferred
+        try:
+            if stage == "download":
+                result = self.pipeline.retry_download(job_id)
+            else:
+                restart = {
+                    "job": JobState.WAITING,
+                    "ending": JobState.RAW_READY,
+                    "hls": JobState.HLS_ENCODING,
+                }.get(stage)
+                if restart is None:
+                    raise ValueError(f"unsupported retry stage: {stage}")
+                result = self.pipeline.create_retry(job_id, restart)
+        except SaveDeferred:
+            result = self.jobs.get(job_id)
         self._jobs_callback(self.jobs.list())
         return result
 
@@ -381,7 +402,7 @@ class GuiPipelineController:
                         self._jobs_callback(values)
                     self._publish_status(values)
                     if values and all(
-                        job.state
+                        job.id in getattr(self.pipeline, 'deferred_ids', set()) or job.state
                         in {
                             JobState.COMPLETED,
                             JobState.FAILED,
@@ -397,6 +418,9 @@ class GuiPipelineController:
         except RunCancelled:
             self._log_callback({'level':'INFO', 'stage':'stopped', 'message':json.dumps(self.cancellation.diagnostic())})
         finally:
+            summary = getattr(self.pipeline, 'deferred_summary', None)
+            if callable(summary):
+                summary()
             # No terminal job can require another Notebook poll. Keep scheduler
             # state aligned with the stopped worker after natural completion too.
             self.scheduler.stop()

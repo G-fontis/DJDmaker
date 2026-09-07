@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Protocol
 
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QColor, QBrush
 from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
@@ -65,7 +65,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.3"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.4"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -89,6 +89,8 @@ class MainWindow(QMainWindow):
         self.settings = self.settings_repository.load()
         self.jobs: list[Job] = []
         self._checked_job_ids: set[str] = set()
+        store = getattr(self.job_repository, '_deferred_state', None)
+        self._deferred_overlays = set(store.entries) if store else set()
         self._running = False
         self._stopping = False
         self._closing = False
@@ -444,6 +446,7 @@ class MainWindow(QMainWindow):
         self._refresh_summary()
 
     def _refresh_summary(self) -> None:
+        self._render_deferred_overlays()
         summary = summarize_jobs(self.jobs)
         self.total_label.setText(f"全Job: {summary.total}")
         self.active_label.setText(f"処理中: {summary.active}")
@@ -471,8 +474,9 @@ class MainWindow(QMainWindow):
         self.completion_label.setText(
             f"全 {summary.total}授業 / 完成 {summary.zip_complete} / "
             f"エラー {summary.errors} / RAW {raw_count}本 / 完成ZIP {summary.zip_complete}本"
+            + (f" / 状態保存保留 {len(self._deferred_overlays)}件（完全成功ではありません）" if self._deferred_overlays else '')
         )
-        self.completion_group.setVisible(all_finished)
+        self.completion_group.setVisible(all_finished or bool(self._deferred_overlays))
         self._update_action_state()
 
     def _selected_job(self) -> Job | None:
@@ -509,6 +513,8 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         dialog = JobDetailDialog(job, self)
+        if job.id in self._deferred_overlays:
+            dialog.layout().insertWidget(0, QLabel('状態保存待ち：成果物を照合してから再試行します。詳細はログを確認してください。'))
         dialog.retry_requested.connect(self.controller.retry)
         dialog.exec()
 
@@ -615,6 +621,17 @@ class MainWindow(QMainWindow):
     def _apply_runtime_status(self, status: object) -> None:
         if isinstance(status, dict):
             record = status.get('runtime')
+            if isinstance(record, dict) and str(record.get('stage', '')).startswith('save.'):
+                job_id = record.get('job_id')
+                if job_id:
+                    if record['stage'] == 'save.recovered':
+                        self._deferred_overlays.discard(job_id)
+                        job = next((j for j in self.jobs if j.id == job_id), None)
+                        if job is not None:
+                            self.update_job(job)
+                    else:
+                        self._deferred_overlays.add(job_id)
+                self._refresh_summary()
             if isinstance(record, dict) and record:
                 if record.get('phase_counts'):
                     self.phase_counts_label.setText(str(record['phase_counts']))
@@ -652,6 +669,20 @@ class MainWindow(QMainWindow):
             )
             self._update_action_state()
 
+    def _render_deferred_overlays(self):
+        # Presentation only: never modify Job or paint a failed save as success.
+        sorting = self.job_table.isSortingEnabled()
+        self.job_table.setSortingEnabled(False)
+        for row in range(self.job_table.rowCount()):
+            item = self.job_table.item(row, 5)
+            job_id = self.job_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            if job_id in self._deferred_overlays:
+                item.setText('状態保存待ち（他job続行）')
+                item.setForeground(QBrush(QColor('#9b6500')))
+            else:
+                item.setForeground(QBrush())
+        self.job_table.setSortingEnabled(sorting)
+
     def _refresh_runtime_elapsed(self):
         record = self._runtime_record
         elapsed = record.get('elapsed', 0)
@@ -665,6 +696,8 @@ class MainWindow(QMainWindow):
         record = value['runtime']
         stage = operation_text(record.get('stage', ''))
         decision = operation_text(record.get('decision', ''))
+        if record.get('message'):
+            decision = str(record['message'])
         text = f"{datetime.now():%H:%M:%S} [{record.get('job', '－')}] {stage} / {decision}"
         self.runtime_messages.appendPlainText(sanitize_log_text(text))
 

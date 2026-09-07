@@ -103,7 +103,7 @@ class JsonStore:
                 self._notify_retry(
                     "retry", attempt, total_attempts, destination, error
                 )
-                time.sleep(delay)
+                self._retry_wait(delay)
                 continue
             try:
                 os.replace(source, destination)
@@ -137,7 +137,7 @@ class JsonStore:
                     self._notify_retry(
                         "retry", attempt, total_attempts, destination, error
                     )
-                    time.sleep(delay)
+                    self._retry_wait(delay)
                     continue
                 if not is_transient_replace_error(caught):
                     raise
@@ -166,7 +166,18 @@ class JsonStore:
                     return
                 if delay is None:
                     raise
-                time.sleep(delay)
+                self._retry_wait(delay)
+
+    @staticmethod
+    def _retry_wait(delay: float) -> None:
+        # Same bounded schedule; cancellation may interrupt a pipeline wait.
+        # Settings/GUI saves outside a run keep their original sleep semantics.
+        from .cancellation import current_token
+        token = current_token()
+        if token is None:
+            time.sleep(delay)
+        else:
+            token.wait(delay)
 
     @staticmethod
     def _published_content_matches(

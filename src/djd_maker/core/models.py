@@ -153,6 +153,9 @@ class Job:
     ending_result: str | None = None
     zip_path: str | None = None
     hls_result: str | None = None
+    hls_checkpoint_directory: str | None = None
+    hls_source_sha256: str | None = None
+    zip_checkpoint_path: str | None = None
     progress_percent: float = 0.0
     error_code: str | None = None
     error_message: str | None = None

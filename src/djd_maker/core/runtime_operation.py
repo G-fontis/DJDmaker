@@ -5,6 +5,10 @@ from contextvars import ContextVar
 _sink = ContextVar('runtime_sink', default=None)
 
 LABELS = {
+    'save.deferred': '状態保存待ち・他job続行', 'save.retry': '状態保存を再試行',
+    'save.recovered': '状態保存を復旧', 'save.unresolved': '状態保存保留',
+    'save.summary': '保存保留を含む処理結果',
+    'zip.publish': '検証済みZIPを公開',
     'phase.a': '動画生成開始フェーズ', 'phase.b': '動画回収・変換フェーズ',
     'REMOTE_ARTIFACT_READY': '動画完成・回収待ち',
     'notebook.create': 'Notebook作成中', 'notebook.created': 'Notebook作成完了',

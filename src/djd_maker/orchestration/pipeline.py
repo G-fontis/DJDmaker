@@ -61,7 +61,11 @@ class PipelinePaths:
     ending_video: Path | None
 
 
-class PipelineCoordinator:
+from .deferred_recovery import DeferredRecovery
+from djd_maker.core.deferred_state import SaveDeferred
+
+
+class PipelineCoordinator(DeferredRecovery):
     """Notebook laneとbounded FFmpeg laneを1 cycleずつ前進させる。"""
 
     NOTEBOOK_STATES = frozenset(
@@ -142,16 +146,28 @@ class PipelineCoordinator:
         self._idle_announced: dict[str, tuple] = {}
         self._media_progress_lock = threading.Lock()
         self._media_completed = 0
+        self._init_deferred()
+        if hasattr(self.notebook, 'persist_identity'):
+            self.notebook.persist_identity = self._save
 
     def begin_run(self) -> None:
         """Reset local queue bookkeeping only; never opens a Notebook."""
         self._resume_attempted.clear()
         self._no_op_count = 0
         self._idle_announced.clear()
+        self._deferred_attempts.clear()
+        for entry in self.deferred.entries.values():
+            self._deferred_notice(entry, 'save.deferred', '保存保留journalを検出しました。再実行前に成果物を照合します。')
 
     def _save(self, job: Job) -> None:
+        if job.id in self.deferred_ids:
+            raise SaveDeferred()
         job.presentation_revision += 1
-        self.jobs.save(job)
+        try:
+            self.jobs.save(job)
+        except JobStateSaveError as error:
+            self._defer(job, error)
+            raise SaveDeferred() from error
         self._progress_jobs[job.id] = Job.from_dict(job.to_dict())
         self.job_callback(Job.from_dict(job.to_dict()))
 
@@ -173,6 +189,12 @@ class PipelineCoordinator:
             job.presentation_stage = stage
             job.presentation_phase = self.phase
             self._save(job)
+
+    @staticmethod
+    def _local_checkpoint_fields(job, fields):
+        for name in ('hls_checkpoint_directory', 'hls_source_sha256', 'zip_checkpoint_path'):
+            if fields.get(name):
+                setattr(job, name, fields[name])
 
     def _transition(self, job: Job, target: JobState) -> None:
         job.transition_to(target)
@@ -201,7 +223,7 @@ class PipelineCoordinator:
         resumed = []
         candidates = self.jobs.list() if job_ids is None else [self.jobs.get(job_id) for job_id in sorted(job_ids)]
         for job in candidates:
-            if job is None:
+            if job is None or job.id in self.deferred_ids:
                 continue
             checkpoint('resume.dequeue', job.id)
             interrupted = job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:')
@@ -250,11 +272,15 @@ class PipelineCoordinator:
                 job.resume_checkpoint = target.value
                 job.error_code = None
                 job.error_message = None
-                resumed.append(job.id)
-            self._save(job)
+            with self._job_boundary(job):
+                self._save(job)
+                if target is not None:
+                    resumed.append(job.id)
         return resumed
 
     def _needs_dispatch(self, job: Job) -> bool:
+        if job.id in self.deferred_ids:
+            return False
         if job.state in {JobState.WAITING, JobState.UPLOADING}:
             return True
         if job.state is JobState.FAILED:
@@ -270,9 +296,12 @@ class PipelineCoordinator:
         remaining = sum(self._needs_dispatch(j) for j in jobs)
         summary = (f'生成開始済: {generated}/{len(jobs)} / 予約済: {reserved} / 残り: {remaining}' if phase == 'GENERATION_DISPATCH'
                    else f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}')
+        summary += f' / 状態保存保留: {len(self.deferred_ids)}'
+        decision = ('保存保留jobは未解決のまま隔離し、安全な他jobの回収を続行します' if self.deferred_ids
+                    else '全jobの動画生成開始/予約が完了しました')
         self.runtime_callback(dict(phase='動画生成開始フェーズ' if phase == 'GENERATION_DISPATCH' else '動画回収・変換フェーズ',
                                    stage='phase.a' if phase == 'GENERATION_DISPATCH' else 'phase.b', phase_counts=summary,
-                                   next_action=summary, decision='全jobの動画生成開始/予約が完了しました' if phase == 'COLLECT_LOCAL' else '未生成jobを先に処理'))
+                                   next_action=summary, decision=decision if phase == 'COLLECT_LOCAL' else '未生成jobを先に処理'))
 
     def run_cycle(self) -> None:
         self._reject_output_name_collisions()
@@ -285,17 +314,21 @@ class PipelineCoordinator:
             finally:
                 self._dispatch_only = False
             checkpoint('phase.dispatch.complete')
+            self._retry_deferred()
             if any(self._needs_dispatch(j) for j in self.jobs.list()):
                 return
         if self.phase != 'COLLECT_LOCAL':
+            if self.deferred_ids:
+                self._retry_deferred()
             self._phase_event('COLLECT_LOCAL')
         self._run_cycle_lane()
+        self._retry_deferred()
 
     def _run_cycle_lane(self) -> None:
         self._reject_output_name_collisions()
         # Preserve the existing bounded FFmpeg lane for RAW already on disk.
         # This is local-only: no Notebook is inspected/opened by these workers.
-        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and not self._dispatch_only]
+        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and not self._dispatch_only and job.id not in self.deferred_ids and job.artifact_status != 'DELETE_PENDING']
         if local_media:
             self._media_completed = 0
             with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency, thread_name_prefix='djd-ffmpeg') as pool:
@@ -312,73 +345,79 @@ class PipelineCoordinator:
         # Local ordering only. No remote pre-scan and no second execution queue.
         values.sort(key=lambda j: 0 if j.state in self.MEDIA_STATES or j.state is JobState.DOWNLOAD_PENDING else 1)
         for index, job in enumerate(values, 1):
-            checkpoint('queue.dequeue', job.id)
-            idle = self._idle_reason(job)
-            signature = (idle, job.state, job.next_poll_at, job.credit_reset_at, job.error_code)
-            if idle and self._idle_announced.get(job.id) == signature:
+            if job.id in self.deferred_ids:
                 continue
-            if idle:
-                self._idle_announced[job.id] = signature
-            else:
-                self._idle_announced.pop(job.id, None)
+            with self._job_boundary(job):
+                checkpoint('queue.dequeue', job.id)
+                idle = self._idle_reason(job)
+                signature = (idle, job.state, job.next_poll_at, job.credit_reset_at, job.error_code)
+                if idle and self._idle_announced.get(job.id) == signature:
+                    continue
+                if idle:
+                    self._idle_announced[job.id] = signature
+                else:
+                    self._idle_announced.pop(job.id, None)
+                started = time.monotonic()
+                record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
+                              phase='動画生成開始フェーズ' if self._dispatch_only else '動画回収・変換フェーズ', decision='－', next_action='状態確認', outcome='－',
+                              attempt='－', processed=index-1, total=len(values), started=started)
+                def update(stage, fields):
+                    self._local_checkpoint_fields(job, fields)
+                    self._stage_event(job, stage)
+                    record.update(fields)
+                    record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
+                    record['phase_counts'] = self._counts()
+                    self.runtime_callback(dict(record))
+                with operation_scope(update):
+                    report_operation('job.start')
+                    try:
+                        if idle:
+                            self._finish_job(job, idle)
+                        else:
+                            self._check_act_job(job)
+                    except RunCancelled:
+                        job.runtime_outcome = 'STOPPED'
+                        job.runtime_reason = 'STOP_REQUESTED'
+                        self._save(job)
+                        report_operation('stop.complete', outcome='STOPPED')
+                        raise
+                    except BlockingModalError:
+                        job.runtime_outcome = 'STOPPED'
+                        job.runtime_reason = 'BLOCKING_MODAL'
+                        self._save(job)
+                        report_operation('modal.blocked', outcome='STOPPED')
+                        raise
+                    report_operation('job.next', processed=index, next_action='次のジョブ')
+
+    def _local_media_with_progress(self, job: Job, index: int, total: int) -> None:
+        with self._job_boundary(job):
             started = time.monotonic()
             record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
-                          phase='動画生成開始フェーズ' if self._dispatch_only else '動画回収・変換フェーズ', decision='－', next_action='状態確認', outcome='－',
-                          attempt='－', processed=index-1, total=len(values), started=started)
+                          phase='保存済みRAWの変換', processed=self._media_completed, total=total, started=started)
             def update(stage, fields):
+                self._local_checkpoint_fields(job, fields)
                 self._stage_event(job, stage)
                 record.update(fields)
                 record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
                 record['phase_counts'] = self._counts()
                 self.runtime_callback(dict(record))
             with operation_scope(update):
-                report_operation('job.start')
                 try:
-                    if idle:
-                        self._finish_job(job, idle)
-                    else:
-                        self._check_act_job(job)
+                    self._run_media_job(job)
                 except RunCancelled:
                     job.runtime_outcome = 'STOPPED'
                     job.runtime_reason = 'STOP_REQUESTED'
                     self._save(job)
                     report_operation('stop.complete', outcome='STOPPED')
                     raise
-                except BlockingModalError:
-                    job.runtime_outcome = 'STOPPED'
-                    job.runtime_reason = 'BLOCKING_MODAL'
-                    self._save(job)
-                    report_operation('modal.blocked', outcome='STOPPED')
-                    raise
-                report_operation('job.next', processed=index, next_action='次のジョブ')
-
-    def _local_media_with_progress(self, job: Job, index: int, total: int) -> None:
-        started = time.monotonic()
-        record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
-                      phase='保存済みRAWの変換', processed=self._media_completed, total=total, started=started)
-        def update(stage, fields):
-            self._stage_event(job, stage)
-            record.update(fields)
-            record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
-            record['phase_counts'] = self._counts()
-            self.runtime_callback(dict(record))
-        with operation_scope(update):
-            try:
-                self._run_media_job(job)
-            except RunCancelled:
-                job.runtime_outcome = 'STOPPED'
-                job.runtime_reason = 'STOP_REQUESTED'
+                job.runtime_outcome = job.state.value
+                job.runtime_reason = job.error_code or job.state.value
                 self._save(job)
-                report_operation('stop.complete', outcome='STOPPED')
-                raise
-            job.runtime_outcome = job.state.value
-            job.runtime_reason = job.error_code or job.state.value
-            self._save(job)
-            # Media state is already durably saved; queue bookkeeping stays on
-            # the Notebook owner thread and is not shared across FFmpeg workers.
-            with self._media_progress_lock:
-                self._media_completed += 1
-                report_operation('job.result', outcome=job.state.value, processed=self._media_completed)
+                # Media state is already durably saved; queue bookkeeping stays on
+                # the Notebook owner thread and is not shared across FFmpeg workers.
+                with self._media_progress_lock:
+                    self._media_completed += 1
+                    report_operation('job.result', outcome=job.state.value, processed=self._media_completed)
 
     def _idle_reason(self, job: Job) -> str | None:
         if job.state is JobState.COMPLETED:
@@ -442,6 +481,8 @@ class PipelineCoordinator:
             self._resume_attempted.add(job.id)
             report_operation('resume.check')
             self.resume_failed_jobs({job.id})
+            if job.id in self.deferred_ids:
+                raise SaveDeferred()
             resumed = self.jobs.get(job.id)
             assert resumed is not None
             # Keep the current object so cancellation persists this same job.
@@ -502,43 +543,56 @@ class PipelineCoordinator:
         processed: list[str] = []
         values = self.jobs.list()
         for index, job in enumerate(values, 1):
-            checkpoint('recovery.dequeue', job.id)
-            if job.state not in self.RECOVERY_STATES:
+            if job.id in self.deferred_ids:
                 continue
-            deadline = self._parse_utc(job.next_poll_at)
-            if deadline is not None and current < deadline:
-                continue
-            if job.state is JobState.RESERVED_WAITING_CREDIT_RESET:
-                reset_at = self._parse_utc(job.credit_reset_at)
-                if reset_at is not None and current < reset_at:
+            with self._job_boundary(job):
+                checkpoint('recovery.dequeue', job.id)
+                if job.state not in self.RECOVERY_STATES:
                     continue
-            processed.append(job.id)
-            started = time.monotonic()
-            record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
-                          phase='回収処理', processed=index-1, total=len(values), started=started)
-            def update(stage, fields):
-                self._stage_event(job, stage)
-                record.update(fields)
-                record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
-                self.runtime_callback(dict(record))
-            with operation_scope(update):
-                report_operation('job.start')
-                self._recover_remote_job(job, checked_at=current)
-                if job.state in self.MEDIA_STATES:
-                    self._run_media_job(job)
-                self._finish_job(job, job.error_code or job.state.value)
-                report_operation('job.next', processed=index)
+                deadline = self._parse_utc(job.next_poll_at)
+                if deadline is not None and current < deadline:
+                    continue
+                if job.state is JobState.RESERVED_WAITING_CREDIT_RESET:
+                    reset_at = self._parse_utc(job.credit_reset_at)
+                    if reset_at is not None and current < reset_at:
+                        continue
+                processed.append(job.id)
+                started = time.monotonic()
+                record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
+                              phase='回収処理', processed=index-1, total=len(values), started=started)
+                def update(stage, fields):
+                    self._local_checkpoint_fields(job, fields)
+                    self._stage_event(job, stage)
+                    record.update(fields)
+                    record.update(stage=stage, elapsed=time.monotonic()-started, notebook=job.notebook_url or '－')
+                    self.runtime_callback(dict(record))
+                with operation_scope(update):
+                    report_operation('job.start')
+                    self._recover_remote_job(job, checked_at=current)
+                    if job.state in self.MEDIA_STATES:
+                        self._run_media_job(job)
+                    self._finish_job(job, job.error_code or job.state.value)
+                    report_operation('job.next', processed=index)
 
-        media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES]
+        media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and job.id not in self.deferred_ids]
+        # Browser reconciliation stays on its owning thread, never a FFmpeg
+        # executor thread (Playwright's sync session is thread-affine).
+        for index, job in enumerate(media_jobs, 1):
+            if job.artifact_status == 'DELETE_PENDING':
+                checkpoint('media.dequeue', job.id)
+                self._local_media_with_progress(job, index, len(media_jobs))
+        media_jobs = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES
+                      and job.id not in self.deferred_ids and job.artifact_status != 'DELETE_PENDING']
         with ThreadPoolExecutor(
             max_workers=self.ffmpeg_concurrency, thread_name_prefix="djd-ffmpeg"
         ) as pool:
             futures = []
-            for job in media_jobs:
+            for index, job in enumerate(media_jobs, 1):
                 checkpoint('media.dequeue')
-                futures.append(pool.submit(copy_context().run, self._run_media_job, job))
+                futures.append(pool.submit(copy_context().run, self._local_media_with_progress, job, index, len(media_jobs)))
             for future in futures:
                 future.result()
+        self._retry_deferred()
         return processed
 
     @staticmethod
@@ -578,9 +632,8 @@ class PipelineCoordinator:
             # An ambiguous dialog stops the run, not just this recovery item.
             raise
         except JobStateSaveError:
-            # The repository already exhausted its bounded Windows-sharing
-            # retries. Preserve remote/local artifacts and surface one terminal
-            # operation error to the GUI; do not rewrite the job as FAILED.
+            # Preserve artifacts; the outer job boundary isolates this save
+            # failure without rewriting the job as FAILED or stopping others.
             raise
         except Exception as exc:
             job.recovery_retry_count += 1
@@ -726,6 +779,7 @@ class PipelineCoordinator:
                 try:
                     require_remote_deletion_gate(gate)
                     self.notebook.delete_video_artifact(job, gate)
+                    job.artifact_status = 'DELETED'
                     report_operation('artifact.deleted')
                 except BlockingModalError:
                     raise
@@ -765,6 +819,24 @@ class PipelineCoordinator:
     def _run_media_job(self, job: Job) -> None:
         try:
             checkpoint('media.start', job.id)
+            if job.artifact_status == 'DELETE_PENDING' and job.notebook_id:
+                require_remote_deletion_gate(job.safety_gate)
+                try:
+                    status = self.notebook.inspect_status(job)
+                    if status == 'READY':
+                        self.notebook.delete_video_artifact(job, job.safety_gate)
+                        job.artifact_status = 'DELETED'
+                    elif status == 'NOT_STARTED':
+                        job.artifact_status = 'DELETED'
+                    else:
+                        raise ValueError('ARTIFACT_CLEANUP_UNCERTAIN')
+                    self._save(job)
+                except BlockingModalError:
+                    raise
+                except Exception as error:
+                    job.error_code = 'REMOTE_ARTIFACT_DELETE_FAILED'
+                    job.error_message = str(error)
+                    self._save(job)
             raw = Path(job.raw_path or "")
             edited = (
                 self.paths.work_directory / job.id / "ending" / f"{job.script_name}.mp4"
@@ -822,9 +894,14 @@ class PipelineCoordinator:
                         raise FileExistsError(f"不正な既存ZIPを上書きしません: {output_zip}")
                     job.zip_path = str(output_zip)
                 else:
-                    result = self.hls.convert_validate_and_zip(
-                        Path(job.edited_path or edited), output_zip
-                    )
+                    if job.hls_checkpoint_directory:
+                        result = self.hls.resume_validated(Path(job.edited_path or edited), output_zip,
+                            Path(job.hls_checkpoint_directory), job.hls_source_sha256,
+                            Path(job.zip_checkpoint_path) if job.zip_checkpoint_path else None)
+                    else:
+                        result = self.hls.convert_validate_and_zip(
+                            Path(job.edited_path or edited), output_zip
+                        )
                     job.zip_path = str(result.zip_path)
                 job.hls_result = "PASS"
                 if job.state is JobState.HLS_ENCODING:
@@ -835,6 +912,8 @@ class PipelineCoordinator:
             self._save(job)
             raise
         except JobStateSaveError:
+            raise
+        except BlockingModalError:
             raise
         except Exception as exc:
             job.error_code = "MEDIA_STAGE_FAILED"
@@ -867,7 +946,9 @@ class PipelineCoordinator:
                 job.error_message = (
                     f"output stem {job.script_name!r} is already owned by job {owner.id}"
                 )
-                self._transition(job, JobState.FAILED)
+                if job.id not in self.deferred_ids:
+                    with self._job_boundary(job):
+                        self._transition(job, JobState.FAILED)
 
     @staticmethod
     def _valid_zip(path: Path) -> bool:
@@ -914,6 +995,8 @@ class PipelineCoordinator:
         self.resume_failed_jobs({previous.id})
         retried = self.jobs.get(previous.id)
         assert retried is not None
+        if retried.id in self.deferred_ids:
+            return retried
         if retried.state is JobState.FAILED:
             raise ValueError("再開checkpointを確認できません。既存jobと成果物は保持しました")
         retried.attempt_by_stage[retried.state.value] = retried.attempt_by_stage.get(retried.state.value, 0) + 1

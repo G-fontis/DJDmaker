@@ -1,5 +1,12 @@
 # 開発ルール
 
+## Ver1.2.4 状態保存失敗のjob単位隔離（最新指示）
+
+- `DJD-CHAPPY-V123-MAIN-JOBSTATE-SAVE-FAILURE-ISOLATION-CONTINUE-FULL-001`によりmain修正を明示許可。基準f35ba708、phase2はf6f58719のまま変更しない。
+- 既存atomic保存・backup・6段階retryを維持し、retry枯渇後は対象jobだけ隔離。正式stateを偽更新せず、別のruntime overlayで状態保存待ちを表示する。
+- 再試行前にremote/local成果物を照合し、Preset/生成/予約/Downloadを盲目的に繰り返さない。journal失敗時はmemory保持し、未解決件数を最終警告する。
+- Phase A/B、Stop/Close、RAW安全性とEnding任意を維持。本番ではfault injectionせず、copy/fixtureのみ使用。全source/test Gate前のversion変更・build、全Gate前のcommit/pushは禁止。
+
 ## Ver1.2.3候補：生成優先と状態表即時更新
 
 - 最新正式指示`DJD-CHAPPY-V123-GENERATION-FIRST-CLOUD-THEN-LOCAL-LIVE-STATUS-REFRESH-FULL-001`を優先する。過去の完成artifact即回収規則はPhase B内に限定する。
@@ -80,4 +87,4 @@
 - job JSONはresolved path単位のprocess内mutexで直列化する。job保存にfilesystem lock fileを使わない。
 - atomic saveは同一directory tempへのwrite、flush、fsync、handle close、backup、`os.replace`の順を守る。
 - PermissionErrorおよびWinError 5/32だけをbounded retryする。復旧成功時はWARNING/INFOログだけとし、GUI modalやpipeline failureを発生させない。
-- 全retry失敗時だけterminal errorを表示する。既存JSON、RAW、Notebook、artifact、outputを削除・破損させず、再試行可能性を残す。
+- 全retry失敗時は対象jobだけ状態保存待ちへ隔離し、blocking modalなしで他jobを続行する。別journal/memoryへ復旧情報を残し、bounded照合後も未解決なら件数を警告する。既存JSON、RAW、Notebook、artifact、outputを削除・破損させない。

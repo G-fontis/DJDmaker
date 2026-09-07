@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from djd_maker.core.models import Job, JobState
 from djd_maker.core.repositories import JobStateSaveError
+from djd_maker.core.deferred_state import SaveDeferred
 from djd_maker.core.cancellation import CancellationToken, cancellation_scope, RunCancelled
 from djd_maker.core.runtime_operation import LABELS
 from djd_maker.gui.viewmodels import state_display, job_stage_texts
@@ -122,9 +123,11 @@ def test_runtime_notebook_url_refreshed_after_create(tmp_path):
 
 @pytest.mark.parametrize('stage',STAGES)
 def test_persisted_stage_immediately_updates_only_job_row_on_gui_thread(tmp_path,stage,monkeypatch):
-    job=Job('one.txt',state=JobState.UPLOADING)
+    job=Job('one.txt',state=JobState.WAITING)
     window,_,_,bridge=_window(tmp_path,[Job.from_dict(job.to_dict())],ending=False)
     jobs=MemoryJobs(job);pipeline=coordinator(tmp_path,jobs,Remote([]))
+    # This tests a live run's update, not an ambiguous UPLOADING at restart.
+    job.state=JobState.UPLOADING
     persisted=[];draw_threads=[]
     def notify(snapshot):
         assert jobs.get(snapshot.id).presentation_stage==stage
@@ -173,7 +176,7 @@ def test_sort_checkbox_scroll_and_selected_row_survive_update(tmp_path):
 def test_save_failure_emits_no_success_and_keeps_durable_state(tmp_path):
     job=Job('one.txt');jobs=TerminalSaveFailureJobs(job)
     pipeline=coordinator(tmp_path,jobs,Remote([]));events=[];pipeline.job_callback=events.append
-    with pytest.raises(JobStateSaveError):pipeline._transition(jobs.get(job.id),JobState.UPLOADING)
+    with pytest.raises(SaveDeferred):pipeline._transition(jobs.get(job.id),JobState.UPLOADING)
     assert not events
     assert jobs.get(job.id).state is JobState.WAITING
 
