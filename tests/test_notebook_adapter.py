@@ -552,6 +552,10 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
     events = []
 
     class Dom:
+        def ensure_source(self, path):
+            self.upload_txt(path)
+            self.wait_for_source_ready(path.name)
+
         def create_notebook(self):
             events.append("create")
             return ResumeMetadata("id", "https://notebook.google.com/notebook/id", "")
@@ -599,6 +603,10 @@ def test_engine_returns_structured_reservation_and_records_recovery_fields(tmp_p
     persisted = []
 
     class Dom:
+        def ensure_source(self, path):
+            self.upload_txt(path)
+            self.wait_for_source_ready(path.name)
+
         def create_notebook(self):
             return ResumeMetadata(
                 "reserved-id",
@@ -640,7 +648,7 @@ def test_engine_returns_structured_reservation_and_records_recovery_fields(tmp_p
     assert job.expected_generation_after == reset.isoformat()
     assert job.reservation_created_at == created.isoformat()
     assert job.artifact_status == "RESERVED"
-    assert len(persisted) == 2
+    assert len(persisted) == 3
     assert persisted[0]["notebook_id"] == "reserved-id"
 
 
@@ -655,6 +663,7 @@ def test_source_ready_requires_active_right_side_studio_card(monkeypatch):
             pass
 
     adapter = NotebookDomAdapter(Page())
+    adapter.source_state = lambda _filename: "PROCESSING"
     adapter._body_text = lambda: "1 個のソース"  # type: ignore[method-assign]
     adapter._source_registered = lambda _filename: True  # type: ignore[method-assign]
     adapter._source_processing = lambda: False  # type: ignore[method-assign]
@@ -675,6 +684,7 @@ def test_visible_filename_with_disabled_studio_card_times_out(monkeypatch):
             pass
 
     adapter = NotebookDomAdapter(Page())
+    adapter.source_state = lambda _filename: "PROCESSING"
     adapter._body_text = lambda: "1 個のソース"  # type: ignore[method-assign]
     adapter._source_registered = lambda _filename: True  # type: ignore[method-assign]
     adapter._source_processing = lambda: False  # type: ignore[method-assign]
@@ -685,12 +695,19 @@ def test_visible_filename_with_disabled_studio_card_times_out(monkeypatch):
         adapter.wait_for_source_ready("lesson.txt", timeout_ms=5_000)
 
 
-def test_source_timeout_marks_failed_and_recreates_notebook_once(tmp_path):
+def test_source_timeout_retries_same_notebook_without_reupload(tmp_path):
     source = tmp_path / "lesson.txt"
     source.write_text("source", encoding="utf-8")
     events = []
 
     class Dom:
+        ensure_source = NotebookDomAdapter.ensure_source
+        ensure_interactable = lambda self: None
+        diagnostic = staticmethod(lambda _message: None)
+
+        def source_state(self, _name):
+            return "MISSING" if self.waits == 0 else "PROCESSING"
+
         def __init__(self):
             self.creates = 0
             self.waits = 0
@@ -728,27 +745,30 @@ def test_source_timeout_marks_failed_and_recreates_notebook_once(tmp_path):
         )
     )
 
-    assert result[0] == "id-2"
+    assert result[0] == "id-1"
     assert events == [
         "create",
         ("rename", "lesson"),
         ("upload", "lesson.txt"),
         ("wait", "lesson.txt"),
-        ("rename", "FAILED_lesson"),
-        "create",
-        ("rename", "lesson"),
-        ("upload", "lesson.txt"),
         ("wait", "lesson.txt"),
         ("chat_generate", prompt),
     ]
 
 
-def test_second_source_timeout_marks_replacement_failed_and_stops(tmp_path):
+def test_third_source_timeout_preserves_notebook_and_stops(tmp_path):
     source = tmp_path / "lesson.txt"
     source.write_text("source", encoding="utf-8")
     events = []
 
     class Dom:
+        ensure_source = NotebookDomAdapter.ensure_source
+        ensure_interactable = lambda self: None
+        diagnostic = staticmethod(lambda _message: None)
+
+        def source_state(self, _name):
+            return "PROCESSING" if ("upload", "lesson.txt") in events else "MISSING"
+
         def __init__(self):
             self.creates = 0
 
@@ -788,16 +808,12 @@ def test_second_source_timeout_marks_replacement_failed_and_stops(tmp_path):
         ("rename", "lesson"),
         ("upload", "lesson.txt"),
         ("wait", "lesson.txt"),
-        ("rename", "FAILED_lesson"),
-        "create",
-        ("rename", "lesson"),
-        ("upload", "lesson.txt"),
         ("wait", "lesson.txt"),
-        ("rename", "FAILED_lesson"),
+        ("wait", "lesson.txt"),
     ]
 
 
-def test_exact_test_preset_reaches_main_chat_without_video_card_controls():
+def test_exact_test_preset_reaches_main_chat_without_video_card_controls(monkeypatch):
     prompt = (
         "ソースの読み込みが完了したら、以下の条件で動画を生成開始してください。\n"
         "形式：説明動画\n・日本語\n・ペーパークラフト"
@@ -844,6 +860,15 @@ def test_exact_test_preset_reaches_main_chat_without_video_card_controls():
         lambda: events.append("auto_generation")
     )
 
+    from djd_maker.adapters.replies import ReplyResult, ReplyKind
+    def verified_send(_flow, actual):
+        textbox.fill(actual)
+        Send().click()
+        events.append(("sent_dom", actual))
+        events.append("auto_generation")
+        return ReplyResult(ReplyKind.GENERATION_ACCEPTED)
+    monkeypatch.setattr("djd_maker.adapters.chat_flow.ChatFlow.send", verified_send)
+
     adapter.start_video_generation_from_chat(prompt)
 
     assert events == [
@@ -856,7 +881,7 @@ def test_exact_test_preset_reaches_main_chat_without_video_card_controls():
     assert not any("動画生成ボタン" in str(event) for event in events)
 
 
-def test_exhausted_precheck_schedules_without_sending_chat_generate():
+def test_old_exhausted_precheck_does_not_skip_current_chat_attempt(monkeypatch):
     jst = timezone(timedelta(hours=9))
     now = datetime(2026, 9, 7, 22, 0, tzinfo=jst)
     credit = CreditSnapshot(
@@ -879,9 +904,9 @@ def test_exhausted_precheck_schedules_without_sending_chat_generate():
     adapter = NotebookDomAdapter(
         Page(), credit_detector=CreditStub(credit), clock=lambda: now
     )
-    adapter._wait_for_generation_chat_ready = lambda: pytest.fail(  # type: ignore[method-assign]
-        "exhausted precheck must not prepare or send immediate chat generation"
-    )
+    adapter._wait_for_generation_chat_ready = lambda: None
+    from djd_maker.adapters.replies import ReplyKind, ReplyResult
+    monkeypatch.setattr("djd_maker.adapters.chat_flow.ChatFlow.send", lambda _flow, _prompt: ReplyResult(ReplyKind.QUOTA_EXHAUSTED, reset_at=credit.reset_at))
     adapter.request_scheduled_video_generation = (  # type: ignore[method-assign]
         lambda prompt, snapshot: events.append((prompt, snapshot))
         or GenerationOutcome(RemoteVideoStatus.WAITING, True, snapshot, now)
@@ -890,7 +915,7 @@ def test_exhausted_precheck_schedules_without_sending_chat_generate():
     outcome = adapter.start_video_generation_from_chat("selected preset")
 
     assert outcome.reserved is True
-    assert events == [("selected preset", credit)]
+    assert events == [("selected preset", CreditSnapshot(CreditState.EXHAUSTED, reset_at=credit.reset_at))]
 
 
 def test_reservation_uses_exact_allowlist_and_requires_waiting_status():
@@ -1011,7 +1036,7 @@ def test_missing_schedule_control_has_specific_failure():
         adapter.request_scheduled_video_generation("prompt", credit)
 
 
-def test_chat_input_readback_mismatch_blocks_send():
+def test_chat_input_readback_mismatch_blocks_send(monkeypatch):
     events = []
 
     class EmptyCards:
@@ -1033,7 +1058,11 @@ def test_chat_input_readback_mismatch_blocks_send():
     adapter._wait_for_generation_chat_ready = lambda: Textbox()  # type: ignore[method-assign]
     adapter._first_enabled_visible = lambda _candidates, _name: pytest.fail("must not send")  # type: ignore[method-assign]
 
-    with pytest.raises(PresetApplyMismatchError, match="main chat readback differ"):
+    from djd_maker.adapters.chat_flow import ChatFlowError
+    monkeypatch.setattr("djd_maker.adapters.chat_flow.ChatFlow.turns", lambda _flow: [])
+    monkeypatch.setattr("djd_maker.adapters.chat_flow.ChatFlow.input", lambda _flow: Textbox())
+
+    with pytest.raises(ChatFlowError, match="PRESET_APPLY_MISMATCH"):
         adapter.start_video_generation_from_chat("expected")
     assert events == ["fill"]
 

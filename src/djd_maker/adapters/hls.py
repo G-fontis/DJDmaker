@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import subprocess
+from djd_maker.core.cancellation import run_process, checkpoint
+from djd_maker.core.runtime_operation import report_operation
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +49,7 @@ def _resolve_tool(value: str | Path, name: str) -> Path:
 
 def _run(command: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        return run_process(
             command,
             capture_output=True,
             text=True,
@@ -160,6 +162,7 @@ def create_and_validate_zip(
     with ZipFile(temporary_zip, "x", compression=ZIP_STORED, allowZip64=True) as archive:
         archive.write(playlist, playlist.name)
         for segment in segments:
+            checkpoint('zip.segment')
             archive.write(segment, segment.name)
     try:
         with ZipFile(temporary_zip, "r") as archive:
@@ -180,6 +183,7 @@ def create_and_validate_zip(
 
 def _publish_without_overwrite(temporary: Path, destination: Path) -> None:
     """Atomically publish through a hard link; link creation cannot overwrite."""
+    checkpoint('zip.publish')
     try:
         os.link(temporary, destination)
     except FileExistsError as exc:
@@ -253,6 +257,7 @@ class HlsAdapter:
                 str(hls_directory / "segment%05d.ts"),
                 str(hls_directory / "playlist.m3u8"),
             ]
+            report_operation('hls.start', next_action='HLS検証後ZIP作成')
             conversion = _run(command, self.conversion_timeout_seconds)
             if conversion.returncode != 0:
                 raise HlsAdapterError(
@@ -266,9 +271,12 @@ class HlsAdapter:
                     "HLS codecs are invalid: "
                     f"video={output_probe.video_codec!r}, audio={output_probe.audio_codec!r}"
                 )
+            report_operation('hls.complete', next_action='ZIP作成')
+            report_operation('zip.start', next_action='ZIP整合性検証・完成保存')
             create_and_validate_zip(playlist, segments, temporary_zip)
             _publish_without_overwrite(temporary_zip, output_zip)
             published = True
+            report_operation('zip.complete', next_action='完成状態保存')
             return HlsResult(hls_directory, playlist, segments, output_zip)
         finally:
             temporary_zip.unlink(missing_ok=True)

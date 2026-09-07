@@ -8,7 +8,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QThreadPool
-from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from djd_maker.core.models import Job, JobState
 from djd_maker.core.settings import AppSettings
@@ -116,24 +116,19 @@ def _drain_until(condition, timeout: float = 2) -> None:
 def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path: Path) -> None:
     job = Job("日本語の台本.txt", state=JobState.COMPLETED, raw_path="raw.mp4", zip_path="done.zip")
     window, _settings, controller, _bridge = _window(tmp_path, [job])
-    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.1"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2.3"
     assert "GNBCreator" in window.ENGINE_CAPTION
     assert "ドウガッチンガー" in window.ENGINE_CAPTION
     assert "HLS Converter" in window.ENGINE_CAPTION
     assert window.CREDIT == "Created by 福ゼミ塾長"
-    assert window.job_table.columnCount() == 8
-    assert [window.job_table.horizontalHeaderItem(i).text() for i in range(8)] == list(window.JOB_COLUMNS)
+    assert window.job_table.columnCount() == 9
+    assert [window.job_table.horizontalHeaderItem(i).text() for i in range(9)] == list(window.JOB_COLUMNS)
     assert window.job_table.item(0, 1).text() == "日本語の台本"
     assert window.total_label.text() == "全Job: 1"
     assert window.zip_complete_label.text() == "ZIP完了: 1/1"
     assert window.completion_group.isVisibleTo(window)
     controls_layout = window.sidebar.layout()
-    button_widgets = [
-        controls_layout.itemAt(index).widget()
-        for index in range(controls_layout.count())
-        if isinstance(controls_layout.itemAt(index).widget(), QPushButton)
-    ]
-    assert button_widgets == [
+    assert [controls_layout.itemAt(index).widget() for index in range(1, 10)] == [
         window.settings_button,
         window.login_button,
         window.start_button,
@@ -148,14 +143,14 @@ def test_main_window_has_formal_identity_controls_and_fixed_job_columns(tmp_path
     assert "shutdown" in controller.calls
 
 
-def test_ending_not_configured_blocks_start(tmp_path: Path, monkeypatch) -> None:
+def test_ending_not_configured_allows_start(tmp_path: Path, monkeypatch) -> None:
     window, _settings, controller, _bridge = _window(tmp_path, [], ending=False)
     warnings: list[str] = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(str(args[2])))
-    assert not window.start_button.isEnabled()
+    assert window.start_button.isEnabled()
     window.start_processing()
-    assert "start" not in controller.calls
-    assert warnings and "Ending" in warnings[0]
+    _drain_until(lambda: 'start' in controller.calls)
+    assert not warnings
     window.close()
 
 
@@ -184,7 +179,7 @@ def test_normal_ux_is_login_then_start_with_no_extra_gui_operation(tmp_path: Pat
     window.start_button.click()
     _drain_until(lambda: not bridge.busy)
     assert controller.calls == ["login", "start"]
-    assert window.statusBar().currentMessage() == "準備確認中..."
+    assert window.statusBar().currentMessage() == "認証・プロファイル・Notebookホーム画面を確認しています"
     window.close()
 
 

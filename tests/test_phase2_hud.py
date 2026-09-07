@@ -61,7 +61,7 @@ def hud_window(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def test_phase2_window_launches_with_static_hud_architecture(hud_window: MainWindow) -> None:
-    assert hud_window.windowTitle() == "台本から授業動画つくるマシーン Ver1.1"
+    assert hud_window.windowTitle() == "台本から授業動画つくるマシーン Ver1.2.3"
     assert hud_window.findChildren(HudPanel)
     assert hud_window.findChildren(CircularStatusWidget)
     assert hud_window.centralWidget().objectName() == "hudRoot"
@@ -119,7 +119,7 @@ def test_phase2_job_states_use_text_and_distinct_colors(hud_window: MainWindow) 
     assert any("未回収" in text for text in state_texts)
     assert any("エラー" in text for text in state_texts)
     assert len(state_colors) >= 4
-    assert hud_window.job_table.item(0, 7).text() == "14:10"
+    assert any(hud_window.job_table.item(row, 8).text() == "14:10" for row in range(len(jobs)))
 
 
 def test_phase2_process_timeline_has_all_static_steps(hud_window: MainWindow) -> None:
@@ -237,12 +237,13 @@ def test_phase2_preview_is_not_imported_by_production_startup() -> None:
     assert "hud_preview" not in source
 
 
-def test_phase2_contains_no_timer_or_animation_runtime() -> None:
+def test_phase2_contains_no_animation_runtime() -> None:
     import djd_maker.gui.hud as hud
     import djd_maker.gui.main_window as main_window
 
     source = inspect.getsource(hud) + inspect.getsource(main_window)
     assert "QPropertyAnimation" not in source
     assert "QVariantAnimation" not in source
-    assert "QTimer" not in source
+    # The inherited v123 elapsed-time timer updates text only, not animation.
+    assert source.count('QTimer(self)') == 1
     assert "startTimer" not in source

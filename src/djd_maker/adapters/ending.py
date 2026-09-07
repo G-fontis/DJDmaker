@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 import os
 import subprocess
+from djd_maker.core.cancellation import run_process, checkpoint
 from uuid import uuid4
 
 from djd_maker.core.interfaces import MediaResult
@@ -48,7 +49,7 @@ class EndingEngineAdapter:
 
     def _run(self, command: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
         try:
-            completed = subprocess.run(
+            completed = run_process(
                 command, shell=False, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=self.timeout_seconds,
                 check=False,
@@ -156,6 +157,7 @@ class EndingEngineAdapter:
             self._run(command, "ending processing")
             staged = self.validator.validate(staging, reject_temporary=False)
             try:
+                checkpoint('ending.publish')
                 os.link(staging, output_path)
             except FileExistsError:
                 raise EndingOutputCollisionError(

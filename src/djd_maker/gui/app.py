@@ -46,7 +46,11 @@ def build_desktop(
     settings_repository = SettingsRepository(root / "system" / "settings.json")
     preset_repository = PresetRepository(root / "system" / "presets.json")
     job_repository = JobRepository(root / "system" / "jobs")
+    from djd_maker.core.job_migration import migrate_jobs
+    from djd_maker.core.completed_txt import reconcile_completed_txt
+    migrate_jobs(root / "system")
     settings = settings_repository.load()
+    reconcile_completed_txt(job_repository, _resolved(root, settings.raw_directory))
     browser = browser_manager or BrowserManager(
         root / "browser" / "chrome-profile",
         selector_probe=NotebookDomAdapter.preflight_home_page,
@@ -58,14 +62,15 @@ def build_desktop(
     )
 
     def make_pipeline(*, require_preset: bool) -> PipelineCoordinator:
+        from djd_maker.adapters.notebook_modal import ensure_notebook_interactable
         current = settings_repository.load()
         current.validate()
         selected_preset = (
             preset_repository.require_selected() if require_preset else None
         )
-        ending_path = _resolved(root, current.ending_video) if current.ending_video else Path("")
-        if not current.ending_video or not ending_path.is_file():
-            raise FileNotFoundError("Ending動画が未設定または存在しません")
+        ending_path = _resolved(root, current.ending_video) if current.ending_video else None
+        if ending_path is not None and not ending_path.is_file():
+            raise FileNotFoundError("選択したEnding動画が存在しません。再選択または設定を空にしてください")
         scheduler.first_poll_seconds = current.first_notebook_check_seconds
         scheduler.subsequent_poll_seconds = current.notebook_poll_seconds
         validator = VideoValidator()
@@ -74,6 +79,7 @@ def build_desktop(
             NotebookDomAdapter(
                 page,
                 download_handoff=PlaywrightArtifactDownload(validator),
+                interactable_guard=ensure_notebook_interactable,
             ),
             recover_page=browser.restart,
             persist_identity=job_repository.save,
@@ -112,6 +118,8 @@ def build_desktop(
         pipeline_factory=pipeline_factory,
         recovery_pipeline_factory=recovery_pipeline_factory,
         cleanup=browser.stop,
+        abort_owned_external=getattr(browser, 'abort_owned_automation', None),
+        shutdown_diagnostic=getattr(browser, 'shutdown_diagnostic', None),
         scheduler=scheduler,
         manual_login=browser.open_login,
         browser_status_provider=browser.runtime_status,

@@ -58,6 +58,7 @@ class AsyncControllerBridge(QObject):
     """Runs controller commands away from the UI thread and relays immutable data."""
 
     jobs_changed = Signal(object)
+    job_changed = Signal(object)
     status_changed = Signal(object)
     log_received = Signal(object)
     operation_started = Signal(str)
@@ -79,6 +80,9 @@ class AsyncControllerBridge(QObject):
         self._lock = threading.Lock()
         self._closing = False
         self._tasks: set[_ControllerTask] = set()
+        bind_job = getattr(controller, 'bind_job', None)
+        if callable(bind_job):
+            bind_job(self.publish_job)
         binder = getattr(controller, "bind", None)
         if callable(binder):
             binder(
@@ -132,6 +136,9 @@ class AsyncControllerBridge(QObject):
         return self._invoke("pause", self.controller.pause)
 
     def stop(self) -> bool:
+        request = getattr(self.controller, 'request_stop', None)
+        if callable(request):
+            request()
         return self._invoke("stop", self.controller.stop)
 
     def login(self) -> bool:
@@ -143,8 +150,16 @@ class AsyncControllerBridge(QObject):
     def refresh_credit(self) -> bool:
         return self._invoke("credit", self.controller.refresh_credit)
 
+    def delete_completed(self, job_ids: list[str]) -> bool:
+        return self._invoke("delete_completed", lambda: self.controller.delete_completed(job_ids))
+
     def retry(self, job_id: str, stage: str) -> bool:
         return self._invoke(f"retry:{stage}", lambda: self.controller.retry(job_id, stage))
+
+    @Slot(object)
+    def publish_job(self, job: object) -> None:
+        if not self._closing:
+            self.job_changed.emit(job)
 
     @Slot(object)
     def publish_jobs(self, jobs: object) -> None:

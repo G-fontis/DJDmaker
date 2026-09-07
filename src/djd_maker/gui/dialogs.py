@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QPushButton,
     QSpinBox,
     QTableView,
@@ -336,6 +337,16 @@ class JobDetailDialog(QDialog):
         form.addRow("生成開始", QLabel(job.generation_started_at or "－"))
         form.addRow("最終確認", QLabel(job.last_polled_at or "－"))
         form.addRow("次回確認", QLabel(job.next_poll_at or "－"))
+        for caption, value in (
+            ('Phase', job.presentation_phase), ('Stage', job.presentation_stage),
+            ('Source', job.source_status), ('Preset ID', job.preset_id),
+            ('Preset名', job.preset_name), ('Preset SHA-256', job.preset_body_sha256),
+            ('Reply / 判定', job.runtime_reason), ('判定結果', job.runtime_outcome),
+            ('TXT move', job.txt_move_status), ('TXT保存先', job.archived_txt_path),
+        ):
+            label = QLabel(value or '－')
+            label.setWordWrap(True)
+            form.addRow(caption, label)
         form.addRow("Credit状態", QLabel(job.credit_state or "CREDIT_UNKNOWN"))
         form.addRow(
             "Credit残量",
@@ -364,7 +375,13 @@ class JobDetailDialog(QDialog):
         error = QLabel(job.error_message or "－")
         error.setWordWrap(True)
         form.addRow("エラー詳細", error)
-        layout.addLayout(form)
+        form_widget = QWidget()
+        form_widget.setLayout(form)
+        details_scroll = QScrollArea()
+        details_scroll.setWidgetResizable(True)
+        details_scroll.setWidget(form_widget)
+        layout.addWidget(details_scroll, 1)
+        self.resize(820, 680)
 
         timeline = QGroupBox("工程タイムライン")
         timeline_layout = QHBoxLayout(timeline)

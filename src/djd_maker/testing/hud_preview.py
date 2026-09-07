@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 from dataclasses import replace
@@ -149,8 +150,13 @@ def _capture(widget, destination: Path, size: tuple[int, int] | None = None) -> 
         widget.resize(*size)
     widget.show()
     QApplication.processEvents()
+    if isinstance(widget, MainWindow) and size is not None:
+        assert (widget.width(), widget.height()) == size
+        assert all(button.isVisibleTo(widget) for button in (widget.start_button, widget.stop_button, widget.recover_button))
     if not widget.grab().save(str(destination), "PNG"):
         raise RuntimeError(f"SCREENSHOT_SAVE_FAILED: {destination}")
+    destination.with_suffix('.json').write_text(json.dumps({'width':widget.width(),'height':widget.height(),
+        'device_pixel_ratio':widget.devicePixelRatioF(),'requested':size}),encoding='utf-8')
     widget.hide()
 
 
@@ -188,6 +194,10 @@ def render_previews(output_directory: Path) -> list[Path]:
             preset_repository=presets,
         )
         window.set_jobs(jobs)
+        window._apply_runtime_status({'runtime':{'job_id':jobs[0].id,'job':jobs[0].script_name,
+            'notebook':'https://notebook.google.com/notebook/preview-only','phase':'動画回収・変換フェーズ',
+            'stage':'hls.start','decision':'RAW検証済み','next_action':'HLS変換',
+            'outcome':'処理中','attempt':'1/3','elapsed':12,'processed':1,'total':len(jobs)}})
         window._apply_runtime_status(
             {
                 "credit_state": "CREDIT_AVAILABLE",

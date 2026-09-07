@@ -1,5 +1,32 @@
 # 開発ルール
 
+## Ver1.2.3 Phase2統合（最新指示優先）
+
+- `DJD-CHAPPY-V123-PHASE2-EXISTING-BRANCH-HUD-INTEGRATION-FULL-001`に従い、既存phase2だけで統合する。mainはf35ba70815822d8f253b66da6f71e6d35f889ab2を参照専用として保護し、mainへのcommit/merge/pushを行わない。
+- BackendはVer1.2.3を正本とし、既存HUDの配色・構成を保持して即時row更新とRuntimeを接続する。新規phase2-v123/phase3 branchやAnimationは作らない。経過時間の文字更新用に既存v123の1秒timerだけを保持する。
+- Phase A/B、RAW gate、Ending任意、認証、Stop/Close、本番177 JSON保護を維持。テスト・portable gate通過後のみphase2へ通常commit/pushする。
+
+## Ver1.2.3候補：生成優先と状態表即時更新
+
+- 最新正式指示`DJD-CHAPPY-V123-GENERATION-FIRST-CLOUD-THEN-LOCAL-LIVE-STATUS-REFRESH-FULL-001`を優先する。過去の完成artifact即回収規則はPhase B内に限定する。
+- Phase Aは未生成jobを1件ずつcheck→生成開始/予約→保存→next。全jobの投入完了または理由確定terminal後にPhase Bへ進む。Phase A中のDownload/Ending/HLS/ZIPは禁止。
+- 状態と工程をatomic JSONへ保存成功後、snapshot eventをQt signalでGUI threadへ渡し、job_idで該当rowと集計を即更新する。全表再構築・workerからQt widget直接操作・保存失敗時の成功表示は禁止。
+- sort/checkbox/scroll/選択rowを保持し、stop/close/RAW gate/Ending任意/元3engine機能を維持する。本番JSONは変更せず、test/copyで検証する。全Gate通過前のversion bump/build/commit/pushは禁止。
+
+## Ver1.2.2候補：逐次再開と可視化
+
+- 最終release指示`DJD-CHAPPY-V122-FINAL-RELEASE-BUILD-COMMIT-PUSH-FULL-001`では、既存live証跡を引き継ぎ、source/portable/移行/監査Gate通過後にVer1.2.2としてcommit・main通常pushする。追加の動画生成やPhase2統合は行わない。旧配布物cleanupが環境ポリシーに拒否された場合は迂回せず、対象・容量・保持理由をrelease記録へ残す。
+
+- 指示 `DJD-CHAPPY-V121-SEQUENTIAL-RESUME-RUNTIME-VISIBILITY-MODAL-FULL-001` を適用する。通常Startの全件remote pre-scanは禁止。各jobを確認・判断保存・必要工程実行・結果保存してから次Notebookへ進む。
+- COMPLETEDと自動再開不可FAILEDはremoteを開かない。待機は既存の永続`next_poll_at`（要求のnext_check_atに相当）を使う。期限前に開かない。
+- 白GUIへ現在job/Notebook/phase/stage/decision/next action/outcome/attempt/elapsed/countと一般利用者向けmessageを表示する。Phase2 HUDは変更しない。
+- 完成artifactは同一jobでDownload→RAW gate→artifact削除→Ending任意→HLS/ZIP→TXT移動まで進める。すでにローカルにあるRAWのFFmpeg並列数1/2は維持する。
+- 不明状態・no-opを黙って巡回しない。理由をJSONとGUIへ残し、3件連続なら安全停止する。告知modalで次Notebookへskipせず、閉じて操作可能を確認するか安全停止する。
+- 本番JSONをAcceptanceで書き換えない。コピー側で本番artifactを削除すると本番側が未回収になるため、live削除試験は本番処理から切り離した対象で行う。
+- 2026-09-07追加承認: 本番の既存生成失敗Notebookをlive送信試験に使用可。まず1件、Quota履歴/未送信を両方確認できない場合のみ最大2件。state保存はtest/copy側だけとし、原本177 JSONを保持する。生成成功後の動画はremoteに残し、後から通常の未回収/Download処理で回収する。
+- 続行指示`DJD-CHAPPY-V122-SEQUENTIAL-RECOVERY-LIVE-CONTINUE-FULL-001`: TAX120/HT075はcopy側の保存済み期限到達後に再確認する。完成を検出した1件について実Download→12項目RAW gate→artifact削除→Ending任意→HLS/ZIP→TXT moveを許可する。原本JSONは変更せず、完成RAW/ZIPとcopy checkpointの所在を必ず引き継ぐ。Notebook/sourceの削除はしない。
+- source/live Gateをすべて満たすまでVersion変更・build・commit・pushを行わない。modal自然再現がない場合の`UNVERIFIED_LIVE`は許容するが、他の4種live Gateを免除しない。
+
 ## 作業終了通知音
 
 - 開発作業を中断するとき、および依頼された作業を完了するときは、次の音源を再生する。
@@ -17,6 +44,9 @@
 - 並行処理時は、全agentの状態を確認してから再生可否を判断する。
 
 ## 認証・ブラウザ変更のRelease Gate
+
+- 2026-09-07追加指示: Endingファイル選択は動作必須条件にしない。未選択時はEnding結合をスキップし、再検証したRAWを変更せずHLS/ZIPへ渡す。選択済みファイルが消失した場合は未選択と混同せず、再選択・設定解除を案内する。
+- 2026-09-07補正: 告知modalのlive自動dismiss未確認は既知事項として許容し、fixtureで安全性を担保する。強制再現をしない。他のStop/Close/配布Gateは免除されない。
 
 - 認証またはブラウザ起動方式を変更するreleaseでは、既存Cookie/sessionをコピーしないFresh Profile Sign-in Acceptanceを必須とする。
 - Warm profileの成功だけをFresh認証の証拠にしてはならない。Fresh、Warm、期限切れsessionを分けて記録する。
@@ -38,6 +68,12 @@
 - `raw_files`、`output`、ユーザー設定、利用中browser profileなどユーザーデータをBuild Cleanupで削除しない。
 
 ## Credit reservation / recovery
+
+- 最終Gate補正`DJD-CHAPPY-V12-FINAL-RELEASE-GATE-CONTINUE-FULL-001`ではsource upload errorのlive復旧だけを`UNVERIFIED_LIVE`として許容する。原因不明の完了を修正成功とせず、fixture安全性確認と自然再発時の追加Acceptanceを維持する。現在のrelease記録は`docs/v12-final-release-gate.md`を参照する。
+- Ver1.2候補（指示002）では、human Start時に過去のquota返信だけで予約へ送らない。既存artifactを先に診断し、生成未開始なら中央Chatへ今回のpreset snapshotを送信し、そのuser message以降の返信だけを分類する。現行候補のrelease判定は`docs/v12-quota-resume-migration.md`に記録する。
+- 中央Chatのcontainer配下で入力先を確定する。source検索欄を除外し、全文readback、送信button有効化、今回user message、今回replyを順に確認する。最大3attempt、返信待機は元GNBの180秒を基準とし、再送直前に遅延返信を確認する。
+- FAILEDを一律に新規job/Notebookへ置換しない。既存remote・RAW等を診断し、同じjob IDとpreset snapshotを保持して再開する。COMPLETEDは再生成しない。
+- 完成TXTの移動失敗はCOMPLETEDを変更しない。同名異内容は上書きせず補助状態を記録する。完成job一覧削除では成果物とremoteを保持し、削除記録をJSONへ残して再読込による復活を防ぐ。
 
 - NotebookLMのクレジット枯渇はsource本文ではなく、visibleなstatus/alert/live surfaceの明示表示だけで判定する。残量percentageが取得できなくても枯渇表示を優先する。
 - 枯渇時に即時生成を反復しない。同一jobで即時生成と予約生成を二重実行しない。

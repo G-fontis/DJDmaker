@@ -1,6 +1,6 @@
 # Phase 2 Static HUD
 
-Phase 2 is the presentation-only branch for the Ver1.1 functional baseline. It introduces a static control-room HUD while preserving the existing application, controller, scheduler, adapter, persistence, browser, credit, reservation, recovery, media, and packaging behavior.
+Phase 2 integrates the approved static HUD with the Ver1.2.3 functional baseline (`f35ba70815822d8f253b66da6f71e6d35f889ab2`). Only the existing phase2 branch is changed; main is read-only. Backend business logic is identical to that baseline, including generation-first dispatch, due-only collection, atomic stage persistence, RAW safety, optional Ending and safe shutdown.
 
 ## Layout
 
@@ -12,7 +12,7 @@ Phase 2 is the presentation-only branch for the Ver1.1 functional baseline. It i
 
 ## Safety boundaries
 
-- No timers, animations, pulses, moving gradients, particles, or background motion are used.
+- No animations, pulses, moving gradients, particles, or background motion are used. The inherited Ver1.2.3 elapsed-time text uses one 1-second timer; it does not animate the HUD.
 - No sample values are injected during normal startup.
 - Preview values live only in `djd_maker.testing.hud_preview` and are never imported by the production composition root.
 - Embedded and detached logs use the existing redaction rules before display.

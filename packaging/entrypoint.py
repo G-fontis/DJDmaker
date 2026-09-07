@@ -109,7 +109,9 @@ def _hud_smoke(output_directory: Path, report_path: Path) -> int:
     """Render the packaged production widgets; never entered by normal startup."""
     if os.environ.get("DJD_PACKAGING_SMOKE") != "1":
         return 3
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from djd_maker.core.models import JobState
 
     from djd_maker.core.repositories import JobRepository, PresetRepository, SettingsRepository
     from djd_maker.gui.app import build_desktop
@@ -137,6 +139,7 @@ def _hud_smoke(output_directory: Path, report_path: Path) -> int:
 
     try:
         capture(window, "exe_main_1920x1080.png", 1920, 1080)
+        capture(window, "exe_main_1600x900.png", 1600, 900)
         capture(window, "exe_main_1280x720.png", 1280, 720)
         settings_dialog = SettingsDialog(settings, preset_repository=presets)
         capture(settings_dialog, "exe_settings.png", 820, 650)
@@ -162,7 +165,25 @@ def _hud_smoke(output_directory: Path, report_path: Path) -> int:
             window.log_button,
             window.details_button,
         )
-        passed = len(paths) == 6 and all(path.is_file() for path in paths) and all(
+        window.job_table.sortItems(1, Qt.SortOrder.DescendingOrder)
+        completed = next(job for job in jobs if job.state is JobState.COMPLETED)
+        row = next(r for r in range(window.job_table.rowCount()) if window.job_table.item(r,0).data(Qt.ItemDataRole.UserRole)==completed.id)
+        window.job_table.selectRow(row)
+        window.job_table.item(row,6).setCheckState(Qt.CheckState.Checked)
+        assert window._selected_job().id == completed.id and completed.id in window._checked_job_ids
+        preserved = [Path(p) for p in (completed.raw_path, completed.zip_path, completed.archived_txt_path) if p]
+        question = QMessageBox.question
+        try:
+            QMessageBox.question = lambda *args, **kwargs: QMessageBox.StandardButton.Yes
+            window._delete_jobs(False)
+            deadline = time.monotonic()+10
+            while time.monotonic()<deadline and any(j.id==completed.id for j in window.jobs):
+                application.processEvents()
+                time.sleep(0.02)
+        finally:
+            QMessageBox.question = question
+        deletion_passed = not any(j.id==completed.id for j in window.jobs) and all(p.is_file() for p in preserved)
+        passed = deletion_passed and len(paths) == 7 and all(path.is_file() for path in paths) and all(
             button.text().strip() for button in buttons
         )
     finally:
@@ -171,6 +192,7 @@ def _hud_smoke(output_directory: Path, report_path: Path) -> int:
         json.dumps(
             {
                 "passed": passed,
+                "sort_checkbox_delete_preserves_files": deletion_passed,
                 "screenshots": [str(path) for path in paths],
                 "sidebar_button_count": 9,
                 "job_columns": list(window.JOB_COLUMNS),
@@ -217,6 +239,12 @@ def _preset_smoke(report_path: Path) -> int:
 
 
 def _dispatch() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-sequential-smoke':
+        from djd_maker.packaging.sequential_smoke import run_sequential_smoke
+        return run_sequential_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-shutdown-smoke':
+        from djd_maker.packaging.shutdown_smoke import run_shutdown_smoke
+        return run_shutdown_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) in {4, 5} and sys.argv[1] == "--packaging-settings-smoke":
         expected_value = int(sys.argv[4]) if len(sys.argv) == 5 else 137
         return _settings_smoke(sys.argv[2], Path(sys.argv[3]), expected_value)

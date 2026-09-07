@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
+from djd_maker.core.cancellation import checkpoint
 from uuid import uuid4
 
 from djd_maker.core.interfaces import MediaResult
@@ -51,7 +52,12 @@ class RawSafeStore:
         staging = destination.with_name(f".{destination.name}.{uuid4().hex}.staging")
         try:
             with source_path.open("rb") as read_stream, staging.open("xb") as write_stream:
-                shutil.copyfileobj(read_stream, write_stream)
+                while True:
+                    checkpoint('raw.copy')
+                    chunk = read_stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    write_stream.write(chunk)
                 write_stream.flush()
                 os.fsync(write_stream.fileno())
             if staging.stat().st_size != source_result.size_bytes:
@@ -62,6 +68,7 @@ class RawSafeStore:
             try:
                 # A same-directory hard link is an atomic no-overwrite publish:
                 # unlike os.replace it cannot erase a destination won in a race.
+                checkpoint('raw.publish')
                 os.link(staging, destination)
             except FileExistsError:
                 raise RawStoreCollisionError(

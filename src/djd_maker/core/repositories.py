@@ -531,6 +531,8 @@ class JobRepository:
 
     def get(self, job_id: str) -> Job | None:
         document = self._document(job_id)
+        if job_id in self._deleted_records():
+            return None
         try:
             value = document.load()
         except FileNotFoundError:
@@ -556,7 +558,10 @@ class JobRepository:
             return [], {}
         jobs: list[Job] = []
         errors: dict[str, str] = {}
+        deleted = self._deleted_records()
         for path in sorted(self.directory.glob("*.json")):
+            if path.stem in deleted:
+                continue
             document = self._document(path.stem)
             try:
                 jobs.append(self._decode(document.load(), path))
@@ -667,6 +672,41 @@ class JobRepository:
             JobState.DOWNLOAD_PENDING,
         }
         return list({job.id: job for job in self.list() if job.state in pending_states}.values())
+
+    def delete_completed(self, job_ids: list[str]) -> None:
+        """Remove records only, after validating the entire requested selection."""
+        unique = list(dict.fromkeys(job_ids))
+        with _thread_lock(self.directory):
+            selected = [self.require(job_id) for job_id in unique]
+            if any(job.state is not JobState.COMPLETED for job in selected):
+                raise ValueError("未完了ジョブを含むため削除できません")
+            tombstones = _VersionedDocument(self.directory.parent / "deleted_jobs.json", "deleted_jobs", use_file_lock=False, replace_retry_delays=self.REPLACE_RETRY_DELAYS)
+            def remember(value):
+                for job in selected:
+                    value["records"][job.id] = str(Path(job.source_path).resolve())
+                return value
+            tombstones.update({"schema_version": SCHEMA_VERSION, "kind": "deleted_jobs", "records": {}}, remember)
+            for job in selected:
+                # Queue removal precedes record removal; crashes can only leave
+                # a completed record visible for the next delete retry.
+                queue_path = self.directory.parent / "queue.json"
+                if queue_path.is_file():
+                    QueueRepository(queue_path).remove(job.id)
+                document = self._document(job.id)
+                with document._operation_lock():
+                    document._cleanup_temporaries()
+                    document.path.unlink()
+                    document.backup_path.unlink(missing_ok=True)
+
+    def deleted_source_paths(self) -> set[str]:
+        return set(self._deleted_records().values())
+
+    def _deleted_records(self) -> dict[str, str]:
+        document = _VersionedDocument(self.directory.parent / "deleted_jobs.json", "deleted_jobs", use_file_lock=False)
+        if not document.path.exists() and not document.backup_path.exists():
+            return {}
+        value = document.load({"schema_version": SCHEMA_VERSION, "kind": "deleted_jobs", "records": {}})
+        return value["records"]
 
 
 class QueueRepository:
