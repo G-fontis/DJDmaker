@@ -27,7 +27,7 @@ def parse_limit_text(message: str, *, now: datetime, chat_disabled=False):
         raise ValueError('limit clock must be timezone-aware')
     compact = re.sub(r'\s+', '', message)
     strong = 'AIの使用量上限に達しました' in compact or ('チャットは' in compact and 'まで無効' in compact)
-    secondary = '使用量上限' in compact and '利用可能' in compact
+    secondary = '使用量上限' in compact and '利用可能' in compact and not is_limit_warning(message)
     english = message.lower().replace('’', "'")
     strong = strong or bool(re.search(
         r"(?:you(?:'ve| have) reached (?:your |the )?(?:ai )?(?:usage )?limit|"
@@ -55,7 +55,9 @@ def parse_limit_text(message: str, *, now: datetime, chat_disabled=False):
 
 def is_limit_warning(message: str) -> bool:
     """An approaching limit is not exhaustion while the chat remains enabled."""
-    return bool(re.search(r'almost at (?:your |the )?(?:ai )?usage limit', message, re.I))
+    return bool(re.search(
+        r'\b(?:almost at|near(?:ing)?|approaching|close to)\s+(?:(?:your|the)\s+)?(?:ai\s+)?(?:usage\s+)?limit\b'
+        r'|上限\s*(?:が近|に近|に接近)', message, re.I))
 
 
 class CloudLimitGate:

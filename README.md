@@ -1,13 +1,13 @@
-# 台本から授業動画つくるマシーン Ver1.2.6
+# 台本から授業動画つくるマシーン Ver1.2.7
 
-台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
+台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、任意Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
 GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成<br>
 Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.2.6。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.2.7。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,7 +33,9 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.2.6`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.2.7`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+
+Ver1.2.7では、Source失敗を読み込み中と区別し、対象の失敗entryだけを除去して同じTXTを再uploadします。正常SourceやNotebookは削除しません。動画生成失敗時はStudioの再試行ボタンを使わず、job開始時に保存したPreset本文を中央Chatへ再送し、新しい生成状態を確認します。再試行は最大3回、実上限中は保留します。詳細は[Ver1.2.7 検証記録](docs/v127-source-failed-retry-quota-priority.md)を参照してください。
 
 Ver1.2.4では1件のジョブ状態保存が既存の最大7回retryで復旧しない場合も、対象だけを「状態保存待ち」に隔離して他jobを続行します。Phase末尾で最大2回照合し、未解決は成功件数と分けて警告します。次回Startでは`system/recovery/deferred`のjournalとremote/local成果物を照合し、Preset・生成・予約・Downloadを盲目的に繰り返しません。journalも保存できなければmemoryに保持して警告します。詳細は[Ver1.2.4保存失敗隔離](docs/v124-jobstate-save-isolation.md)を参照してください。
 
@@ -47,11 +49,11 @@ Ver1.2.6では、AI使用量上限・Chat無効の明示表示、または今回
 
 画面下部の `GUIタイプ` から白基調PHASE1とCyber HUD PHASE2を選択できます。GUI選択は次回起動時も復元します。両画面は同じ操作ID・処理・Preset Repository/ViewModelを使用し、切替後はjob・runtime・presetを自動表示します。同一sessionのpreset選択は共有し、アプリ再起動時は未選択になります。切替は処理停止中のみで、一時停止中は切替できません。一時停止は次のNotebook移動・送信・Download・ローカル工程開始を止めます。開始済みの短い操作やFFmpegは安全checkpointまで進め、`授業動画作成開始`で同じ位置から再開します。独立した`再開`ボタンはありません。
 
-通常時はVer1.2.3以降の生成投入優先を維持します。Phase Aで未生成jobを1件ずつ確認→生成開始→保存→次jobへ進め、全対象の投入判定後にPhase BでDownload・RAW検証・Ending（任意）・HLS/ZIP・TXT移動を行います。上限検出時だけローカル処理へ切り替えます。生成待機は保存した次回確認時刻までNotebookを開かず、Phase Bで完成を検出したjobはその場で回収します。全jobの確認だけを先に行う事前巡回はしません。
+優先順位は生成→Local→期限到達Artifact確認/Download→Error Recovery→10分待機です。固定phaseへ居続けず、各taskの安全な完了境界で再評価します。上限解除時刻＋5分後に現在UIでChat有効・実上限なしを確認したら、未生成jobを次Localより優先します。開始済みFFmpegはkillせず、Ending/HLS完了後に切り替えます。検証済みHLSは保存し、後で再エンコードせずZIP工程から再開します。生成待機は保存した次回確認時刻までNotebookを開かず、全jobの確認だけを先に行う事前巡回もしません。
 
 工程ごとにJSON保存成功後、状態表の該当行・集計・Runtime表示を即時更新します。Stopや全件終了まで古い表示を残さず、ソート・チェック選択・スクロール位置を保持します。白GUIには現在Phase・Job・Notebook・工程・判断・次処理・結果・Attempt・経過時間・処理件数と日本語メッセージを表示します。検証記録は[Ver1.2.3](docs/v123-generation-first-live-status.md)を参照してください。
 
-既知事項: `ANNOUNCEMENT_MODAL_LIVE_AUTO_DISMISS: UNVERIFIED_LIVE`（fixture PASS）、`SOURCE_UPLOAD_ERROR_LIVE_RECOVERY: UNVERIFIED_LIVE`。自然再現していないため実機修正成功とは扱いません。詳細は[Ver1.2.2 release記録](docs/v122-final-release.md)を参照してください。
+既知事項: `ANNOUNCEMENT_MODAL_LIVE_AUTO_DISMISS: UNVERIFIED_LIVE`（fixture PASS）は継続します。Source失敗はVer1.2.7のREV018で自然再現し、単独再upload→READY→生成開始をlive確認しました。旧版で原因不明のまま完了した別Notebookの経緯まで解明したとは扱いません。
 
 Ending動画は任意です。設定を空にするとEnding結合をスキップし、検証済みRAWからHLS/ZIPを作成します。RAWそのものは変更しません。選択済みのEndingファイルが見つからない場合は、設定画面で再選択するかパスを空にしてください。
 
@@ -60,7 +62,7 @@ Ending動画は任意です。設定を空にするとEnding結合をスキッ�
 - COMPLETEDは再生成しません。完成時・起動時・Start時に残っている対応TXTをRAW保存先へ補完移動します。同名異内容を上書きせず、移動失敗でもCOMPLETEDを維持します。
 - checkboxで完成jobを選択削除、または完成jobを一括削除できます。成果物・Notebook・sourceは削除しません。列見出しで全件を自然順に並べ替えできます。
 - 旧版へ上書きせず、[Ver1.1→Ver1.2移行手順](docs/v12-final-release-gate.md)を確認してください。旧runtimeの自動importは行いません。
-- 既知事項：`SOURCE_UPLOAD_ERROR_LIVE_RECOVERY: UNVERIFIED_LIVE`。upload完了の経緯は不明で、live retry成功とは扱っていません。安全性fixtureを確認済みで、自然再発時に追加検証します。
+- Source失敗の旧記録と今回のlive復旧証跡は区別します。元TXT・本番JSONを変更せず、試験stateはcopy側だけに保存しています。
 
 初回は「動画生成プリセット」からプリセット名と本文を登録してください。Ending動画の指定は任意です。プリセット一覧は保存されますが、選択状態は起動をまたいで保持しません。起動ごとに使用するプリセットを選択してください。未選択のまま開始した場合はNotebook作成前にエラー停止し、default・test・前回選択presetの自動投入はありません。選択本文はjob開始時にsnapshotされ、source ready後にメインチャットへ入力します。入力直後のDOM readback完全一致、送信後のuser message安定表示、Notebook側の動画artifact生成開始を確認します。通常pipelineは動画解説カードやGenerateボタンを直接操作しません。
 
@@ -77,8 +79,8 @@ Start後のPre-flightと動画完成までの処理は自動で、正常時に�
 
 1. `input`へ台本TXTを配置し、設定画面で`raw_files`、`output`、Ending動画、動画生成プリセットを指定します。プリセット一覧は保存されますが、起動ごとに使用するプリセットを選択します。
 2. 必要な場合は`Googleログイン`を押し、通常Chromeでログイン後、そのChromeを閉じます。CookieやpasswordをアプリやGitへ保存しません。
-3. `授業動画作成開始`を押すと7項目の内部Pre-flight後、Notebook作成、rename、source投入、source ready監視、メインチャットへのpreset送信、Notebook側の自動動画生成、scheduler監視、Downloadをjob単位で実行します。sourceが5分以内にreadyにならない場合はNotebook名へ`FAILED_`を付け、新しいNotebookで1回だけ再試行します。
-4. DownloadしたMP4を検証して`raw_files`へ永久保存した後、動画artifactだけをWeb UIから削除します。Notebook本体とsourceは削除しません。
+3. `授業動画作成開始`を押すと7項目の内部Pre-flight後、Notebook作成、rename、source投入、source ready監視、メインチャットへのpreset送信、Notebook側の自動動画生成、scheduler監視、Downloadをjob単位で実行します。sourceの待機期限では状態を再診断し、明示的に失敗したentryだけを同じTXTで再uploadします（最大3回）。状態不明のままPresetを送信せず、Error Recoveryへ移します。
+4. DownloadしたMP4を検証して`raw_files`へ永久保存した後、動画artifactだけをWeb UIから削除します。Notebook本体と正常sourceは削除しません。失敗sourceの限定削除は前項の復旧時だけです。
 5. RAWにEnding処理を行い、6秒segmentのHLSと無圧縮ZIPを`output`へ作成します。
 
 一時停止は新しい工程の開始を止め、保存済みdeadlineとjob状態を維持します。再開・アプリ再起動後も同一NotebookやDownloadを重複作成しない設計です。RAWは後工程で上書き・削除されません。

@@ -1,5 +1,13 @@
 # 開発ルール
 
+## Ver1.2.7 優先指示
+
+- `DJD-CHAPPY-V127-SOURCE-FAILED-RETRY-QUOTA-PRIORITY-FULL-001` を適用。調査・実装中は1.2.6を維持し、source/live Gate前のversion変更・build、全Gate前のcommit/pushは禁止。
+- SourceをABSENT/UPLOADING/READY/FAILED/UNKNOWNに区別する。失敗を読み込み待ちにしない。対象を一意に再診断し、必要な失敗entryのみ除去して同TXTを再uploadする。正常source、Notebook、元TXTは削除しない。retryはjobへ永続化し最大3回、UNKNOWN/timeoutは再分類する。
+- failed video artifactはjob snapshot本文を中央Chatへ再送して復旧する。Studio再試行buttonは使用しない。再送前の現在状態照合、最大3回、上限中pending保持を必須とする。
+- 各taskの安全な完了境界でCapability/優先順位を再評価する。実行中Localをkillせず、Cloud復帰＋未生成ありなら次Localより生成を優先する。生成→Local→Artifact/Download→Error→10分待機を維持。
+- almostは非停止。前回確定の今回返信クォータ不足もCloud停止理由として維持し、確認/Download可否と分離する。本番JSON・phase2・元3repoを変更しない。自然条件がないlive項目はclock/capability injectionで区別して検証する。
+
 ## Ver1.2.6 優先指示
 
 - 2026-09-08追加確定: 今回のPreset送信に対応する新しい返信が「動画生成に必要な利用枠（クォータ）が不足」と示す場合も生成停止トリガーとする。実上限banner・Chat無効化を必須にせず、生成を後回しにしてLocal→完成確認/Downloadへ進む。新規予約・即時再送は行わない。過去返信やalmost警告だけでは発火させない。

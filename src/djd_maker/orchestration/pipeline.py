@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,7 +21,8 @@ from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.core.cancellation import RunCancelled, checkpoint
 from djd_maker.core.cloud_limit import CloudLimitGate, CloudLimitReached
 from djd_maker.adapters.notebook_modal import BlockingModalError
-from djd_maker.core.runtime_operation import operation_scope, report_operation
+from djd_maker.adapters.notebook import SourceRetryExhausted, GenerationRetryExhausted
+from djd_maker.core.runtime_operation import operation_scope, report_operation, local_task_scope, LocalTaskComplete
 
 
 class NoOpJobTransitionError(RuntimeError):
@@ -328,6 +329,31 @@ class PipelineCoordinator(DeferredRecovery):
                     job.error_message = '保存済み再確認日時が不正です。既存Notebookを再診断します。'
                     job.next_poll_at = None
                     self._save(job)
+        self._refresh_capabilities()
+        self._reject_output_name_collisions()
+        self._progress_jobs = {j.id:j for j in self.jobs.list()}
+        if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
+            self.wait_seconds = 0
+            self._scheduler_status(1, '生成投入')
+            self._phase_event('GENERATION_DISPATCH')
+            self._dispatch_only = True
+            try:
+                self._run_cycle_lane()
+            finally:
+                self._dispatch_only = False
+            checkpoint('phase.dispatch.complete')
+            self._retry_deferred()
+            if self._generation_preempts():
+                return
+        if self.phase != 'COLLECT_LOCAL':
+            if self.deferred_ids:
+                self._retry_deferred()
+            self._phase_event('COLLECT_LOCAL')
+        self._discover_remaining_tasks()
+
+    def _refresh_capabilities(self):
+        """Recheck on the browser owner thread, never inside an FFmpeg worker."""
+        checkpoint('capability.refresh')
         if self.cloud_limit.blocked:
             if self.cloud_limit.due:
                 recheck = getattr(self.notebook, 'recheck_cloud_limit', None)
@@ -345,28 +371,11 @@ class PipelineCoordinator(DeferredRecovery):
                         self.cloud_limit.defer_recheck()
                         self.runtime_callback(dict(stage='limit.recheck.failed', level='WARNING',
                             message=f'上限解除を確認できません。待機を維持して再確認します: {type(exc).__name__}'))
-            self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
-        self._reject_output_name_collisions()
-        self._progress_jobs = {j.id:j for j in self.jobs.list()}
-        if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
-            self.wait_seconds = 0
-            self._scheduler_status(1, '生成投入')
-            self._phase_event('GENERATION_DISPATCH')
-            self._dispatch_only = True
-            try:
-                self._run_cycle_lane()
-            finally:
-                self._dispatch_only = False
-            checkpoint('phase.dispatch.complete')
-            self._retry_deferred()
-            if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
-                return
-        if self.phase != 'COLLECT_LOCAL':
-            if self.deferred_ids:
-                self._retry_deferred()
-            self._phase_event('COLLECT_LOCAL')
         self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
-        self._discover_remaining_tasks()
+
+    def _generation_preempts(self):
+        self._refresh_capabilities()
+        return self.capabilities.can_generate and any(self._needs_dispatch(j) for j in self.jobs.list())
 
     def all_tasks_completed(self):
         return not self.deferred_ids and all(terminal(j) for j in self.jobs.list())
@@ -402,6 +411,8 @@ class PipelineCoordinator(DeferredRecovery):
         if any(j.state in self.MEDIA_STATES for j in self.jobs.list()):
             self._scheduler_status(2, 'ローカル処理')
         self._drain_limit_local(local_only=True)
+        if self._generation_preempts():
+            return
         # P3: Chat disabled does not disable artifact access. Check each due job
         # independently; the adapter remains responsible for current DOM readiness.
         now = self.cloud_limit.clock()
@@ -492,18 +503,41 @@ class PipelineCoordinator(DeferredRecovery):
             self.runtime_callback(dict(stage='limit.local', phase=self.phase, cloud_limit=self.cloud_limit.status(),
                 message='ローカル処理を実行しています。'))
         if local:
-            self._media_completed = 0
-            with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency) as pool:
-                futures = []
-                for i, job in enumerate(local, 1):
-                    checkpoint('media.dequeue', job.id)
-                    futures.append(pool.submit(copy_context().run, self._local_media_with_progress, job, i, len(local)))
-                for future in futures:
-                    future.result()
+            self._run_local_tasks(local)
         checkpoint('completed.txt.reconcile')
         if any(j.state is JobState.COMPLETED and j.zip_path for j in self.jobs.list()):
             self.reconcile_completed_txt()
         self._retry_deferred(local_only=True)
+
+    def _run_local_tasks(self, jobs):
+        """Submit only available slots; refresh priority before every next task.
+
+        Already running tasks finish normally. No executor backlog can start
+        another local job after generation becomes runnable.
+        """
+        self._media_completed = 0
+        pending = list(jobs)
+        with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency, thread_name_prefix='djd-ffmpeg') as pool:
+            active = {}
+            preempt = False
+            while pending or active:
+                preempt = preempt or self._generation_preempts()
+                while pending and len(active) < self.ffmpeg_concurrency and not preempt:
+                    job = pending.pop(0)
+                    checkpoint('media.dequeue', job.id)
+                    future = pool.submit(copy_context().run, self._local_media_with_progress,
+                                         job, 1, len(jobs), True)
+                    active[future] = job.id
+                if not active:
+                    break
+                finished, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    future.result()
+                    job_id = active.pop(future)
+                    latest = self.jobs.get(job_id)
+                    if latest and latest.state in self.MEDIA_STATES and job_id not in self.deferred_ids:
+                        pending.insert(0, latest)
+                preempt = preempt or self._generation_preempts()
 
     def _run_cycle_lane(self, *, selected_jobs=None, allow_collection=False) -> None:
         self._reject_output_name_collisions()
@@ -511,21 +545,17 @@ class PipelineCoordinator(DeferredRecovery):
         # This is local-only: no Notebook is inspected/opened by these workers.
         local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and not self._dispatch_only and job.id not in self.deferred_ids and job.artifact_status != 'DELETE_PENDING']
         if local_media:
-            self._media_completed = 0
-            with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency, thread_name_prefix='djd-ffmpeg') as pool:
-                futures = []
-                for index, job in enumerate(local_media, 1):
-                    checkpoint('media.dequeue', job.id)
-                    self._resume_attempted.add(job.id)
-                    futures.append(pool.submit(copy_context().run, self._local_media_with_progress, job, index, len(local_media)))
-                for future in futures:
-                    future.result()
+            self._run_local_tasks(local_media)
+            if self._generation_preempts():
+                return
         values = self.jobs.list() if selected_jobs is None else selected_jobs
         if self._dispatch_only:
             values = [job for job in values if self._needs_dispatch(job)]
         # Local ordering only. No remote pre-scan and no second execution queue.
         values.sort(key=lambda j: 0 if j.state in self.MEDIA_STATES or j.state is JobState.DOWNLOAD_PENDING else 1)
         for index, job in enumerate(values, 1):
+            if not self._dispatch_only and self._generation_preempts():
+                return
             if self.cloud_limit.blocked and not allow_collection:
                 break
             if job.id in self.deferred_ids:
@@ -572,7 +602,7 @@ class PipelineCoordinator(DeferredRecovery):
                         raise
                     report_operation('job.next', processed=index, next_action='次のジョブ')
 
-    def _local_media_with_progress(self, job: Job, index: int, total: int) -> None:
+    def _local_media_with_progress(self, job: Job, index: int, total: int, one_task=False) -> None:
         with self._job_boundary(job):
             started = time.monotonic()
             record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
@@ -586,7 +616,7 @@ class PipelineCoordinator(DeferredRecovery):
                 self.runtime_callback(dict(record))
             with operation_scope(update):
                 try:
-                    self._run_media_job(job)
+                    self._run_media_job(job, one_task=one_task)
                 except RunCancelled:
                     job.runtime_outcome = 'STOPPED'
                     job.runtime_reason = 'STOP_REQUESTED'
@@ -599,7 +629,8 @@ class PipelineCoordinator(DeferredRecovery):
                 # Media state is already durably saved; queue bookkeeping stays on
                 # the Notebook owner thread and is not shared across FFmpeg workers.
                 with self._media_progress_lock:
-                    self._media_completed += 1
+                    if job.state not in self.MEDIA_STATES:
+                        self._media_completed += 1
                     report_operation('job.result', outcome=job.state.value, processed=self._media_completed)
 
     def _idle_reason(self, job: Job) -> str | None:
@@ -725,7 +756,10 @@ class PipelineCoordinator(DeferredRecovery):
                 self._finish_job(job, 'NO_OP_JOB_TRANSITION', no_op=True)
                 return
         if job.state in self.MEDIA_STATES and not self._dispatch_only:
-            self._run_media_job(job)
+            while job.state in self.MEDIA_STATES:
+                if self._generation_preempts():
+                    break
+                self._run_media_job(job, one_task=True)
         self._finish_job(job, 'WAITING_REMOTE_ACCESS' if job.runtime_reason == 'WAITING_REMOTE_ACCESS' else
                          job.error_code or ('GENERATION_ALREADY_STARTED' if job.state is JobState.WAITING_VIDEO else job.state.value))
         if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}:
@@ -951,7 +985,16 @@ class PipelineCoordinator(DeferredRecovery):
                 self._save(job)
                 if status != "READY":
                     if status == "FAILED":
-                        raise RuntimeError("remote video generation failed")
+                        # Keep identity and snapshot. Dispatch will inspect the
+                        # present state again before a bounded central-chat retry.
+                        job.state = JobState.WAITING
+                        job.resume_checkpoint = 'FAILED_ARTIFACT_RETRY'
+                        job.runtime_reason = 'GENERATION_RETRY_PENDING'
+                        job.next_poll_at = None
+                        self._save(job)
+                        report_operation('generation.retry.pending', decision='FAILED_ARTIFACT',
+                                         next_action='上限解除後Preset再送' if self.cloud_limit.blocked else 'Priority 1でPreset再送')
+                        return
                     if self.scheduler is None:
                         job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
                         self._save(job)
@@ -1016,6 +1059,12 @@ class PipelineCoordinator(DeferredRecovery):
                     job.error_code = "REMOTE_ARTIFACT_DELETE_FAILED"
                     job.error_message = str(exc)
                     self._save(job)
+        except (SourceRetryExhausted, GenerationRetryExhausted) as exc:
+            job.error_code = str(exc).split(':', 1)[0]
+            job.error_message = str(exc)
+            job.failure_class = 'TERMINAL_FAILED'
+            job.state = JobState.FAILED
+            self._save(job)
         except CloudLimitReached as exc:
             self.cloud_limit.block(exc.observation, notebook_url=job.notebook_url)
             # A Chat limit must never erase an existing generation/download
@@ -1073,10 +1122,10 @@ class PipelineCoordinator(DeferredRecovery):
                     job.error_code = job.error_code or "NOTEBOOK_STAGE_FAILED"
                 self._transition(job, JobState.FAILED)
 
-    def _run_media_job(self, job: Job) -> None:
+    def _run_media_job(self, job: Job, *, one_task=False) -> None:
         try:
             checkpoint('media.start', job.id)
-            if job.artifact_status == 'DELETE_PENDING' and job.notebook_id and not self.cloud_limit.blocked:
+            if job.artifact_status == 'DELETE_PENDING' and job.notebook_id and not self.cloud_limit.blocked and not one_task:
                 require_remote_deletion_gate(job.safety_gate)
                 try:
                     status = self.notebook.inspect_status(job)
@@ -1112,6 +1161,8 @@ class PipelineCoordinator(DeferredRecovery):
                     job.ending_result = 'SKIPPED (not configured)'
                     report_operation('ending.skip', decision='RAW_READY', next_action='HLS変換')
                     self._transition(job, JobState.HLS_ENCODING)
+                    if one_task:
+                        return
 
             if job.state is JobState.ENDING:
                 existing_is_valid = False
@@ -1139,6 +1190,8 @@ class PipelineCoordinator(DeferredRecovery):
                     job.ending_result = "PASS (checkpoint)"
                 report_operation('ending.complete')
                 self._transition(job, JobState.HLS_ENCODING)
+                if one_task:
+                    return
 
             if job.state in {JobState.HLS_ENCODING, JobState.ZIPPING}:
                 resuming_zip_publish = job.state is JobState.ZIPPING
@@ -1151,19 +1204,24 @@ class PipelineCoordinator(DeferredRecovery):
                         raise FileExistsError(f"不正な既存ZIPを上書きしません: {output_zip}")
                     job.zip_path = str(output_zip)
                 else:
-                    if job.hls_checkpoint_directory:
-                        result = self.hls.resume_validated(Path(job.edited_path or edited), output_zip,
-                            Path(job.hls_checkpoint_directory), job.hls_source_sha256,
-                            Path(job.zip_checkpoint_path) if job.zip_checkpoint_path else None)
-                    else:
-                        result = self.hls.convert_validate_and_zip(
-                            Path(job.edited_path or edited), output_zip
-                        )
+                    with local_task_scope(one_task):
+                        if job.hls_checkpoint_directory:
+                            result = self.hls.resume_validated(Path(job.edited_path or edited), output_zip,
+                                Path(job.hls_checkpoint_directory), job.hls_source_sha256,
+                                Path(job.zip_checkpoint_path) if job.zip_checkpoint_path else None)
+                        else:
+                            result = self.hls.convert_validate_and_zip(
+                                Path(job.edited_path or edited), output_zip
+                            )
                     job.zip_path = str(result.zip_path)
                 job.hls_result = "PASS"
                 if job.state is JobState.HLS_ENCODING:
                     self._transition(job, JobState.ZIPPING)
                 self._transition(job, JobState.COMPLETED)
+        except LocalTaskComplete:
+            # hls.complete persisted the validated directory and input digest.
+            # The owner thread refreshes capability before scheduling ZIP.
+            return
         except RunCancelled:
             job.resume_checkpoint = 'STOPPED:' + job.state.value
             self._save(job)

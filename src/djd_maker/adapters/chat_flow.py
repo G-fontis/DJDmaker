@@ -105,10 +105,10 @@ class ChatFlow:
             self.page.wait_for_timeout(2000)
         return None
 
-    def send(self, prompt):
+    def send(self, prompt, *, max_attempts=3):
         baseline = None
         last_target_error = None
-        for attempt in range(1, 4):
+        for attempt in range(1, max_attempts+1):
             checkpoint('chat.retry')
             self.check_limit()
             from djd_maker.core.runtime_operation import report_operation
@@ -156,4 +156,4 @@ class ChatFlow:
                     return result
         if last_target_error is not None:
             raise last_target_error
-        raise ChatFlowError("PRESET_RESPONSE_TIMEOUT: 3回の送信試行で今回の生成開始・クォータ返信を確認できません")
+        raise ChatFlowError(f"PRESET_RESPONSE_TIMEOUT: {max_attempts}回の送信試行で今回の生成開始・クォータ返信を確認できません")

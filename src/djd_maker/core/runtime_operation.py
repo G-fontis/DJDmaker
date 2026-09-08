@@ -3,8 +3,28 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 _sink = ContextVar('runtime_sink', default=None)
+_yield_after_hls = ContextVar('yield_after_hls', default=False)
+
+
+class LocalTaskComplete(Exception):
+    """Validated, durably checkpointed HLS yielded before starting ZIP."""
+
+
+@contextmanager
+def local_task_scope(enabled):
+    marker = _yield_after_hls.set(enabled)
+    try:
+        yield
+    finally:
+        _yield_after_hls.reset(marker)
 
 LABELS = {
+    'generation.failed.retry': '失敗動画のPreset再送',
+    'generation.retry.pending': '失敗動画の再生成待ち',
+    'generation.retry.confirm': '再生成開始をStudioで確認',
+    'source.failed.remove': '失敗Sourceを単独で除去',
+    'source.failed.remove.confirm': '失敗Sourceの消失確認',
+    'capability.refresh': '実行可否・優先順位を再確認',
     'limit.warning': 'AI使用量上限に接近（生成継続）',
     'save.deferred': '状態保存待ち・他job続行', 'save.retry': '状態保存を再試行',
     'save.recovered': '状態保存を復旧', 'save.unresolved': '状態保存保留',
@@ -70,6 +90,8 @@ def report_operation(stage, **fields):
     sink = _sink.get()
     if sink is not None:
         sink(stage, fields)
+        if stage == 'hls.complete' and _yield_after_hls.get():
+            raise LocalTaskComplete()
 
 
 @contextmanager

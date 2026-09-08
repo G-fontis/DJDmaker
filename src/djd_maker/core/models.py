@@ -130,6 +130,7 @@ class Job:
     # preset_body_snapshot only and never treats this field as a fallback.
     generation_prompt: str | None = None
     generation_started_at: str | None = None
+    generation_retry_turn_count: int | None = None
     next_poll_at: str | None = None
     last_polled_at: str | None = None
     credit_state: str = "CREDIT_UNKNOWN"

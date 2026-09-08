@@ -6,7 +6,7 @@ import re
 import shutil
 import subprocess
 from djd_maker.core.cancellation import run_process, checkpoint
-from djd_maker.core.runtime_operation import report_operation
+from djd_maker.core.runtime_operation import report_operation, LocalTaskComplete
 import tempfile
 from hashlib import sha256
 from djd_maker.core.deferred_state import SaveDeferred
@@ -291,7 +291,7 @@ class HlsAdapter:
             published = True
             report_operation('zip.complete', next_action='完成状態保存')
             return HlsResult(hls_directory, playlist, segments, output_zip)
-        except SaveDeferred:
+        except (SaveDeferred, LocalTaskComplete):
             preserve_checkpoint = True
             raise
         finally:

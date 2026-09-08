@@ -160,6 +160,10 @@ class DeferredRecovery:
             target = {'READY': JobState.DOWNLOAD_PENDING, 'GENERATING': JobState.WAITING_VIDEO,
                       'WAITING': JobState.RESERVED_WAITING_CREDIT_RESET,
                       'SCHEDULED_REMOTE': JobState.RESERVED_WAITING_CREDIT_RESET}.get(status)
+            if status == 'FAILED' and job.generation_retry_turn_count is not None:
+                # Preserve the claimed chat boundary. The retry adapter must
+                # reconcile it before sending; never erase it on save recovery.
+                target = JobState.WAITING
             if target is None:
                 # Only a pre-chat checkpoint can be safely retried in place.
                 # NOT_STARTED after a possible send is NOT proof of no send.

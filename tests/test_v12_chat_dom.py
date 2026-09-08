@@ -129,8 +129,16 @@ def test_source_retry_is_scoped_to_matching_error_card(page, tmp_path):
     }""")
     dom = NotebookDomAdapter(page)
     dom.wait_for_source_ready = lambda _: None
+    removed = []
+    def remove(name):
+        removed.append(name)
+        page.locator('.single-source-container').filter(has=page.get_by_role('button', name=name, exact=True)).evaluate('e=>e.remove()')
+    dom.remove_failed_source = remove
+    uploaded = []
+    dom.upload_txt = lambda path: uploaded.append(path.name)
     dom.ensure_source(tmp_path / 'lesson.txt')
-    assert page.evaluate('window.targetRetries') == 1
+    assert removed == uploaded == ['lesson.txt']
+    assert page.evaluate('window.targetRetries') == 0
     assert page.evaluate('window.otherRetries') == 0
 
 
@@ -138,7 +146,7 @@ def test_source_retry_missing_preserves_failed_card(page, tmp_path):
     from djd_maker.adapters.notebook import SourceProcessingError
     page.locator('.source-panel').evaluate("""p=>p.innerHTML=`<div class='single-source-container'><button class='source-stretched-button' aria-label='lesson.txt'>lesson.txt</button><span>ソースのアップロード中にエラー</span></div>`""")
     dom = NotebookDomAdapter(page)
-    with pytest.raises(SourceProcessingError, match='再試行UI'):
+    with pytest.raises(SourceProcessingError, match='source専用menu'):
         dom.ensure_source(tmp_path / 'lesson.txt')
     assert page.locator('.single-source-container').count() == 1
 
@@ -156,7 +164,7 @@ def test_source_error_material_tooltip_is_read_by_association(page):
     assert NotebookDomAdapter(page).source_state('lesson.txt') == "ERROR"
 
 
-def test_persistent_source_error_retries_at_most_three_without_reupload(page, tmp_path):
+def test_persistent_source_error_reuploads_at_most_three_without_duplicates(page, tmp_path):
     from djd_maker.adapters.notebook import SourceProcessingError
     page.locator('.source-panel').evaluate("""p=>{
       p.innerHTML=`<div class='single-source-container'><button aria-label='lesson.txt'>lesson.txt</button><span>ソースのアップロード中にエラー</span><button class='retry'>再試行</button></div>`;
@@ -166,9 +174,19 @@ def test_persistent_source_error_retries_at_most_three_without_reupload(page, tm
     def still_error(_name):
         raise SourceProcessingError("SOURCE_UPLOAD_FAILED: persistent fixture error")
     dom.wait_for_source_ready = still_error
-    dom.upload_txt = lambda _: pytest.fail("existing source must not be duplicated")
+    removed, uploaded = [], []
+    def remove(name):
+        removed.append(name)
+        page.locator('.single-source-container').evaluate('e=>e.remove()')
+    def upload(path):
+        assert page.locator('.single-source-container').count() == 0
+        uploaded.append(path.name)
+        page.locator('.source-panel').evaluate("p=>p.innerHTML+=`<div class='single-source-container'><button aria-label='lesson.txt'>lesson.txt</button><span>ソースのアップロード中にエラー</span></div>`")
+    dom.remove_failed_source = remove
+    dom.upload_txt = upload
     dom.create_notebook = lambda: pytest.fail("source failure must not recreate Notebook")
     with pytest.raises(SourceProcessingError, match='persistent'):
         dom.ensure_source(tmp_path / 'lesson.txt')
-    assert page.evaluate('window.retries') == 3
+    assert removed == uploaded == ['lesson.txt']*3
+    assert page.evaluate('window.retries') == 0
     assert page.locator('.single-source-container').count() == 1

@@ -36,6 +36,22 @@ class SourceProcessingError(NotebookAdapterError):
     pass
 
 
+class SourceRetryExhausted(SourceProcessingError):
+    pass
+
+
+class GenerationRetryExhausted(NotebookAdapterError):
+    pass
+
+
+class SourceState(StrEnum):
+    ABSENT = 'SOURCE_ABSENT'
+    UPLOADING = 'SOURCE_UPLOADING'
+    READY = 'SOURCE_READY'
+    FAILED = 'SOURCE_FAILED'
+    UNKNOWN = 'SOURCE_UNKNOWN'
+
+
 class ArtifactDeletionRetryableError(NotebookAdapterError):
     """Deletion was not confirmed; the job may safely be retried later."""
 
@@ -736,8 +752,16 @@ class NotebookDomAdapter:
             else:
                 stable_since = None
             self.page.wait_for_timeout(500)
-        self.diagnostic("SOURCE_READY_TIMEOUT:300s")
+        final_state = self.source_state(filename)
+        self.diagnostic(f"SOURCE_READY_TIMEOUT:reclassified={final_state}")
+        if final_state == 'ERROR':
+            raise SourceProcessingError('SOURCE_UPLOAD_FAILED: timeout再診断でSource失敗を確認')
         raise SourceReadyTimeoutError("TXT sourceの解析が5分以内に完了しませんでした")
+
+    def classify_source(self, filename: str) -> SourceState:
+        return {'MISSING': SourceState.ABSENT, 'PROCESSING': SourceState.UPLOADING,
+                'READY': SourceState.READY, 'ERROR': SourceState.FAILED}.get(
+                    self.source_state(filename), SourceState.UNKNOWN)
 
     def source_state(self, filename: str) -> str:
         panels = self.page.locator("source-panel, sources-panel, .source-panel, [data-testid='source-panel']")
@@ -754,6 +778,14 @@ class NotebookDomAdapter:
                 if not matches.count():
                     continue
                 panel = matches.first
+            # Live REV018 (2026-09-08): the failed row has no rendered error
+            # sentence. Its semantic class and accessible error icon are the
+            # authoritative signals; warning color alone is not sufficient.
+            if panel.evaluate("e => e.classList.contains('single-source-error-container') || e.getAttribute('aria-invalid') === 'true'"):
+                return 'ERROR'
+            icons = panel.locator('[aria-label="エラー情報"], [aria-label="Error information"], [data-source-state="error"]')
+            if any(icons.nth(i).is_visible() for i in range(icons.count())):
+                return 'ERROR'
             # Include accessible tooltips, not just the rendered caption.
             text = panel.inner_text().replace(Path(filename).name, "").casefold()
             if any(marker in text for marker in errors):
@@ -771,7 +803,57 @@ class NotebookDomAdapter:
             return "MISSING"
         if not self._source_processing() and self._chat_source_count_positive() and self._studio_video_card_active():
             return "READY"
-        return "PROCESSING"
+        return "PROCESSING" if self._source_processing() else "UNKNOWN"
+
+    def remove_failed_source(self, filename: str) -> None:
+        """Remove only the uniquely identified failed row, never all sources.
+
+        Menu sequence observed live on REV018. Notebook deletion and Studio
+        controls are outside this scope. Absence is required before upload.
+        """
+        self.ensure_interactable()
+        self.check_usage_limit()
+        if self.source_state(filename) != 'ERROR':
+            raise SourceProcessingError('SOURCE_STATE_CHANGED: failed sourceを再確認できません')
+        panels = self.page.locator('source-panel, sources-panel, .source-panel, [data-testid="source-panel"]')
+        cards = panels.locator('.single-source-container').filter(has=self.page.get_by_role('button', name=filename, exact=True))
+        if cards.count() != 1:
+            raise SourceProcessingError('SOURCE_IDENTITY_AMBIGUOUS: 削除対象を一意に確認できません')
+        more = cards.locator('.source-item-more-button')
+        if more.count() != 1 or not more.is_visible() or not more.is_enabled():
+            raise SourceProcessingError('SOURCE_UPLOAD_FAILED: 失敗source専用menuを確認できません')
+        checkpoint('source.failed.remove')
+        more.click()
+        menus = self.page.get_by_role('menu')
+        menus = [menus.nth(i) for i in range(menus.count()) if menus.nth(i).is_visible()]
+        if len(menus) != 1:
+            raise SourceProcessingError('SOURCE_UPLOAD_FAILED: source menuが一意ではありません')
+        remove = menus[0].get_by_role('menuitem', name=re.compile(r'(?:ソースを削除|Remove source|Delete source)$', re.I))
+        if remove.count() != 1:
+            raise SourceProcessingError('SOURCE_UPLOAD_FAILED: 単一source削除項目を確認できません')
+        if self.source_state(filename) != 'ERROR' or cards.count() != 1:
+            raise SourceProcessingError('SOURCE_STATE_CHANGED: menu表示後にsource状態が変化したため削除しません')
+        remove.click()
+        deadline = active_monotonic() + 10
+        while active_monotonic() < deadline:
+            checkpoint('source.failed.remove.confirm')
+            if cards.count() == 0:
+                self.diagnostic('SOURCE_FAILED_ENTRY_REMOVED')
+                return
+            dialogs = self.page.get_by_role('dialog')
+            visible = [dialogs.nth(i) for i in range(dialogs.count()) if dialogs.nth(i).is_visible()]
+            if visible:
+                if len(visible) != 1:
+                    raise SourceProcessingError('SOURCE_UPLOAD_FAILED: 削除確認dialogが一意ではありません')
+                text = visible[0].inner_text()
+                if filename not in text or re.search(r'ノートブック.*削除|delete.*notebook', text, re.I):
+                    raise SourceProcessingError('SOURCE_UPLOAD_FAILED: 削除確認の対象TXTが一致しません')
+                confirm = visible[0].get_by_role('button', name=re.compile(r'^(削除|Delete|Remove)$', re.I))
+                if confirm.count() != 1:
+                    raise SourceProcessingError('SOURCE_UPLOAD_FAILED: source削除確認buttonが一意ではありません')
+                confirm.click()
+            self.page.wait_for_timeout(250)
+        raise SourceProcessingError('SOURCE_UPLOAD_FAILED: 失敗entry消失を確認できないため再uploadしません')
 
     def ensure_source(self, source: Path) -> None:
         self.ensure_interactable()
@@ -784,20 +866,34 @@ class NotebookDomAdapter:
             if state == "MISSING":
                 self.upload_txt(source)
             elif state == "ERROR":
-                panels = self.page.locator("source-panel, sources-panel, .source-panel, [data-testid='source-panel']")
-                cards = panels.locator(".single-source-container").filter(has=self.page.get_by_role("button", name=source.name, exact=True))
-                if cards.count() != 1:
-                    raise SourceProcessingError("SOURCE_UPLOAD_FAILED: 再試行対象sourceを一意に確認できません")
-                retry = cards.get_by_role("button", name=re.compile(r"^(再試行|もう一度試す|Retry|Try again)$"))
-                if retry.count() != 1 or not retry.first.is_visible() or not retry.first.is_enabled():
-                    raise SourceProcessingError("SOURCE_UPLOAD_FAILED: source再試行UIを確認できません。Notebook/sourceは保持")
                 self.check_usage_limit()
-                retry.first.click()
+                job = getattr(self, 'source_recovery_job', None)
+                persist = getattr(self, 'source_recovery_persist', None)
+                used = job.attempt_by_stage.get('source.reupload', 0) if job else attempt-1
+                if used >= 3:
+                    raise SourceRetryExhausted('SOURCE_RETRY_EXHAUSTED: Source再uploadは最大3回です')
+                if job:
+                    job.attempt_by_stage['source.reupload'] = used+1
+                    job.source_status = SourceState.FAILED.value
+                    if persist:
+                        persist(job)
+                self.remove_failed_source(source.name)
+                # A verified absence is mandatory; never append duplicates.
+                if self.source_state(source.name) != 'MISSING':
+                    raise SourceProcessingError('SOURCE_UPLOAD_FAILED: 失敗entryが残っています')
+                self.upload_txt(source)
             try:
                 self.wait_for_source_ready(source.name)
                 return
             except (SourceProcessingError, SourceReadyTimeoutError):
+                reclassified = self.source_state(source.name)
+                self.diagnostic(f'SOURCE_RECLASSIFIED:{reclassified}')
+                if reclassified == 'UNKNOWN':
+                    raise SourceProcessingError('SOURCE_UNKNOWN: timeout後も状態不明。Error Recoveryへ')
                 if attempt == 3:
+                    job = getattr(self, 'source_recovery_job', None)
+                    if job and job.attempt_by_stage.get('source.reupload', 0) >= 3:
+                        raise SourceRetryExhausted('SOURCE_RETRY_EXHAUSTED: Source再uploadが3回失敗しました')
                     raise
 
     def start_video_generation(self, prompt: str) -> GenerationOutcome | None:
@@ -1013,13 +1109,15 @@ class NotebookDomAdapter:
             self.page.wait_for_timeout(500)
         raise NotebookAdapterError("Notebookの自動動画生成開始を確認できませんでした")
 
-    def start_video_generation_from_chat(self, prompt: str) -> GenerationOutcome:
+    def start_video_generation_from_chat(self, prompt: str, *, retry_failed=False) -> GenerationOutcome:
         """Send the exact job snapshot to main chat and let Notebook generate."""
         self.ensure_interactable()
         self.check_usage_limit()
         if not prompt.strip():
             raise ValueError("動画生成プリセット本文が空です")
-        if self.page.locator("artifact-library-item").count():
+        if self.page.locator("artifact-library-item").count() and not (
+            retry_failed and self.inspect_status() is RemoteVideoStatus.FAILED
+        ):
             raise NotebookAdapterError(
                 "チャット送信前に動画artifactが存在するため重複生成を停止しました"
             )
@@ -1027,7 +1125,8 @@ class NotebookDomAdapter:
         from .replies import ReplyKind
 
         self._wait_for_generation_chat_ready()
-        reply = ChatFlow(self).send(prompt)
+        flow = ChatFlow(self)
+        reply = flow.send(prompt, max_attempts=1) if retry_failed else flow.send(prompt)
         if reply.kind is ReplyKind.QUOTA_EXHAUSTED:
             from djd_maker.core.runtime_operation import report_operation
             report_operation(
@@ -1045,8 +1144,24 @@ class NotebookDomAdapter:
         cards = self.page.locator("artifact-library-item")
         count = cards.count()
         if count > 1:
-            self.diagnostic("DOM_MISMATCH:multiple_artifacts")
-            return RemoteVideoStatus.UNKNOWN
+            # Failed retries remain in Studio. Ignore only positively failed
+            # video cards, never arbitrary other artifacts or ambiguous rows.
+            candidates = []
+            failed = 0
+            for i in range(count):
+                card = cards.nth(i)
+                text = card.inner_text().casefold()
+                if any(marker.casefold() in text for marker in self.FAILED_MARKERS):
+                    failed += 1
+                else:
+                    candidates.append(card)
+            if failed == count:
+                return RemoteVideoStatus.FAILED
+            if len(candidates) != 1:
+                self.diagnostic("DOM_MISMATCH:multiple_artifacts")
+                return RemoteVideoStatus.UNKNOWN
+            cards = candidates[0]
+            count = 1
         if count == 1:
             card = cards.first
             try:
@@ -1376,6 +1491,8 @@ class NotebookEngineAdapter:
         except ValueError as exc:
             raise NotebookAdapterError(str(exc)) from exc
         source = Path(job.source_path)
+        self.dom.source_recovery_job = job
+        self.dom.source_recovery_persist = self.persist_identity
         from hashlib import sha256
         source_hash = sha256(source.read_bytes()).hexdigest()
         if job.source_sha256 and job.source_sha256 != source_hash:
@@ -1388,6 +1505,8 @@ class NotebookEngineAdapter:
             if status in {"READY", "GENERATING", "WAITING"}:
                 outcome = GenerationOutcome(RemoteVideoStatus(status), status == "WAITING", CreditSnapshot())
                 return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
+            if status == 'FAILED':
+                return self.retry_failed_generation(job)
             if status not in {"NOT_STARTED"}:
                 if job.resume_checkpoint == 'SOURCE_CHECK':
                     # Recovery may repair/read the existing source, never
@@ -1443,6 +1562,75 @@ class NotebookEngineAdapter:
             metadata.notebook_url,
             outcome,
         )
+
+    def retry_failed_generation(self, job: Job) -> NotebookSubmissionResult:
+        """Bounded current-state retry via the original immutable chat snapshot."""
+        from .chat_flow import ChatFlow
+        from .replies import classify_reply, ReplyKind
+        from djd_maker.core.runtime_operation import report_operation
+        prompt = job.require_preset_body_snapshot()
+        self._open_job(job)
+        status = self.inspect_status(job)
+        metadata = ResumeMetadata(job.notebook_id, job.notebook_url, job.script_name)
+        if status in {'READY', 'GENERATING', 'WAITING'}:
+            outcome = GenerationOutcome(RemoteVideoStatus(status), status == 'WAITING', CreditSnapshot())
+            return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
+        if status != 'FAILED':
+            raise NotebookAdapterError('GENERATION_STATE_UNCERTAIN: failed artifactを再確認できません')
+        self.dom.check_usage_limit()
+        turns = ChatFlow(self.dom).turns()
+        baseline = job.generation_retry_turn_count
+        if baseline is not None and len(turns) > baseline:
+            new = turns[baseline:]
+            if new[0]['role'] == 'user' and new[0]['text'] == prompt:
+                reply = '\n'.join(turn['text'] for turn in new[1:] if turn['role'] == 'assistant')
+                result = classify_reply(reply, now=self.dom.clock())
+                if result.kind is ReplyKind.GENERATION_ACCEPTED:
+                    raise NotebookAdapterError('GENERATION_STATE_UNCERTAIN: retry返信は生成開始ですが新artifact未確認。追加送信しません')
+            raise NotebookAdapterError('GENERATION_STATE_UNCERTAIN: 前回retry送信後の状態を再診断します。追加送信しません')
+        count = job.attempt_by_stage.get('generation.failed_retry', 0)
+        if count >= 3:
+            raise GenerationRetryExhausted('GENERATION_RETRY_EXHAUSTED: 失敗動画の再生成は最大3回です')
+        self.dom.source_recovery_job = job
+        self.dom.source_recovery_persist = self.persist_identity
+        self.dom.ensure_source(Path(job.source_path))
+        # Recheck after source readiness, before claiming an irreversible send.
+        if self.dom.inspect_status() is not RemoteVideoStatus.FAILED:
+            raise NotebookAdapterError('GENERATION_STATE_UNCERTAIN: Source確認中にartifact状態が変化しました')
+        self.dom.check_usage_limit()
+        job.attempt_by_stage['generation.failed_retry'] = count+1
+        job.generation_retry_turn_count = len(turns)
+        if self.persist_identity:
+            self.persist_identity(job)
+        report_operation('generation.failed.retry', attempt=count+1,
+                         decision='FAILED_ARTIFACT', next_action='保存済みPresetを中央Chatへ再送')
+        try:
+            outcome = self.dom.start_video_generation_from_chat(prompt, retry_failed=True)
+        except Exception as exc:
+            from djd_maker.core.cloud_limit import CloudLimitReached
+            if isinstance(exc, CloudLimitReached) and exc.observation.message == 'QUOTA_EXHAUSTED':
+                # This correlated reply explicitly refused generation. It is
+                # not an unknown send outcome or a failed generated artifact.
+                job.generation_retry_turn_count = None
+                job.attempt_by_stage['generation.failed_retry'] = count
+                if self.persist_identity:
+                    self.persist_identity(job)
+            raise
+        # A successful chat sentence alone is not proof that the failed video
+        # restarted. Retain the durable send boundary until Studio confirms it.
+        deadline = active_monotonic() + min(self.dom.timeout_ms, 30_000)/1000
+        while active_monotonic() < deadline:
+            checkpoint('generation.retry.confirm')
+            current = self.dom.inspect_status()
+            if current in {RemoteVideoStatus.GENERATING, RemoteVideoStatus.READY}:
+                outcome = GenerationOutcome(current, False, outcome.credit)
+                break
+            self.dom.page.wait_for_timeout(500)
+        else:
+            raise NotebookAdapterError('GENERATION_STATE_UNCERTAIN: retry送信後の新しい生成開始を確認できません。追加送信しません')
+        job.generation_retry_turn_count = None
+        self._record_submission(job, metadata, outcome)
+        return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
 
     def recheck_cloud_limit(self, notebook_url=None):
         if notebook_url:
