@@ -63,6 +63,7 @@ class PipelinePaths:
 
 
 from .deferred_recovery import DeferredRecovery
+from .task_discovery import Capabilities, RESCAN_SECONDS, MAX_ERROR_ATTEMPTS, due, terminal
 from djd_maker.core.deferred_state import SaveDeferred
 
 
@@ -150,6 +151,9 @@ class PipelineCoordinator(DeferredRecovery):
         self._idle_announced: dict[str, tuple] = {}
         self._media_progress_lock = threading.Lock()
         self._media_completed = 0
+        self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
+        self.wait_seconds = 0
+        self.scheduler_view = {}
         self._init_deferred()
         if hasattr(self.notebook, 'persist_identity'):
             self.notebook.persist_identity = self._save
@@ -183,7 +187,7 @@ class PipelineCoordinator(DeferredRecovery):
         return f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}'
 
     def _stage_event(self, job: Job, stage: str) -> None:
-        if stage in {'state.saved', 'job.start', 'job.result', 'job.next'} or job.state is JobState.COMPLETED:
+        if stage in {'state.saved', 'job.start', 'job.result', 'job.next', 'limit.warning'} or job.state is JobState.COMPLETED:
             return
         if job.presentation_stage != stage or job.presentation_phase != self.phase:
             if stage == 'zip.start' and job.state is JobState.HLS_ENCODING:
@@ -235,7 +239,7 @@ class PipelineCoordinator(DeferredRecovery):
                 continue
             if job_ids is not None and job.id not in job_ids:
                 continue
-            if job.failure_class == 'FATAL_FAILED':
+            if terminal(job) or job.failure_class == 'FATAL_FAILED':
                 continue
             job.failure_class = failure_class(job)
             if job.failure_class == 'FATAL_FAILED':
@@ -248,8 +252,6 @@ class PipelineCoordinator(DeferredRecovery):
                         if job.edited_path and Path(job.edited_path).is_file() and getattr(self.validator.validate(Path(job.edited_path)), "valid", True):
                             target = JobState.ZIPPING if job.resume_checkpoint == "ZIPPING" else JobState.HLS_ENCODING
                 elif job.notebook_id and job.notebook_url:
-                    if self.cloud_limit.blocked:
-                        continue
                     diagnose = getattr(self.notebook, "diagnose_resume", None)
                     diagnosis = diagnose(job) if callable(diagnose) else {"artifact": self.notebook.inspect_status(job)}
                     status = diagnosis["artifact"]
@@ -285,13 +287,15 @@ class PipelineCoordinator(DeferredRecovery):
         return resumed
 
     def _needs_dispatch(self, job: Job) -> bool:
-        if job.id in self.deferred_ids:
+        if job.id in self.deferred_ids or terminal(job):
             return False
         if job.state in {JobState.WAITING, JobState.UPLOADING}:
             return True
         if job.state is JobState.FAILED:
             from djd_maker.core.job_migration import failure_class
-            return job.id not in self._resume_attempted and failure_class(job) != 'FATAL_FAILED' and job.error_code != 'OUTPUT_NAME_COLLISION'
+            return (not job.raw_path and failure_class(job) != 'FATAL_FAILED'
+                    and job.attempt_by_stage.get('scheduler.recovery', 0) < MAX_ERROR_ATTEMPTS
+                    and due(job, self.cloud_limit.clock()))
         return job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:') and job.id not in self._resume_attempted
 
     def _phase_event(self, phase: str) -> None:
@@ -311,6 +315,19 @@ class PipelineCoordinator(DeferredRecovery):
 
     def run_cycle(self) -> None:
         checkpoint('pipeline.cycle')
+        for job in self.jobs.list():
+            if terminal(job) or job.id in self.deferred_ids or not job.next_poll_at:
+                continue
+            try:
+                self._parse_utc(job.next_poll_at)
+            except (ValueError, TypeError, AttributeError):
+                with self._job_boundary(job):
+                    job.resume_checkpoint = job.state.value
+                    job.state = JobState.FAILED
+                    job.error_code = 'INVALID_CHECK_DEADLINE'
+                    job.error_message = '保存済み再確認日時が不正です。既存Notebookを再診断します。'
+                    job.next_poll_at = None
+                    self._save(job)
         if self.cloud_limit.blocked:
             if self.cloud_limit.due:
                 recheck = getattr(self.notebook, 'recheck_cloud_limit', None)
@@ -328,33 +345,127 @@ class PipelineCoordinator(DeferredRecovery):
                         self.cloud_limit.defer_recheck()
                         self.runtime_callback(dict(stage='limit.recheck.failed', level='WARNING',
                             message=f'上限解除を確認できません。待機を維持して再確認します: {type(exc).__name__}'))
-            if self.cloud_limit.blocked:
-                self._drain_limit_local()
-                return
+            self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
         self._reject_output_name_collisions()
         self._progress_jobs = {j.id:j for j in self.jobs.list()}
-        if any(self._needs_dispatch(j) for j in self.jobs.list()):
+        if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
+            self.wait_seconds = 0
+            self._scheduler_status(1, '生成投入')
             self._phase_event('GENERATION_DISPATCH')
             self._dispatch_only = True
             try:
                 self._run_cycle_lane()
             finally:
                 self._dispatch_only = False
-            if self.cloud_limit.blocked:
-                self._drain_limit_local()
-                return
             checkpoint('phase.dispatch.complete')
             self._retry_deferred()
-            if any(self._needs_dispatch(j) for j in self.jobs.list()):
+            if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
                 return
         if self.phase != 'COLLECT_LOCAL':
             if self.deferred_ids:
                 self._retry_deferred()
             self._phase_event('COLLECT_LOCAL')
-        self._run_cycle_lane()
-        self._retry_deferred()
+        self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
+        self._discover_remaining_tasks()
 
-    def _drain_limit_local(self):
+    def all_tasks_completed(self):
+        return not self.deferred_ids and all(terminal(j) for j in self.jobs.list())
+
+    def _scheduler_status(self, priority, task):
+        from dataclasses import asdict
+        now = self.cloud_limit.clock().astimezone(UTC)
+        next_scan = None
+        if self.wait_seconds:
+            previous_scan = self._parse_utc(self.scheduler_view.get('next_scan_at'))
+            next_scan = (previous_scan if previous_scan and previous_scan > now else now+timedelta(seconds=self.wait_seconds)).isoformat()
+        view = dict(priority=priority, capabilities=asdict(self.capabilities),
+            task=task, next_scan_at=next_scan,
+            completed=sum(j.state is JobState.COMPLETED for j in self.jobs.list()),
+            retry_attempts={j.id: j.attempt_by_stage.get('scheduler.recovery', 0) for j in self.jobs.list()
+                            if j.attempt_by_stage.get('scheduler.recovery', 0)},
+            terminal_failed=sum(j.failure_class in {'TERMINAL_FAILED', 'FATAL_FAILED'} for j in self.jobs.list()))
+        if view == self.scheduler_view:
+            return
+        self.scheduler_view = view
+        self.runtime_callback(dict(stage='scheduler.wait' if priority == 5 else 'scheduler.task',
+            scheduler=dict(self.scheduler_view), phase=self.phase, cloud_limit=self.cloud_limit.status(),
+            message=f'優先度{priority}: {task}'))
+
+    def _discover_remaining_tasks(self):
+        self.wait_seconds = 0
+        now = self.cloud_limit.clock()
+        idle = [j for j in self.jobs.list() if j.state is JobState.COMPLETED or
+                j.state is JobState.WAITING_VIDEO and not due(j, now)]
+        if idle:
+            self._run_cycle_lane(selected_jobs=idle, allow_collection=True)
+        # P2: finish existing local media before any remote collection.
+        if any(j.state in self.MEDIA_STATES for j in self.jobs.list()):
+            self._scheduler_status(2, 'ローカル処理')
+        self._drain_limit_local(local_only=True)
+        # P3: Chat disabled does not disable artifact access. Check each due job
+        # independently; the adapter remains responsible for current DOM readiness.
+        now = self.cloud_limit.clock()
+        remote = [j for j in self.jobs.list() if j.id not in self.deferred_ids and
+            (due(j, now) or j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
+             and j.runtime_reason != 'WAITING_REMOTE_ACCESS')
+            and (j.state in {JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING,
+                JobState.DOWNLOADING, JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING}
+                or j.state in self.MEDIA_STATES and j.artifact_status == 'DELETE_PENDING')]
+        if remote:
+            self._scheduler_status(3, '期限到達動画の確認・Download')
+            self._run_cycle_lane(selected_jobs=remote, allow_collection=True)
+        # P4 is reached only after higher-priority work has had its turn.
+        self._retry_deferred(local_only=self.cloud_limit.blocked)
+        for job in self.jobs.list():
+            if job.id not in self.deferred_ids and not terminal(job) and job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED} and due(job, now):
+                self._scheduler_status(4, f'Error再診断: {job.script_name}')
+                self._run_cycle_lane(selected_jobs=[job], allow_collection=True)
+                # Re-evaluate generation priority before processing another error.
+                if job.state is JobState.WAITING and not self.cloud_limit.blocked:
+                    return
+        runnable = any(j.id not in self.deferred_ids and not terminal(j) and
+            (j.state in self.MEDIA_STATES or
+             (self._needs_dispatch(j) and not self.cloud_limit.blocked) or
+             (j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} and due(j, now)))
+            for j in self.jobs.list())
+        if not self.all_tasks_completed() and not runnable:
+            self.wait_seconds = RESCAN_SECONDS
+            self._scheduler_status(5, '現在実行可能なtaskなし。10分後に再確認します')
+
+    def _recover_error_task(self, job):
+        checkpoint('error.recovery', job.id)
+        key = 'scheduler.recovery'
+        attempts = job.attempt_by_stage.get(key, 0)
+        from djd_maker.core.job_migration import failure_class
+        if attempts >= MAX_ERROR_ATTEMPTS or failure_class(job) == 'FATAL_FAILED':
+            job.failure_class = 'TERMINAL_FAILED' if attempts >= MAX_ERROR_ATTEMPTS else 'FATAL_FAILED'
+            with self._job_boundary(job): self._save(job)
+            return
+        with self._job_boundary(job):
+            job.attempt_by_stage[key] = attempts+1
+            self._save(job)  # Claim retry durably before any remote operation.
+            if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
+                job.state = JobState.DOWNLOADING
+                self._save(job)
+                self._run_notebook_job(job)
+            else:
+                self.resume_failed_jobs({job.id})
+                restored = self.jobs.get(job.id)
+                for field in job.__dataclass_fields__:
+                    setattr(job, field, getattr(restored, field))
+                if job.state is JobState.FAILED and job.failure_class != 'FATAL_FAILED' and not self.cloud_limit.blocked:
+                    # submit() checks the existing artifact and ensure_source()
+                    # checks existing source identity before any upload/send.
+                    job.state = JobState.WAITING
+                    job.resume_checkpoint = 'SOURCE_CHECK'
+                    self._save(job)
+            if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}:
+                job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
+                if job.attempt_by_stage.get(key, 0) >= MAX_ERROR_ATTEMPTS:
+                    job.failure_class = 'TERMINAL_FAILED'
+                self._save(job)
+
+    def _drain_limit_local(self, *, local_only=False):
         self._reject_output_name_collisions()
         self._retry_deferred(local_only=True)
         # Downloaded files still pass the existing RAW safety gate. A known
@@ -363,7 +474,7 @@ class PipelineCoordinator(DeferredRecovery):
             if job.id in self.deferred_ids or job.state not in {JobState.DOWNLOADING, JobState.DOWNLOAD_PENDING}:
                 continue
             download = self.paths.work_directory / job.id / 'download' / f'{job.script_name}.mp4'
-            if not download.is_file() and not getattr(self.notebook, 'download_during_limit_verified', False):
+            if not download.is_file() and (local_only or not getattr(self.notebook, 'download_during_limit_verified', False)):
                 continue
             with self._job_boundary(job):
                 checkpoint('limit.download.dequeue', job.id)
@@ -374,10 +485,12 @@ class PipelineCoordinator(DeferredRecovery):
                         phase='LIMIT_LOCAL_DRAIN', notebook=job.notebook_url or '－'))
                 with operation_scope(update):
                     self._run_notebook_job(job)
-        local = [j for j in self.jobs.list() if j.state in self.MEDIA_STATES and j.id not in self.deferred_ids]
-        self.phase = 'LIMIT_LOCAL_DRAIN' if local else 'LIMIT_WAIT'
-        self.runtime_callback(dict(stage='limit.wait', phase=self.phase, cloud_limit=self.cloud_limit.status(),
-            message='AI使用量上限によりNotebook処理を待機中。現在はローカル処理を優先しています。'))
+        local = [j for j in self.jobs.list() if j.state in self.MEDIA_STATES and j.id not in self.deferred_ids
+                 and (self.cloud_limit.blocked or j.artifact_status != 'DELETE_PENDING')]
+        self.phase = ('LIMIT_LOCAL_DRAIN' if local else 'LIMIT_WAIT') if self.cloud_limit.blocked else 'COLLECT_LOCAL'
+        if local:
+            self.runtime_callback(dict(stage='limit.local', phase=self.phase, cloud_limit=self.cloud_limit.status(),
+                message='ローカル処理を実行しています。'))
         if local:
             self._media_completed = 0
             with ThreadPoolExecutor(max_workers=self.ffmpeg_concurrency) as pool:
@@ -388,10 +501,11 @@ class PipelineCoordinator(DeferredRecovery):
                 for future in futures:
                     future.result()
         checkpoint('completed.txt.reconcile')
-        self.reconcile_completed_txt()
+        if any(j.state is JobState.COMPLETED and j.zip_path for j in self.jobs.list()):
+            self.reconcile_completed_txt()
         self._retry_deferred(local_only=True)
 
-    def _run_cycle_lane(self) -> None:
+    def _run_cycle_lane(self, *, selected_jobs=None, allow_collection=False) -> None:
         self._reject_output_name_collisions()
         # Preserve the existing bounded FFmpeg lane for RAW already on disk.
         # This is local-only: no Notebook is inspected/opened by these workers.
@@ -406,13 +520,13 @@ class PipelineCoordinator(DeferredRecovery):
                     futures.append(pool.submit(copy_context().run, self._local_media_with_progress, job, index, len(local_media)))
                 for future in futures:
                     future.result()
-        values = self.jobs.list()
+        values = self.jobs.list() if selected_jobs is None else selected_jobs
         if self._dispatch_only:
             values = [job for job in values if self._needs_dispatch(job)]
         # Local ordering only. No remote pre-scan and no second execution queue.
         values.sort(key=lambda j: 0 if j.state in self.MEDIA_STATES or j.state is JobState.DOWNLOAD_PENDING else 1)
         for index, job in enumerate(values, 1):
-            if self.cloud_limit.blocked:
+            if self.cloud_limit.blocked and not allow_collection:
                 break
             if job.id in self.deferred_ids:
                 continue
@@ -492,13 +606,15 @@ class PipelineCoordinator(DeferredRecovery):
         if job.state is JobState.COMPLETED:
             return 'COMPLETED_SKIP'
         if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
-            return 'DOWNLOAD_RETRY_REQUIRED'
+            return None if due(job, self.cloud_limit.clock()) else 'WAITING_FOR_NEXT_CHECK'
         if job.state is JobState.FAILED:
             from djd_maker.core.job_migration import failure_class
             if job.failure_class == 'FATAL_FAILED' or failure_class(job) == 'FATAL_FAILED' or job.error_code == 'OUTPUT_NAME_COLLISION':
                 return 'FATAL_FAILED'
-            if job.id in self._resume_attempted:
-                return 'RETRY_REQUIRES_START'
+            if not due(job, self.cloud_limit.clock()):
+                return 'WAITING_FOR_NEXT_CHECK'
+        if job.state is JobState.WAITING_VIDEO and not due(job, self.cloud_limit.clock()):
+            return 'WAITING_FOR_NEXT_CHECK'
         if job.state is JobState.WAITING_VIDEO and self.scheduler is not None:
             self.scheduler.ensure_scheduled(job)
             if not self.scheduler.is_due(job):
@@ -524,6 +640,8 @@ class PipelineCoordinator(DeferredRecovery):
             if job.state is not JobState.FAILED:
                 self._transition(job, JobState.FAILED)
         job.runtime_outcome = 'FAILED_WITH_REASON' if job.state is JobState.FAILED else job.state.value
+        if reason == 'FATAL_FAILED':
+            job.failure_class = 'FATAL_FAILED'
         job.runtime_reason = reason
         # Completed records must remain immutable (TXT reconciliation is local).
         if previous != (job.runtime_outcome, job.runtime_reason) or previous_stage != job.presentation_stage:
@@ -531,25 +649,28 @@ class PipelineCoordinator(DeferredRecovery):
         report_operation('job.result', decision=reason, outcome=job.runtime_outcome,
                          notebook=job.notebook_url or '－')
         self._no_op_count = self._no_op_count + 1 if no_op else 0
-        if self._no_op_count >= 3:
-            raise NoOpJobTransitionError('NO_OP_JOB_TRANSITION: Notebookを開きましたが処理工程を開始できない状態が3件続いています')
+        # Diagnosis failures belong to the individual persisted retry budget.
 
     def _check_act_job(self, job: Job) -> None:
         if job.state is JobState.COMPLETED:
             self._finish_job(job, 'COMPLETED_SKIP')
             return
         interrupted = job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:')
-        if job.state is JobState.FAILED or interrupted:
+        if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED} or interrupted:
             from djd_maker.core.job_migration import failure_class
             if failure_class(job) == 'FATAL_FAILED':
+                job.failure_class = 'FATAL_FAILED'
+                self._save(job)
                 self._finish_job(job, 'FATAL_FAILED')
                 return
-            if job.id in self._resume_attempted:
-                self._finish_job(job, 'RETRY_REQUIRES_START')
+            if terminal(job) or not due(job, self.cloud_limit.clock()):
                 return
             self._resume_attempted.add(job.id)
             report_operation('resume.check')
-            self.resume_failed_jobs({job.id})
+            if interrupted:
+                self.resume_failed_jobs({job.id})
+            else:
+                self._recover_error_task(job)
             if job.id in self.deferred_ids:
                 raise SaveDeferred()
             resumed = self.jobs.get(job.id)
@@ -559,7 +680,7 @@ class PipelineCoordinator(DeferredRecovery):
                 setattr(job, field, getattr(resumed, field))
             report_operation('resume.decision', decision=job.state.value, next_action='必要工程を即実行')
             if job.state is JobState.FAILED:
-                self._finish_job(job, 'REMOTE_STATE_UNKNOWN', no_op=True)
+                self._finish_job(job, 'REMOTE_STATE_UNKNOWN')
                 return
             if job.state is JobState.WAITING_VIDEO:
                 if self.scheduler is not None:
@@ -574,6 +695,8 @@ class PipelineCoordinator(DeferredRecovery):
             self._finish_job(job, 'REMOTE_ARTIFACT_READY' if job.state is JobState.DOWNLOAD_PENDING else job.state.value)
             return
 
+        if job.state is JobState.GENERATING and not self._dispatch_only:
+            self._transition(job, JobState.WAITING_VIDEO)
         if job.state is JobState.WAITING_VIDEO and self.scheduler is not None:
             self.scheduler.ensure_scheduled(job)
             if not self.scheduler.claim_next_poll(job):
@@ -603,13 +726,20 @@ class PipelineCoordinator(DeferredRecovery):
                 return
         if job.state in self.MEDIA_STATES and not self._dispatch_only:
             self._run_media_job(job)
-        self._finish_job(job, job.error_code or ('GENERATION_ALREADY_STARTED' if job.state is JobState.WAITING_VIDEO else job.state.value))
+        self._finish_job(job, 'WAITING_REMOTE_ACCESS' if job.runtime_reason == 'WAITING_REMOTE_ACCESS' else
+                         job.error_code or ('GENERATION_ALREADY_STARTED' if job.state is JobState.WAITING_VIDEO else job.state.value))
+        if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}:
+            attempts = job.attempt_by_stage.get('scheduler.recovery', 0)
+            if attempts:
+                job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
+                if attempts >= MAX_ERROR_ATTEMPTS:
+                    job.failure_class = 'TERMINAL_FAILED'
+                self._save(job)
 
     def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
-        if self.cloud_limit.blocked:
-            self._drain_limit_local()
-            return []
         """Advance only persisted remote/recovery jobs; never submit new work."""
+        if self.cloud_limit.blocked:
+            self._drain_limit_local(local_only=True)
         self.phase = 'COLLECT_LOCAL'
         current = (now or datetime.now(UTC)).astimezone(UTC)
         processed: list[str] = []
@@ -709,8 +839,15 @@ class PipelineCoordinator(DeferredRecovery):
             raise
         except Exception as exc:
             job.recovery_retry_count += 1
+            job.attempt_by_stage['scheduler.recovery'] = job.attempt_by_stage.get('scheduler.recovery', 0)+1
             job.error_code = "RECOVERY_CHECK_FAILED"
             job.error_message = str(exc)
+            job.next_poll_at = (checked_at+timedelta(seconds=RESCAN_SECONDS)).isoformat()
+            if job.attempt_by_stage['scheduler.recovery'] >= MAX_ERROR_ATTEMPTS:
+                job.failure_class = 'TERMINAL_FAILED'
+                job.state = JobState.FAILED
+                self._save(job)
+                return
             if job.state not in {
                 JobState.RESERVED_WAITING_CREDIT_RESET,
                 JobState.RECOVERY_PENDING,
@@ -732,6 +869,10 @@ class PipelineCoordinator(DeferredRecovery):
     def _run_notebook_job(self, job: Job) -> None:
         if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
             return
+        if self.cloud_limit.blocked and job.state in {JobState.WAITING, JobState.UPLOADING}:
+            return
+        status = None
+        raw_validation_started = False
         try:
             if job.state is JobState.WAITING:
                 checkpoint('notebook.submit')
@@ -801,12 +942,19 @@ class PipelineCoordinator(DeferredRecovery):
             if job.state is JobState.WAITING_VIDEO:
                 checkpoint('artifact.poll')
                 status = self.notebook.inspect_status(job)
+                if job.error_code == 'REMOTE_ACCESS_UNAVAILABLE':
+                    job.error_code = None
+                    job.error_message = None
+                    job.runtime_reason = None
                 job.artifact_status = status
                 job.last_checked_at = datetime.now(UTC).isoformat()
                 self._save(job)
                 if status != "READY":
                     if status == "FAILED":
                         raise RuntimeError("remote video generation failed")
+                    if self.scheduler is None:
+                        job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
+                        self._save(job)
                     return
                 report_operation('artifact.ready', decision='READY', next_action='Download開始')
                 self._transition(job, JobState.DOWNLOAD_PENDING)
@@ -826,6 +974,7 @@ class PipelineCoordinator(DeferredRecovery):
                 if not download.exists():
                     self.notebook.download_artifact(job, download)
                 job.download_status = "DOWNLOADED"
+                raw_validation_started = True
                 report_operation('download.complete')
                 report_operation('raw.validate')
                 raw_path = self.paths.raw_directory / f"{job.script_name}.mp4"
@@ -869,10 +1018,15 @@ class PipelineCoordinator(DeferredRecovery):
                     self._save(job)
         except CloudLimitReached as exc:
             self.cloud_limit.block(exc.observation, notebook_url=job.notebook_url)
-            job.state = JobState.WAITING
+            # A Chat limit must never erase an existing generation/download
+            # checkpoint or turn collection into another submission.
+            if job.state in {JobState.WAITING, JobState.UPLOADING}:
+                job.state = JobState.WAITING
+            else:
+                job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
             job.credit_state = 'CLOUD_BLOCKED_UNTIL'
             job.error_code = None
-            job.runtime_reason = 'CLOUD_BLOCKED_UNTIL'
+            job.runtime_reason = 'CLOUD_BLOCKED_UNTIL' if job.state is JobState.WAITING else 'WAITING_REMOTE_ACCESS'
             self._save(job)
         except (RunCancelled, BlockingModalError):
             job.resume_checkpoint = 'STOPPED:' + job.state.value
@@ -883,6 +1037,24 @@ class PipelineCoordinator(DeferredRecovery):
         except JobStateSaveError:
             raise
         except Exception as exc:
+            if ((job.state is JobState.WAITING_VIDEO and status != 'FAILED') or
+                (job.state is JobState.DOWNLOADING and not raw_validation_started)):
+                # Current artifact access can fail independently of Chat.
+                # Preserve identity, back off only this job, and continue peers.
+                key = 'scheduler.recovery'
+                job.attempt_by_stage[key] = job.attempt_by_stage.get(key, 0)+1
+                job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
+                job.error_code = 'REMOTE_ACCESS_UNAVAILABLE'
+                job.error_message = str(exc)
+                job.runtime_reason = 'WAITING_REMOTE_ACCESS'
+                if job.attempt_by_stage[key] >= MAX_ERROR_ATTEMPTS:
+                    job.state = JobState.FAILED
+                    job.failure_class = 'TERMINAL_FAILED'
+                self._save(job)
+                report_operation('remote.wait', decision='WAITING_REMOTE_ACCESS',
+                    next_action='他jobへ。次回期限後に再確認', attempt=job.attempt_by_stage[key],
+                    can_check_artifact=False, can_download=False)
+                return
             job.error_message = str(exc)
             job.resume_checkpoint = job.state.value
             if job.state is JobState.DOWNLOADING:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 import re
+from djd_maker.core.cloud_limit import is_limit_warning
 from typing import Any, Callable, Iterable
 
 
@@ -135,6 +136,7 @@ class CreditDetector:
                 for message in messages
                 if any(
                     phrase.casefold() in message.casefold()
+                    and not (phrase == 'usage limit' and is_limit_warning(message))
                     for phrase in CREDIT_EXHAUSTED_PHRASES
                 )
             ),

@@ -307,6 +307,8 @@ def test_recheck_network_failure_does_not_spin_or_dispatch(tmp_path):
 
 def test_legacy_reserved_preserved_during_limit(tmp_path):
     job=Job('legacy.txt',state=JobState.RESERVED_WAITING_CREDIT_RESET,notebook_id='old',notebook_url='https://notebook.google.com/notebook/old')
+    # V126 permits due artifact patrol during a Chat limit, never early patrol.
+    job.next_poll_at=(NOW+timedelta(hours=2)).isoformat()
     remote=Remote([])
     pipe=coordinator(tmp_path,MemoryJobs(job),remote)
     pipe.cloud_limit.clock=lambda:NOW

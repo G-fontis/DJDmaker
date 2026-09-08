@@ -39,7 +39,7 @@ from .viewmodels import sanitize_log_text
 from djd_maker.core.runtime_operation import operation_text
 from djd_maker.core.commands import CommandId, CommandRouter, BUTTON_COMMANDS, InterfaceError, EventId
 from .phase2_presentation import Phase2Presentation
-from .presentation_models import JobViewModel, CreditLimitViewModel
+from .presentation_models import JobViewModel, CreditLimitViewModel, PresetViewModel
 
 
 class SettingsRepositoryPort(Protocol):
@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.5"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.6"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -101,6 +101,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._dispatch_disabled = False
         self.last_command = None
         self._limit_status = {}
+        self._current_runtime_status = {}
         self._stopping = False
         self._closing = False
         self._log_dialog = LogDialog(self)
@@ -281,7 +282,6 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._connect_local_controls()
 
     def _connect_local_controls(self):
-        self.resume_button = QPushButton('再開')
         self.gui_type_switch = QComboBox()
         self.gui_type_switch.addItems(['PHASE1', 'PHASE2'])
         self.gui_type_switch.setCurrentText(self.settings.gui_type)
@@ -290,9 +290,15 @@ class MainWindow(Phase2Presentation, QMainWindow):
         tools = QHBoxLayout()
         tools.addWidget(QLabel('GUIタイプ'))
         tools.addWidget(self.gui_type_switch)
-        tools.addWidget(self.resume_button)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(160)
+        tools.addWidget(QLabel('生成プリセット'))
+        tools.addWidget(self.preset_combo)
         tools.addWidget(self.limit_label, 1)
         self.centralWidget().layout().addLayout(tools)
+        self.scheduler_label = QLabel('Scheduler: 待機中')
+        self.scheduler_label.setWordWrap(True)
+        self.centralWidget().layout().addWidget(self.scheduler_label)
         commands = {
             CommandId.SETTINGS_OPEN: lambda _: self.show_settings(),
             CommandId.GOOGLE_LOGIN: lambda _: self.start_login(),
@@ -313,6 +319,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
             CommandId.OUTPUT_OPEN: lambda _: self._open_directory(self.output_path_edit.text()),
             CommandId.ENDING_CHANGE: lambda _: self.change_ending(),
             CommandId.ENDING_PREVIEW: lambda _: self.preview_ending(),
+            CommandId.PRESET_SELECT: lambda p: self._select_preset(p['preset_id']),
         }
         self.command_router = CommandRouter(commands.items())
         self.bound_commands = frozenset(commands)
@@ -322,8 +329,25 @@ class MainWindow(Phase2Presentation, QMainWindow):
             button.clicked.connect(lambda checked=False, cmd=command: self.dispatch_command(cmd))
         self.gui_type_switch.currentTextChanged.connect(lambda value: self.dispatch_command(
             CommandId.GUI_SWITCH_PHASE1 if value == 'PHASE1' else CommandId.GUI_SWITCH_PHASE2, {'gui_type': value}))
+        self.preset_combo.currentIndexChanged.connect(lambda _: self.dispatch_command(
+            CommandId.PRESET_SELECT, {'preset_id': self.preset_combo.currentData()}))
+        self._refresh_preset_view()
         self.job_table.itemSelectionChanged.connect(self._update_action_state)
         self.job_table.itemDoubleClicked.connect(lambda _item: self.dispatch_command(CommandId.JOB_DETAIL_OPEN))
+
+    def _refresh_preset_view(self):
+        self.preset_view = PresetViewModel.load(self.preset_repository)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for item in self.preset_view.items:
+            self.preset_combo.addItem(item.name, item.id)
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData(self.preset_view.selected_id) if self.preset_view.selected_id else -1)
+        self.preset_combo.blockSignals(False)
+
+    def _select_preset(self, preset_id):
+        if self.preset_repository is not None:
+            self.preset_repository.select(preset_id)
+        self._refresh_preset_view()
 
     def dispatch_command(self, command, payload=None):
         if self._dispatch_disabled:
@@ -358,8 +382,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
         old = self.takeCentralWidget()
         self._build_ui()
         self.apply_settings(self.settings)
-        self.set_jobs(self.jobs)
+        self.set_jobs(self.job_repository.list())
         self._display_limit(self._limit_status)
+        self._apply_runtime_status(self._current_runtime_status)
         if selected:
             for row in range(self.job_table.rowCount()):
                 if self.job_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == selected.id:
@@ -480,7 +505,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
             self,
             preset_repository=self.preset_repository,
         )
-        if not dialog.exec():
+        accepted = dialog.exec()
+        self._refresh_preset_view()  # CRUD persists even when settings is cancelled.
+        if not accepted:
             return
         updated = dialog.value()
         try:
@@ -669,6 +696,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._log_dialog.activateWindow()
 
     def start_processing(self) -> None:
+        if self._paused:
+            self.dispatch_command(CommandId.RESUME)
+            return
         if self.preset_repository is not None and self.preset_repository.selected() is None:
             QMessageBox.warning(
                 self,
@@ -765,11 +795,15 @@ class MainWindow(Phase2Presentation, QMainWindow):
 
     def _apply_runtime_status(self, status: object) -> None:
         if isinstance(status, dict):
+            self._current_runtime_status = dict(status)
             self._paused = bool(status.get('paused', False))
             self._active_run = bool(status.get('active', status.get('running', False)))
             limit = status.get('cloud_limit', {})
             self._display_limit(limit)
             record = status.get('runtime')
+            view = status.get('scheduler') or (record.get('scheduler') if isinstance(record, dict) else None)
+            if view:
+                self.scheduler_label.setText(f"優先度: {view['priority']} / {view['task']} / Capability: {view['capabilities']} / 次回巡回: {view.get('next_scan_at') or '－'} / 再試行: {view.get('retry_attempts', {})} / terminal: {view['terminal_failed']}")
             if isinstance(record, dict) and str(record.get('stage', '')).startswith('save.'):
                 job_id = record.get('job_id')
                 if job_id:
@@ -868,7 +902,6 @@ class MainWindow(Phase2Presentation, QMainWindow):
     def _update_action_state(self) -> None:
         if self._dispatch_disabled:
             return
-        self.resume_button.setEnabled(self._paused)
         self.gui_type_switch.setEnabled(not (self._active_run or self._running or self._paused))
         self.start_button.setEnabled(not self._running)
         self.recover_button.setEnabled(

@@ -28,6 +28,14 @@ def parse_limit_text(message: str, *, now: datetime, chat_disabled=False):
     compact = re.sub(r'\s+', '', message)
     strong = 'AIの使用量上限に達しました' in compact or ('チャットは' in compact and 'まで無効' in compact)
     secondary = '使用量上限' in compact and '利用可能' in compact
+    english = message.lower().replace('’', "'")
+    strong = strong or bool(re.search(
+        r"(?:you(?:'ve| have) reached (?:your |the )?(?:ai )?(?:usage )?limit|"
+        r'(?:ai )?usage limit (?:has been )?reached|chat (?:is |has been )?disabled)', english))
+    # While producing a reply, Notebook makes the textarea readonly/disabled.
+    # An approaching-limit banner does not turn that transient UI state into
+    # exhaustion. Explicit reached/disabled notices above still take priority.
+    secondary = secondary or ('usage limit' in english and not is_limit_warning(message))
     if not strong and not (secondary and chat_disabled):
         return None
     match = re.search(r'(?<!\d)(?P<period>午前|午後)?\s*(?P<h>\d{1,2}):(?P<m>\d{2})(?!\d)', message)
@@ -43,6 +51,11 @@ def parse_limit_text(message: str, *, now: datetime, chat_disabled=False):
             if reset < now:
                 reset += timedelta(days=1)
     return LimitObservation(message, reset, chat_disabled)
+
+
+def is_limit_warning(message: str) -> bool:
+    """An approaching limit is not exhaustion while the chat remains enabled."""
+    return bool(re.search(r'almost at (?:your |the )?(?:ai )?usage limit', message, re.I))
 
 
 class CloudLimitGate:

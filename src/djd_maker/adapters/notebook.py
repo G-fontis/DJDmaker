@@ -1030,7 +1030,12 @@ class NotebookDomAdapter:
         reply = ChatFlow(self).send(prompt)
         if reply.kind is ReplyKind.QUOTA_EXHAUSTED:
             from djd_maker.core.runtime_operation import report_operation
-            report_operation('quota.detected')
+            report_operation(
+                'quota.detected',
+                decision='QUOTA_EXHAUSTED',
+                next_action='生成を後回しにしてLocal処理・完成確認・Downloadへ',
+                message='今回の動画生成に必要なクォータが不足。生成依頼を停止し、回収・変換を継続します。',
+            )
             credit = CreditSnapshot(CreditState.EXHAUSTED, reset_at=reply.reset_at)
             from djd_maker.core.cloud_limit import CloudLimitReached, LimitObservation
             raise CloudLimitReached(LimitObservation('QUOTA_EXHAUSTED', credit.reset_at, True))
@@ -1384,7 +1389,20 @@ class NotebookEngineAdapter:
                 outcome = GenerationOutcome(RemoteVideoStatus(status), status == "WAITING", CreditSnapshot())
                 return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
             if status not in {"NOT_STARTED"}:
-                raise NotebookAdapterError("REMOTE_DIAGNOSIS_UNCERTAIN: 既存artifact状態を確定できません")
+                if job.resume_checkpoint == 'SOURCE_CHECK':
+                    # Recovery may repair/read the existing source, never
+                    # assume UNKNOWN means that generation has not started.
+                    report_operation('source.check')
+                    self.dom.ensure_source(source)
+                    job.source_status = 'READY'
+                    if self.persist_identity is not None:
+                        self.persist_identity(job)
+                    status = self.inspect_status(job)
+                    if status in {"READY", "GENERATING", "WAITING"}:
+                        outcome = GenerationOutcome(RemoteVideoStatus(status), status == 'WAITING', CreditSnapshot())
+                        return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
+                if status != 'NOT_STARTED':
+                    raise NotebookAdapterError("REMOTE_DIAGNOSIS_UNCERTAIN: 既存artifact状態を確定できません")
         else:
             report_operation('notebook.create')
             metadata = self.dom.create_notebook()

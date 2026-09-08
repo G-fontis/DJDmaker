@@ -1,5 +1,19 @@
 # 開発ルール
 
+## Ver1.2.6 優先指示
+
+- 2026-09-08追加確定: 今回のPreset送信に対応する新しい返信が「動画生成に必要な利用枠（クォータ）が不足」と示す場合も生成停止トリガーとする。実上限banner・Chat無効化を必須にせず、生成を後回しにしてLocal→完成確認/Downloadへ進む。新規予約・即時再送は行わない。過去返信やalmost警告だけでは発火させない。
+- 2026-09-08ユーザー補正: 完成動画の確認・Downloadの可否はクォータ条件と無関係。クォータ不足中も各jobの再確認期限とartifact状態に基づき回収する。クォータ解除・Chat有効化を回収の前提にしない。Pause/Stop、認証・実際のアクセス可否、RAW安全gateは維持する。
+- 2026-09-08 live補正: almost警告中の送信直後、「回答しています…」によるtextarea disabled/readOnlyを実上限と誤認しない。almostとdisabled属性だけではCloud gateを閉じず、実上限到達・上限によるChat無効の明示表示を必要とする。明示hard limitが併存する場合はそちらを優先する。
+
+- 2026-09-08ユーザー確定: `You're almost at your AI usage limit. Limit resets at 16:21.` は上限接近警告であり、Chatが有効なら生成を継続する。実際の上限到達表示または上限表示に伴うChat無効化で生成待機へ移る。空入力による送信button無効をChat無効化と混同しない。警告はruntime表示・ログへ出し、job checkpointやhard limit待機を警告だけで変更しない。
+
+- `DJD-CHAPPY-V126-CURRENT-WINDOW-DUALGUI-PRESET-WORK-STEALING-SCHEDULER-FULL-001`を優先する。Chromeは現在process/profile/window状態で判定し、過去open/close結果は診断専用。版数はsource/live Gate後まで1.2.5を維持する。
+- 生成→local→期限到達artifact確認/Download→Error再診断→10分interruptible waitの優先順位を共通backendで実行する。Chat上限は生成だけを止め、artifactへの現在アクセス可否とは分離する。
+- 未完了/将来待ちjobがあるだけで自動終了しない。Errorはcheckpoint照合後に再開し、正常sourceを重複投入しない。再試行は永続最大3回、失敗jobのみterminalとし、成功件数とは区別する。
+- 両GUIの「再開」buttonだけを除去し、内部Resumeは維持する。Pause解除は既存の開始操作から行う。GUI切替時は共通job/runtime/preset snapshotを自動表示し、session内選択を共有する。アプリ再起動時のpreset選択は空のまま。
+- 全579 tests以上・source/live/EXE/package Gate PASS前はcommit/push禁止。本番原本は読み取りだけ、試験保存はcopy側。元3repoとphase2参照は変更しない。
+
 ## Ver1.2.5 上限待機・Pause・Dual GUI（今回の優先指示）
 
 - 指示 `DJD-CHAPPY-V125-LIMIT-PAUSE-DUALGUI-COMPONENT-ARCHITECTURE-FULL-001` を優先する。main Ver1.2.4 backendを正本とし、phase2 `f6f5871925f44718f51a106f7f55fa44e8f882b1` からpresentationのみ取り込む。phase2 ref自体と元3repoは変更しない。
@@ -93,7 +107,7 @@
 - 枯渇時に即時生成を反復しない。同一jobで即時生成と予約生成を二重実行しない。
 - 予約成功は完全一致した予約actionの実行後、remoteの予約待機状態を確認して確定する。
 - 予約・未回収情報は既存`system/jobs/*.json`へ永続化する。DBや終了時に失われるmemory-only stackを導入しない。
-- 未回収チェックは既存Notebook/artifactのみを対象とし、新規Notebook作成・動画再生成を行わない。reset前はremote操作を行わず、COMPLETEDは対象外とする。
+- 未回収チェックは既存Notebook/artifactのみを対象とし、新規Notebook作成・動画再生成を行わない。クォータreset前でも完成確認・Downloadを行い、COMPLETEDは対象外とする。
 
 ## Job state JSON persistence
 

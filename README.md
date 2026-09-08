@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver1.2.5
+# 台本から授業動画つくるマシーン Ver1.2.6
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、固定Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.2.5。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.2.6。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,7 +33,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.2.5`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.2.6`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 Ver1.2.4では1件のジョブ状態保存が既存の最大7回retryで復旧しない場合も、対象だけを「状態保存待ち」に隔離して他jobを続行します。Phase末尾で最大2回照合し、未解決は成功件数と分けて警告します。次回Startでは`system/recovery/deferred`のjournalとremote/local成果物を照合し、Preset・生成・予約・Downloadを盲目的に繰り返しません。journalも保存できなければmemoryに保持して警告します。詳細は[Ver1.2.4保存失敗隔離](docs/v124-jobstate-save-isolation.md)を参照してください。
 
@@ -41,11 +41,11 @@ Ver1.2.1ではStop/Window ×の協調停止と所有automation process限定の�
 
 ## Ver1.2 再開・移行
 
-Ver1.2.5では、AI使用量上限・Chat無効の表示を検出すると、表示解除時刻に固定5分を加えた時刻まで生成処理を停止します。待機は `system/cloud-limit.json` に保存され、再起動しても維持します。期限後もNotebookの上限表示とChat有効状態を再確認してから再開します。時刻を取得できなければ自動再開しません。配布検証・SHA-256は[最終Release Gate](docs/v125-final-release.md)を参照してください。
+Ver1.2.6では、AI使用量上限・Chat無効の明示表示、または今回の生成依頼に対応する返信の「動画生成に必要なクォータ不足」を検出すると、生成を後回しにします。almost警告だけ、回答中の一時的な入力無効化、過去の返信だけでは停止しません。解除時刻に固定5分を加えて `system/cloud-limit.json` に保存し、期限後も現在のUIを再確認してから再開します。時刻を取得できなければ自動再開しません。検証結果・配布SHA-256は[Ver1.2.6 Release Gate](docs/v126-final-release.md)を参照してください。
 
-上限中は新規Notebook、source投入、Preset/Chat送信、新規予約を行いません。既存のローカルRAW検証・Ending（任意）・HLS/ZIP・TXT移動・保存復旧を優先し、完成確認済み動画のDownloadも継続します。ローカル処理のためにremote削除を要求せず、未削除artifactは保持して削除待ち状態を残します。backlogが空ならNotebookを巡回せず待機します。
+上限中は新規Notebook、source投入、Preset/Chat送信、新規予約を行いません。ローカルRAW検証・Ending（任意）・HLS/ZIP・TXT移動・保存復旧の後も、期限到達jobの完成確認・Downloadを継続します。回収可否はクォータと無関係です。未削除artifactは保持して削除待ち状態を残します。実行可能な作業がなく未完了jobがあれば10分待機して再探索し、全件完了またはterminalになるまで自動終了しません。Errorはcheckpointから最大3回再試行し、失敗したjobだけをterminalとして他jobを続行します。
 
-画面下部の `GUIタイプ` から白基調PHASE1とCyber HUD PHASE2を選択できます。選択は次回起動時も復元します。両画面は同じ操作ID・処理・状態表示を使用します。切替は表示接続を安全に再構築できる処理停止中のみで、一時停止中は切替できません。一時停止は次のNotebook移動・送信・Download・ローカル工程開始を止めます。開始済みの短い操作やFFmpegは安全checkpointまで進め、`再開`で同じ実行位置から続けます。詳細は[上限待機・Pause・Dual GUI検証記録](docs/v125-limit-pause-dualgui.md)を参照してください。
+画面下部の `GUIタイプ` から白基調PHASE1とCyber HUD PHASE2を選択できます。GUI選択は次回起動時も復元します。両画面は同じ操作ID・処理・Preset Repository/ViewModelを使用し、切替後はjob・runtime・presetを自動表示します。同一sessionのpreset選択は共有し、アプリ再起動時は未選択になります。切替は処理停止中のみで、一時停止中は切替できません。一時停止は次のNotebook移動・送信・Download・ローカル工程開始を止めます。開始済みの短い操作やFFmpegは安全checkpointまで進め、`授業動画作成開始`で同じ位置から再開します。独立した`再開`ボタンはありません。
 
 通常時はVer1.2.3以降の生成投入優先を維持します。Phase Aで未生成jobを1件ずつ確認→生成開始→保存→次jobへ進め、全対象の投入判定後にPhase BでDownload・RAW検証・Ending（任意）・HLS/ZIP・TXT移動を行います。上限検出時だけローカル処理へ切り替えます。生成待機は保存した次回確認時刻までNotebookを開かず、Phase Bで完成を検出したjobはその場で回収します。全jobの確認だけを先に行う事前巡回はしません。
 

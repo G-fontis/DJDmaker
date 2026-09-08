@@ -105,7 +105,26 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
             browser.stop()
     if gate.due:
         raise RuntimeError('Live deadline already passed; do not fabricate a live block')
+    collection_source=root/'input/limit-collection.txt'
+    collection_source.write_text('isolated collection fixture',encoding='utf-8')
+    collection=Job(str(collection_source),id='limit-collection',state=JobState.WAITING_VIDEO,
+        notebook_id='fixture',notebook_url='https://notebook.google.com/notebook/fixture',
+        next_poll_at='2020-01-01T00:00:00+00:00')
+    service.jobs.save(collection)
+    collection_calls=[]
     class NoCloud:
+        def inspect_status(self,job):
+            assert job.id==collection.id
+            assert service.jobs.get(local.id).state is JobState.COMPLETED
+            collection_calls.append(['check',job.id])
+            return 'READY'
+        def download_artifact(self,job,destination):
+            assert job.id==collection.id
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            assert not destination.exists()
+            shutil.copyfile(fixture,destination)
+            collection_calls.append(['download',job.id])
+            return destination
         def __getattr__(self,name):
             if name in {'persist_identity','download_during_limit_verified'}:
                 raise AttributeError(name)
@@ -113,7 +132,8 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
                 calls.append(name)
                 raise AssertionError('Cloud action during limit: '+name)
             return forbidden
-    calls=[];errors=[];events=[];commands=[]
+    calls=[];errors=[];events=[];commands=[];wait_times=[]
+    long_wait=os.environ.get('DJD_PACKAGING_TEN_MINUTE_WAIT')=='1'
     validator=VideoValidator(ffprobe)
     pipe=PipelineCoordinator(jobs=service.jobs,notebook=NoCloud(),
         raw_store=RawSafeStore(validator,root/'raw_files'),ending=EndingEngineAdapter(ffmpeg,ffprobe,validator=validator),
@@ -123,6 +143,7 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
     service.pipeline_factory=lambda:pipe
     original=service._runtime_update
     def observe(record):
+        if record.get('stage')=='scheduler.wait': wait_times.append(time.monotonic())
         events.append(record.get('stage'));original(record)
     service._runtime_update=observe
     window.controller.operation_failed.disconnect(window._operation_failed)
@@ -140,32 +161,42 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
         assert window.bound_commands==REQUIRED_COMMANDS
         assert all(getattr(window,attr).property('command_id')==cmd.value for attr,cmd in BUTTON_COMMANDS.items())
         assert SettingsRepository(root/'system/settings.json').load().gui_type==mode
+        from PySide6.QtWidgets import QPushButton
+        assert not any(button.text()=='再開' for button in window.findChildren(QPushButton))
+        assert window.preset_combo.currentData()==preset.id
+        assert window.preset_repository.selected().id==preset.id
         window.grab().save(str(root/f'{mode}.png'))
         modes.append(mode)
     stage=0;paused_at=None;waited_at=None;started=time.monotonic()
     def tick():
         nonlocal stage,paused_at,waited_at
-        if time.monotonic()-started>180:
+        if time.monotonic()-started>(900 if long_wait else 180):
             errors.append(['timeout']);service.request_stop();stage=3
-        if stage==0 and service.jobs.get(local.id).state is JobState.COMPLETED:
+        if stage==0 and service.jobs.get(local.id).state is JobState.COMPLETED and service.jobs.get(collection.id).state is JobState.COMPLETED and wait_times:
             waited_at=time.monotonic();window.pause_button.click();commands.append(window.last_command);stage=1
         elif stage==1 and service.cancellation.paused.is_set():
             if paused_at is None: paused_at=time.monotonic()
             if time.monotonic()-paused_at>.5:
                 window.grab().save(str(root/'PAUSED.png'))
-                window.resume_button.click();commands.append(window.last_command);stage=2
-        elif stage==2 and not service.status()['paused'] and time.monotonic()-waited_at>2:
+                window.start_button.click();commands.append(window.last_command);stage=2
+        elif stage==2 and not service.status()['paused'] and time.monotonic()-waited_at>2 and (not long_wait or len(wait_times)>=2 and wait_times[-1]-wait_times[0]>=600):
             window.stop_button.click();commands.append(window.last_command);stage=3
         if stage==3 and service._worker is None and not window.controller.busy:
             item=service.jobs.get(local.id)
             passed=(not calls and not errors and item.state is JobState.COMPLETED and item.safety_gate.remote_deletion_allowed
                 and item.ending_result.startswith('SKIPPED') and item.hls_result=='PASS' and item.txt_move_status=='MOVED'
-                and all(j.state is JobState.WAITING for j in service.jobs.list() if j.id!=local.id)
+                and all(j.state is JobState.WAITING for j in service.jobs.list() if j.id not in {local.id,collection.id})
+                and service.jobs.get(collection.id).state is JobState.COMPLETED
+                and collection_calls==[['check',collection.id],['download',collection.id]]
+                and (not long_wait or len(wait_times)>=2 and wait_times[-1]-wait_times[0]>=600)
                 and gate.blocked and not gate.due and stage==3 and paused_at is not None)
             result=dict(passed=passed,modes=modes,commands=commands,cloud_calls=calls,errors=errors,events=events,
                 local_state=item.state.value,raw_gate=item.safety_gate.remote_deletion_allowed,ending=item.ending_result,
                 hls=item.hls_result,zip=item.zip_path,txt_move=item.txt_move_status,limit=gate.status(),queued=100)
             result['limit_evidence'] = 'prior_live_observation' if observed_limit else 'real_chrome_local_dom_fixture'
+            result.update(collection_calls=collection_calls,collection_state=service.jobs.get(collection.id).state.value,
+                wait_rescan_seconds=wait_times[-1]-wait_times[0] if len(wait_times)>1 else None,
+                ten_minute_wait_requested=long_wait,preset_shared=True,resume_buttons=0)
             report.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
             timer.stop();window.close();app.exit(0 if passed else 9)
     timer=QTimer();timer.timeout.connect(tick);timer.start(100)

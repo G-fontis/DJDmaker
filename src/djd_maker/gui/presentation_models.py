@@ -38,3 +38,15 @@ class CreditLimitViewModel:
         seconds=state.get('remaining_seconds')
         remaining = '時刻確認必要' if seconds is None else f'{seconds//3600:02}:{seconds//60%60:02}:{seconds%60:02}'
         return cls(True,f"AI LIMIT / CLOUD PAUSED — Notebook再開予定: {state.get('cloud_resume_at') or '時刻確認必要'} / 残り: {remaining} / ローカル処理を優先")
+@dataclass(frozen=True)
+class PresetViewModel:
+    items: tuple
+    selected_id: str | None
+
+    @classmethod
+    def load(cls, repository):
+        if repository is None:
+            return cls((), None)
+        items = tuple(repository.list())
+        selected = repository.selected()
+        return cls(items, selected.id if selected else None)

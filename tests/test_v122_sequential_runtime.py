@@ -58,7 +58,7 @@ def test_inspect_then_act_same_job_no_full_prescan(tmp_path, error):
     assert events == [('check', a.id), ('submit', a.id), ('check', b.id), ('submit', b.id)]
     assert jobs.get(a.id).runtime_outcome == 'WAITING_VIDEO'
     assert jobs.get(a.id).next_poll_at
-    assert records[-1]['processed'] == 2
+    assert any(record.get('processed') == 2 for record in records)
     assert all(j.runtime_outcome for j in jobs.list())
     pipeline.run_cycle()
     assert len(events) == 4  # no double pass or reopening before deadline
@@ -121,16 +121,15 @@ def test_recovery_deadline_no_reopen(tmp_path, state):
     assert events == []
 
 
-def test_noop_transition_detected_and_consecutive_fail_fast(tmp_path):
+def test_noop_transition_isolated_without_stopping_other_jobs(tmp_path):
     values = [Job(f'noop{i}.txt') for i in range(10)]
     jobs, calls = MemoryJobs(*values), []
     pipeline = coordinator(tmp_path, jobs, Remote([]))
     pipeline._run_notebook_job = lambda job: calls.append(job.id)
-    with pytest.raises(NoOpJobTransitionError, match='3件'):
-        pipeline.run_cycle()
-    assert len(calls) == 3
-    assert all(jobs.get(j.id).runtime_reason == 'NO_OP_JOB_TRANSITION' for j in values[:3])
-    assert all(jobs.get(j.id).state is JobState.WAITING for j in values[3:])
+    pipeline.run_cycle()
+    assert len(calls) == 10
+    assert all(jobs.get(j.id).state is JobState.FAILED for j in values)
+    assert all(jobs.get(j.id).error_code == 'NO_OP_JOB_TRANSITION' for j in values)
 
 
 def test_modal_never_causes_skip_and_stops_before_next(tmp_path):

@@ -320,7 +320,9 @@ class SettingsRepository:
         self.settings = settings
 
 
-def test_fake_notebook_runs_through_gui_bridge_to_completed_zip(tmp_path: Path) -> None:
+def test_fake_notebook_runs_through_gui_bridge_to_completed_zip(tmp_path: Path, monkeypatch) -> None:
+    # Accelerated controller integration test; production rescan stays 600 s.
+    monkeypatch.setattr('djd_maker.orchestration.pipeline.RESCAN_SECONDS', 0.01)
     app = QApplication.instance() or QApplication([])
     source = tmp_path / "input" / "授業.txt"
     source.parent.mkdir()

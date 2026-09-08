@@ -410,7 +410,10 @@ class GuiPipelineController:
                     if not self._job_updates_bound:
                         self._jobs_callback(values)
                     self._publish_status(values)
-                    if values and all(
+                    complete = getattr(self.pipeline, 'all_tasks_completed', None)
+                    if callable(complete) and complete():
+                        break
+                    if not callable(complete) and values and all(
                         job.id in getattr(self.pipeline, 'deferred_ids', set()) or job.state
                         in {
                             JobState.COMPLETED,
@@ -420,9 +423,8 @@ class GuiPipelineController:
                         for job in values
                     ):
                         break
-                limit = getattr(self.pipeline, 'cloud_limit', None)
-                interval = max(1.0, self.cycle_interval_seconds) if limit and limit.blocked else self.cycle_interval_seconds
-                self._stop_event.wait(interval)
+                interval = getattr(self.pipeline, 'wait_seconds', 0) or self.cycle_interval_seconds
+                self.cancellation.wait(interval)
         except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError) as exc:
             self.cancellation.request()
             self._error_callback('modal' if isinstance(exc, BlockingModalError) else 'pipeline', str(exc))
@@ -474,6 +476,7 @@ class GuiPipelineController:
             "pause_state": ('PAUSED' if self.cancellation.paused.is_set() else 'PAUSE_REQUESTED') if paused else None,
             "cloud_limit": self.pipeline.cloud_limit.status() if hasattr(self.pipeline, 'cloud_limit') else self.cloud_limit.status() if hasattr(self, 'cloud_limit') else {},
             "scheduler_mode": self.scheduler.mode.value,
+            "scheduler": dict(getattr(self.pipeline, 'scheduler_view', {})),
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
             "phase": self._phase,
             "runtime": dict(self._runtime),

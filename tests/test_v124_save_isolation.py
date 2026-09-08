@@ -147,7 +147,7 @@ def test_journal_restart_reconciles_instead_of_submitting(tmp_path):
     remote = Remote()
     pipeline = coordinator(tmp_path, jobs, remote)
     pipeline.deferred = DeferredStateStore(tmp_path / 'recovery')
-    pipeline._retry_deferred = lambda: None
+    pipeline._retry_deferred = lambda **kwargs: None
     pipeline.run_cycle()
     assert (tmp_path / 'recovery/one.json').is_file()
     jobs._deferred_state = DeferredStateStore(tmp_path / 'recovery')
@@ -388,7 +388,7 @@ def test_invalid_existing_zip_stays_deferred(tmp_path):
     assert output.read_bytes() == b'not zip'
 
 
-def test_gui_controller_finishes_with_deferred_summary_not_error(tmp_path):
+def test_gui_controller_waits_with_deferred_state_until_explicit_stop(tmp_path):
     from djd_maker.orchestration.gui_controller import GuiPipelineController
     from djd_maker.orchestration.scheduler import PersistentPollScheduler
     from djd_maker.core.settings import AppSettings
@@ -404,12 +404,18 @@ def test_gui_controller_finishes_with_deferred_summary_not_error(tmp_path):
     controller.bind(jobs=lambda _:None, status=lambda _:None, log=logs.append, error=lambda *args:errors.append(args))
     controller.start()
     worker = controller._worker or controller._retiring_worker
-    worker.join(timeout=10)
-    assert not worker.is_alive()
-    assert not errors
-    assert jobs.get('good').state is JobState.COMPLETED
+    try:
+        import time
+        deadline = time.monotonic()+10
+        while jobs.get('good').state is not JobState.COMPLETED and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert worker.is_alive()
+        assert not errors
+        assert jobs.get('good').state is JobState.COMPLETED
+        assert not pipeline.all_tasks_completed()
+    finally:
+        controller.shutdown()
     assert any(item.get('stage') == 'save.summary' and item['level'] == 'WARNING' for item in logs)
-    controller.shutdown()
     assert not worker.is_alive()
 
 

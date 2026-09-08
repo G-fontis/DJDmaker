@@ -5,6 +5,7 @@ from contextvars import ContextVar
 _sink = ContextVar('runtime_sink', default=None)
 
 LABELS = {
+    'limit.warning': 'AI使用量上限に接近（生成継続）',
     'save.deferred': '状態保存待ち・他job続行', 'save.retry': '状態保存を再試行',
     'save.recovered': '状態保存を復旧', 'save.unresolved': '状態保存保留',
     'save.summary': '保存保留を含む処理結果',

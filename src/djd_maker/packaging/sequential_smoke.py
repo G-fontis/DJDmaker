@@ -36,7 +36,8 @@ def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) 
     preset = window.preset_repository.create('release fixture', 'never sent to Google')
     window.preset_repository.select(preset.id)
     calls, runtime, errors, dialogs, table_updates = [], [], [], [], []
-    fault = {'enabled': False, 'attempts': 0, 'recovered': False, 'isolation': False, 'overlay': False}
+    fault = {'enabled': False, 'attempts': 0, 'recovered': False, 'isolation': False, 'overlay': False,
+             'controlled_stop_after_wait': False}
     original_replace = os.replace
     def fault_replace(source, destination):
         if save_fault and fault['enabled'] and Path(destination) == root/'system/jobs/release0.json':
@@ -120,6 +121,14 @@ def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) 
         window.start_processing()
     start=time.monotonic()
     def tick():
+        # V126 deliberately waits while a save-deferred job remains. Observe
+        # that wait, then use an explicit Stop for the restart-recovery test.
+        if (save_fault and not fault['recovered'] and not fault['controlled_stop_after_wait']
+                and service._worker is not None and pipeline.wait_seconds
+                and service.jobs.get('release1').state is JobState.COMPLETED
+                and pipeline.deferred_ids == {'release0'}):
+            fault['controlled_stop_after_wait'] = True
+            service.request_stop()
         if time.monotonic()-start>120:
             errors.append(['timeout']);service.stop()
         if time.monotonic()-start>3 and service._worker is None:

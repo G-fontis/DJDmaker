@@ -25,6 +25,7 @@ class CommandId(StrEnum):
     OUTPUT_OPEN = 'CMD_OUTPUT_OPEN'
     ENDING_CHANGE = 'CMD_ENDING_CHANGE'
     ENDING_PREVIEW = 'CMD_ENDING_PREVIEW'
+    PRESET_SELECT = 'CMD_PRESET_SELECT'
 
 
 REQUIRED_COMMANDS = frozenset(CommandId)
@@ -35,7 +36,6 @@ BUTTON_COMMANDS = {
     'reload_button': CommandId.SCRIPT_RELOAD,
     'recover_button': CommandId.RECOVERY_START,
     'pause_button': CommandId.PAUSE,
-    'resume_button': CommandId.RESUME,
     'stop_button': CommandId.STOP,
     'log_button': CommandId.LOG_OPEN,
     'details_button': CommandId.JOB_DETAIL_OPEN,
@@ -66,6 +66,9 @@ def validate_payload(command, payload):
         expected = 'PHASE1' if command == CommandId.GUI_SWITCH_PHASE1 else 'PHASE2'
         if payload != {'gui_type': expected}:
             raise InterfaceError('INTERFACE_ERROR: GUI type/command mismatch')
+    elif command == CommandId.PRESET_SELECT:
+        if set(payload) != {'preset_id'} or (payload['preset_id'] is not None and not isinstance(payload['preset_id'], str)):
+            raise InterfaceError('INTERFACE_ERROR: invalid preset ID')
     elif payload:
         raise InterfaceError('INTERFACE_ERROR: unexpected payload')
 

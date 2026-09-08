@@ -177,10 +177,12 @@ class SettingsDialog(QDialog):
 
     def _reload_presets(self, select_id: str | None = None) -> None:
         assert self.preset_repository is not None
+        from .presentation_models import PresetViewModel
+        view = PresetViewModel.load(self.preset_repository)
         if select_id is None:
             selected = self.preset_repository.selected()
             select_id = selected.id if selected else None
-        presets = self.preset_repository.list()
+        presets = view.items
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
         for preset in presets:

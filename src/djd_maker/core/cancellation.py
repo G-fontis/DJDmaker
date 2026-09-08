@@ -31,6 +31,7 @@ class CancellationToken:
             if not self.pause_requested:
                 self._pause_started = time.monotonic()
             self.pause_requested = True
+            self._condition.notify_all()
 
     def resume(self):
         with self._condition:
@@ -82,10 +83,12 @@ class CancellationToken:
             self.navigation_count += 1
 
     def wait(self, seconds):
-        self.check()
-        if self.event.wait(max(0, seconds)):
-            raise RunCancelled('STOP_REQUESTED')
-        self.check()
+        deadline = time.monotonic() + max(0, seconds)
+        with self._condition:
+            self.check()
+            while time.monotonic() < deadline:
+                self._condition.wait(max(0, deadline-time.monotonic()))
+                self.check()
 
     def diagnostic(self):
         return dict(stop_requested_at=self.requested_at, current_operation=self.operation,
