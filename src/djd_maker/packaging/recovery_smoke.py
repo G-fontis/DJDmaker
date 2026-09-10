@@ -1,6 +1,7 @@
 """Opt-in v127 EXE acceptance. Synthetic DOM/clock; no Google side effects."""
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -109,9 +110,12 @@ def run_recovery_smoke(root, report):
         ffprobe = resolve_executable('ffprobe', tools/'ffprobe.exe' if (tools/'ffprobe.exe').exists() else None)
         raw = root/'fixture.mp4'
         _make_fixture(ffmpeg, raw, 'blue', 2)
+        raw_a, raw_b = root/'a.mp4', root/'b.mp4'
+        for owned_raw in (raw_a, raw_b):
+            shutil.copy2(raw, owned_raw)
         local_repo = JobRepository(root/'priority/jobs')
-        a = Job(str(root/'a.txt'), id='priority-a', state=JobState.HLS_ENCODING, raw_path=str(raw), edited_path=str(raw))
-        b = Job(str(root/'b.txt'), id='priority-b', state=JobState.HLS_ENCODING, raw_path=str(raw), edited_path=str(raw))
+        a = Job(str(root/'a.txt'), id='priority-a', state=JobState.HLS_ENCODING, raw_path=str(raw_a), edited_path=str(raw_a))
+        b = Job(str(root/'b.txt'), id='priority-b', state=JobState.HLS_ENCODING, raw_path=str(raw_b), edited_path=str(raw_b))
         c = Job(str(root/'c.txt'), id='priority-c')
         for item in (a,b,c): local_repo.save(item)
         clock = [datetime.now().astimezone()]
@@ -148,6 +152,8 @@ def run_recovery_smoke(root, report):
         assert local_repo.get(b.id).state is JobState.COMPLETED
         data['quota_recovery_priority'] = 'PASS'
         data['hls_zip_resume'] = 'PASS'
+        data['ready_failed_retention'] = _ready_failed_retention_smoke(
+            root/'ready-failed-retention', raw, ffmpeg, ffprobe)
         data['passed'] = True
     except Exception as exc:
         import traceback
@@ -157,3 +163,93 @@ def run_recovery_smoke(root, report):
         browser.stop()
         report.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     return 0 if data['passed'] else 9
+
+
+def _ready_failed_retention_smoke(root, media_fixture, ffmpeg, ffprobe):
+    """Synthetic remote READY; real download copy, RAW validation and HLS/ZIP.
+
+    This does not contact Google and must never be reported as live acceptance.
+    All runtime state and generated media stay below the opt-in smoke root.
+    """
+    from dataclasses import asdict
+    from hashlib import sha256
+    from djd_maker.adapters.ending import EndingEngineAdapter
+    from djd_maker.adapters.hls import HlsAdapter
+    from djd_maker.core.models import Job, JobState
+    from djd_maker.core.repositories import JobRepository
+    from djd_maker.media.validator import VideoValidator
+    from djd_maker.media.raw_store import RawSafeStore
+    from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
+    from djd_maker.testing.fake_notebook import FakeNotebookAdapter
+
+    root.mkdir(parents=True, exist_ok=False)
+    source = root/'missing-input'/'ready lesson.txt'
+    identity = '00000000-0000-4000-8000-000000000128'
+    job = Job(str(source), id='ready-failed-retention', state=JobState.FAILED,
+              error_code='NOTEBOOK_STAGE_FAILED', failure_class='FATAL_FAILED',
+              notebook_id=identity, notebook_url='https://notebook.google.com/notebook/'+identity,
+              source_sha256=sha256(b'isolated missing source fixture').hexdigest())
+    repository = JobRepository(root/'system/jobs')
+    repository.save(job)
+    calls = []
+    class RetentionFixture(FakeNotebookAdapter):
+        def submit(self, item):
+            calls.append('submit')
+            raise AssertionError('READY must not submit a generation request')
+        def upload_txt(self, source):
+            calls.append('upload')
+            raise AssertionError('READY must not upload the missing TXT')
+        def inspect_status(self, item):
+            calls.append('inspect')
+            return super().inspect_status(item)
+        def download_artifact(self, item, destination):
+            calls.append('download')
+            return super().download_artifact(item, destination)
+        def delete_video_artifact(self, item, gate):
+            calls.append('delete')
+            raise AssertionError('Normal recovery must retain remote artifacts')
+    notebook = RetentionFixture({str(source): media_fixture}, {job.id: 'READY'})
+    validator = VideoValidator(ffprobe)
+    pipeline = PipelineCoordinator(jobs=repository, notebook=notebook,
+        raw_store=RawSafeStore(validator, root/'raw'),
+        ending=EndingEngineAdapter(ffmpeg, ffprobe, validator=validator),
+        hls=HlsAdapter(ffmpeg, ffprobe), validator=validator,
+        paths=PipelinePaths(root/'raw', root/'output', root/'work', None),
+        ffmpeg_concurrency=1)
+    stages = []
+    observations = {}
+    def record(event):
+        stage = event.get('stage')
+        stages.append(stage)
+        if stage == 'raw.saved':
+            observations['after_download'] = notebook.inspect_status(repository.require(job.id))
+    pipeline.runtime_callback = record
+    pipeline.run_cycle()
+    result = repository.require(job.id)
+    assert result.state is JobState.COMPLETED
+    assert not source.exists()
+    assert result.raw_path
+    validator.validate(Path(result.raw_path))
+    assert result.zip_path and Path(result.zip_path).is_file()
+    from djd_maker.core.completed_reconciliation import validated_output
+    assert validated_output(result, root/'output')
+    assert len(asdict(result.safety_gate)) == 12
+    assert not result.safety_gate.failed_checks
+    assert result.artifact_status == 'RETAINED'
+    assert observations.get('after_download') == 'READY'
+    observations['after_completed'] = notebook.inspect_status(result)
+    assert observations['after_completed'] == 'READY'
+    assert 'ending.skip' in stages
+    assert notebook.download_calls == [job.id]
+    assert not any(action in calls for action in ('submit', 'upload', 'delete'))
+    before_repeat = list(calls)
+    pipeline.begin_run()
+    pipeline.run_cycle()
+    assert calls == before_repeat
+    assert repository.require(job.id).state is JobState.COMPLETED
+    return dict(passed=True, mode='SYNTHETIC_REMOTE_READY_REAL_MEDIA', live=False,
+        source_missing=True, raw_12_gate='PASS', ending='SKIPPED', hls_zip='PASS',
+        completed=True, artifact_status=result.artifact_status,
+        remote_observations=observations, submit_calls=0, upload_calls=0,
+        delete_calls=0, download_calls=len(notebook.download_calls),
+        repeat_run_new_actions=0, stages=stages)

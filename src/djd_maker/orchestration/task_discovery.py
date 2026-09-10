@@ -21,9 +21,16 @@ class Capabilities:
         return cls(not blocked, not blocked, not blocked)
 
 
+def remote_reconcile_candidate(job):
+    return (job.state is JobState.FAILED and bool(job.notebook_id or job.notebook_url
+            or job.error_code == 'NOTEBOOK_STAGE_FAILED')
+            and not job.duplicate_of_job_id and job.failure_class != 'OUTPUT_BLOCKED' and job.error_code != 'OUTPUT_NAME_COLLISION'
+            and not (job.failure_class == 'TERMINAL_FAILED' and job.remote_checkpoint is not None))
+
+
 def terminal(job):
     return bool(job.duplicate_of_job_id) or job.state is JobState.COMPLETED or (
-        job.state in {JobState.FAILED,JobState.DOWNLOAD_VERIFY_FAILED} and job.failure_class == 'TERMINAL_FAILED' and
+        not remote_reconcile_candidate(job) and job.state in {JobState.FAILED,JobState.DOWNLOAD_VERIFY_FAILED} and job.failure_class == 'TERMINAL_FAILED' and
         any(job.attempt_by_stage.get(key,0) >= MAX_ERROR_ATTEMPTS
             for key in ('scheduler.recovery','source.reupload','generation.failed_retry')))
 
@@ -41,7 +48,8 @@ def final_discovery(jobs, now, blocked=False, deferred=()):
         local=job.state in {JobState.RAW_READY,JobState.ENDING,JobState.HLS_ENCODING,JobState.ZIPPING}
         remote=job.state in {JobState.GENERATING,JobState.WAITING_VIDEO,JobState.DOWNLOAD_PENDING,
                             JobState.DOWNLOADING,JobState.RECOVERY_PENDING,JobState.RESERVED_WAITING_CREDIT_RESET}
-        allowed=job.id not in deferred and job.failure_class not in {'FATAL_FAILED','OUTPUT_BLOCKED'}
+        remote = remote or remote_reconcile_candidate(job)
+        allowed=job.id not in deferred and (remote_reconcile_candidate(job) or job.failure_class not in {'FATAL_FAILED','OUTPUT_BLOCKED'})
         if allowed and (local or due(job,now) and (remote or not blocked)):
             runnable.append(job.id)
         else:

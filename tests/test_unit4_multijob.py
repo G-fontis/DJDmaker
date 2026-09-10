@@ -215,11 +215,8 @@ def test_three_jobs_keep_identity_raw_immutable_and_zip_mapping(tmp_path: Path) 
         "DJD_MULTI_003",
     }
     assert all(job.notebook_url and job.id in job.notebook_url for job in completed)
-    assert [item for item in notebook.events if item[0] == "delete"] == [
-        ("delete", "job-1"),
-        ("delete", "job-2"),
-        ("delete", "job-3"),
-    ]
+    assert [item for item in notebook.events if item[0] == "delete"] == []
+    assert all(job.artifact_status == 'RETAINED' for job in completed)
     for index, job in enumerate(completed, 1):
         stem = f"DJD_MULTI_{index:03}"
         raw = Path(job.raw_path or "")
@@ -293,7 +290,8 @@ def test_existing_zip_is_collision_not_another_jobs_mapping(tmp_path: Path) -> N
 
     failed = jobs.get(job.id)
     assert failed is not None and failed.state is JobState.FAILED
-    assert failed.error_code == "MEDIA_STAGE_FAILED"
+    assert failed.error_code == "OUTPUT_EXISTING_UNVERIFIED"
+    assert failed.failure_class == 'OUTPUT_BLOCKED'
     assert existing.read_bytes() == before
     assert failed.zip_path is None
 

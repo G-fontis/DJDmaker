@@ -38,9 +38,11 @@ def test_generating_deadline_due_reschedule_then_ready_same_job(tmp_path):
     remote.statuses[job.id] = 'READY'
     clock.advance(1)
     pipeline.run_cycle()
-    assert calls[-3:] == [('poll', job.id), ('download', job.id), ('delete', job.id)]
+    assert calls[-2:] == [('poll', job.id), ('download', job.id)]
+    assert not any(action == 'delete' for action, _ in calls)
     completed = jobs.get(job.id)
     assert completed.state is JobState.COMPLETED
+    assert completed.artifact_status == 'RETAINED'
     assert completed.safety_gate.remote_deletion_allowed
     assert completed.ending_result == 'SKIPPED (not configured)'
     assert completed.hls_result == 'PASS'

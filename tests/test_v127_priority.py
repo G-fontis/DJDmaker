@@ -10,10 +10,11 @@ from test_v125_limit_pause_contract import NOW
 
 @pytest.mark.parametrize('stage', ['ENDING', 'HLS_ENCODING'])
 def test_quota_recovery_preempts_next_local_after_running_task_finishes(tmp_path, stage):
-    raw = tmp_path/'raw.mp4'
-    raw.write_bytes(b'raw')
-    a = Job('a.txt', state=JobState(stage), raw_path=str(raw), edited_path=str(raw))
-    b = Job('b.txt', state=JobState.HLS_ENCODING, raw_path=str(raw), edited_path=str(raw))
+    raw_a, raw_b = tmp_path/'a.mp4', tmp_path/'b.mp4'
+    for raw in (raw_a, raw_b):
+        raw.write_bytes(b'raw')
+    a = Job('a.txt', state=JobState(stage), raw_path=str(raw_a), edited_path=str(raw_a))
+    b = Job('b.txt', state=JobState.HLS_ENCODING, raw_path=str(raw_b), edited_path=str(raw_b))
     c = Job('c.txt')
     repo = MemoryJobs(a, b, c)
     remote = Remote([])
@@ -72,12 +73,13 @@ def test_hls_checkpoint_yields_before_zip_and_resumes_without_reencoding(tmp_pat
     from pathlib import Path
     from types import SimpleNamespace
     from djd_maker.adapters.hls import HlsAdapter, ProbeResult
-    raw = tmp_path/'raw.mp4'
-    raw.write_bytes(b'raw')
+    raw_a, raw_b = tmp_path/'a.mp4', tmp_path/'b.mp4'
+    for raw in (raw_a, raw_b):
+        raw.write_bytes(b'raw')
     tool = tmp_path/'tool.exe'
     tool.touch()
-    a = Job('a.txt', state=JobState.HLS_ENCODING, raw_path=str(raw), edited_path=str(raw))
-    b = Job('b.txt', state=JobState.HLS_ENCODING, raw_path=str(raw), edited_path=str(raw))
+    a = Job('a.txt', state=JobState.HLS_ENCODING, raw_path=str(raw_a), edited_path=str(raw_a))
+    b = Job('b.txt', state=JobState.HLS_ENCODING, raw_path=str(raw_b), edited_path=str(raw_b))
     c = Job('c.txt')
     repo = MemoryJobs(a, b, c)
     remote = Remote([])

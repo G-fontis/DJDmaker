@@ -377,7 +377,7 @@ def test_fake_notebook_runs_through_gui_bridge_to_completed_zip(tmp_path: Path, 
         time.sleep(0.01)
 
     assert jobs.get(job.id).state is JobState.COMPLETED
-    assert notebook.artifact_delete_calls == [job.id]
+    assert notebook.artifact_delete_calls == []
     assert Path(jobs.get(job.id).zip_path or "").is_file()
     window.close()
     pool.waitForDone(2000)

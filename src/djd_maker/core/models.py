@@ -156,6 +156,7 @@ class Job:
     edited_path: str | None = None
     ending_result: str | None = None
     zip_path: str | None = None
+    output_zip_sha256: str | None = None
     hls_result: str | None = None
     hls_checkpoint_directory: str | None = None
     hls_source_sha256: str | None = None
@@ -166,6 +167,8 @@ class Job:
     resume_schema_version: int = 1
     failure_class: str | None = None
     source_status: str = "UNKNOWN"
+    local_error_code: str | None = None
+    remote_checkpoint: str | None = None
     resume_checkpoint: str | None = None
     runtime_outcome: str | None = None
     runtime_reason: str | None = None

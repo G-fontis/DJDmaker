@@ -294,7 +294,11 @@ def test_validated_hls_zip_checkpoint_never_reencodes(tmp_path, monkeypatch, sta
     raw = tmp_path / 'raw.mp4'
     _make_fixture(Path(ffmpeg), raw, 'blue', 1)
     from dataclasses import replace
-    jobs = FaultJobs(Job('one.txt', id='one', state=JobState.RAW_READY, raw_path=str(raw)), once_stage=stage)
+    from hashlib import sha256
+    source = tmp_path / 'one.txt'
+    source.write_text('checkpoint source', encoding='utf-8')
+    jobs = FaultJobs(Job(str(source), id='one', state=JobState.RAW_READY, raw_path=str(raw),
+                         source_sha256=sha256(source.read_bytes()).hexdigest()), once_stage=stage)
     pipeline = coordinator(tmp_path, jobs, Remote())
     pipeline.paths = replace(pipeline.paths, ending_video=None)
     pipeline.hls = hls.HlsAdapter(ffmpeg, ffprobe)

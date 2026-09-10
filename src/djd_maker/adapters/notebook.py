@@ -864,6 +864,9 @@ class NotebookDomAdapter:
                 self.wait_for_source_ready(source.name)
                 return
             if state == "MISSING":
+                job = getattr(self, 'source_recovery_job', None)
+                if job is not None:
+                    NotebookEngineAdapter._verify_local_source(job, source)
                 self.upload_txt(source)
             elif state == "ERROR":
                 self.check_usage_limit()
@@ -872,6 +875,8 @@ class NotebookDomAdapter:
                 used = job.attempt_by_stage.get('source.reupload', 0) if job else attempt-1
                 if used >= 3:
                     raise SourceRetryExhausted('SOURCE_RETRY_EXHAUSTED: Source再uploadは最大3回です')
+                if job is not None:
+                    NotebookEngineAdapter._verify_local_source(job, source)
                 if job:
                     job.attempt_by_stage['source.reupload'] = used+1
                     job.source_status = SourceState.FAILED.value
@@ -1493,11 +1498,8 @@ class NotebookEngineAdapter:
         source = Path(job.source_path)
         self.dom.source_recovery_job = job
         self.dom.source_recovery_persist = self.persist_identity
-        from hashlib import sha256
-        source_hash = sha256(source.read_bytes()).hexdigest()
-        if job.source_sha256 and job.source_sha256 != source_hash:
-            raise NotebookAdapterError("SOURCE_IDENTITY_CHANGED: 開始時のTXTと内容が異なります")
-        job.source_sha256 = source_hash
+        if bool(job.notebook_id) != bool(job.notebook_url):
+            self._open_job(job)
         if job.notebook_id and job.notebook_url:
             self._open_job(job)
             metadata = ResumeMetadata(job.notebook_id, job.notebook_url, job.script_name)
@@ -1523,6 +1525,7 @@ class NotebookEngineAdapter:
                 if status != 'NOT_STARTED':
                     raise NotebookAdapterError("REMOTE_DIAGNOSIS_UNCERTAIN: 既存artifact状態を確定できません")
         else:
+            self._verify_local_source(job, source)
             report_operation('notebook.create')
             metadata = self.dom.create_notebook()
             # Persist before rename/upload, not only before generation.
@@ -1562,6 +1565,17 @@ class NotebookEngineAdapter:
             metadata.notebook_url,
             outcome,
         )
+
+    @staticmethod
+    def _verify_local_source(job: Job, source: Path) -> None:
+        """Local input is required only before an upload, not remote recovery."""
+        from hashlib import sha256
+        if not source.is_file():
+            raise NotebookAdapterError('LOCAL_SOURCE_FILE_MISSING: 台本TXTが見つかりません')
+        source_hash = sha256(source.read_bytes()).hexdigest()
+        if job.source_sha256 and job.source_sha256 != source_hash:
+            raise NotebookAdapterError('SOURCE_IDENTITY_CHANGED: 開始時のTXTと内容が異なります')
+        job.source_sha256 = source_hash
 
     def retry_failed_generation(self, job: Job) -> NotebookSubmissionResult:
         """Bounded current-state retry via the original immutable chat snapshot."""
@@ -1649,6 +1663,13 @@ class NotebookEngineAdapter:
         return False
 
     def _open_job(self, job: Job) -> None:
+        if bool(job.notebook_id) != bool(job.notebook_url):
+            from djd_maker.core.notebook_identity import notebook_identity
+            identity = notebook_identity(job.notebook_id, job.notebook_url)
+            if identity:
+                job.notebook_id, job.notebook_url = identity
+                if self.persist_identity is not None:
+                    self.persist_identity(job)
         if not job.notebook_url:
             raise NotebookAdapterError("jobにNotebook URLがありません")
         parsed = urlparse(job.notebook_url)

@@ -78,11 +78,13 @@ def test_ready_artifact_deferred_until_next_job_dispatched(tmp_path):
     pipeline.scheduler = PersistentPollScheduler(jobs)
     pipeline.run_cycle()
     assert events.index(('check', b.id)) < events.index(('download', a.id))
-    assert events.index(('submit', b.id)) < events.index(('delete', a.id))
+    assert events.index(('submit', b.id)) < events.index(('download', a.id))
+    assert not any(event == 'delete' for event, _ in events)
+    assert jobs.get(a.id).artifact_status == 'RETAINED'
 
 
-@pytest.mark.parametrize('state,reason', [(JobState.COMPLETED, 'COMPLETED_SKIP'), (JobState.FAILED, 'FATAL_FAILED')])
-def test_completed_and_fatal_never_open(tmp_path, state, reason):
+@pytest.mark.parametrize('state,reason', [(JobState.COMPLETED, 'COMPLETED_SKIP'), (JobState.FAILED, 'SOURCE_READY')])
+def test_completed_skips_but_bare_fatal_reconciles_remote(tmp_path, state, reason):
     job = failed('skip', 'FATAL_ERROR')
     job.state = state
     jobs = MemoryJobs(job)
@@ -91,10 +93,14 @@ def test_completed_and_fatal_never_open(tmp_path, state, reason):
     pipeline = coordinator(tmp_path, jobs, Remote(events))
     pipeline.runtime_callback = records.append
     pipeline.run_cycle()
-    assert events == []
+    assert events == ([] if state is JobState.COMPLETED else [('check', job.id)])
     assert any(r.get('decision') == reason for r in records)
     if state is JobState.COMPLETED:
         assert jobs.get(job.id).to_dict() == before
+    else:
+        assert jobs.get(job.id).state is JobState.WAITING
+        assert jobs.get(job.id).remote_checkpoint == 'SOURCE_READY'
+        assert jobs.get(job.id).failure_class == 'PRESET_SEND_FAILED'
 
 
 def test_generating_saves_deadline_and_waiting_not_reopened(tmp_path):
@@ -277,12 +283,16 @@ def test_real_submit_adapter_source_and_preset_before_next(tmp_path, source_stat
     assert events.index(('send_current', values[0].id)) < events.index(('source_ready', values[1].id))
 
 
-def test_cached_fatal_classification_prevents_remote_open(tmp_path):
+def test_cached_fatal_classification_requires_remote_reconcile(tmp_path):
     job = failed('fatal')
     job.failure_class = 'FATAL_FAILED'
     events = []
-    coordinator(tmp_path, MemoryJobs(job), Remote(events)).run_cycle()
-    assert events == []
+    jobs = MemoryJobs(job)
+    coordinator(tmp_path, jobs, Remote(events)).run_cycle()
+    assert events == [('check', job.id)]
+    assert jobs.get(job.id).state is JobState.WAITING
+    assert jobs.get(job.id).remote_checkpoint == 'SOURCE_READY'
+    assert jobs.get(job.id).failure_class == 'PRESET_SEND_FAILED'
 
 
 def test_idle_status_not_spammed_and_no_repeated_disk_save(tmp_path):
@@ -335,7 +345,7 @@ def test_media_failure_not_retried_in_same_run_or_foreign_zip_adopted(tmp_path):
     pipeline.begin_run()
     pipeline.run_cycle()
     assert jobs.get(job.id).state is JobState.FAILED
-    assert jobs.get(job.id).failure_class == 'FATAL_FAILED'
+    assert jobs.get(job.id).failure_class == 'OUTPUT_BLOCKED'
     assert destination.read_bytes() == before
 
 

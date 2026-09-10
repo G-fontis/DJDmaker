@@ -206,7 +206,8 @@ def test_recovery_after_reset_checks_existing_artifact_and_finishes_without_dupl
     assert pipeline.run_recovery_cycle(now=now) == ["reserved-job"]
     completed = repository.require("reserved-job")
     assert completed.state is JobState.COMPLETED
-    assert completed.artifact_status == "DELETED"
+    assert completed.artifact_status == "RETAINED"
+    assert notebook.delete_calls == []
     assert completed.download_status == "DOWNLOADED"
     assert completed.raw_status == "READY"
     assert Path(completed.raw_path or "").is_file()

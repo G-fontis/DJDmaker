@@ -686,6 +686,7 @@ class JobRepository:
             def remember(value):
                 for job in selected:
                     value["records"][job.id] = str(Path(job.source_path).resolve())
+                    value.setdefault('completed_checkpoints', {})[job.id] = job.to_dict()
                 return value
             tombstones.update({"schema_version": SCHEMA_VERSION, "kind": "deleted_jobs", "records": {}}, remember)
             for job in selected:
@@ -699,6 +700,55 @@ class JobRepository:
                     document._cleanup_temporaries()
                     document.path.unlink()
                     document.backup_path.unlink(missing_ok=True)
+
+    def completed_checkpoint_history(self, output_directory=None) -> list[Job]:
+        document = _VersionedDocument(self.directory.parent / 'deleted_jobs.json', 'deleted_jobs', use_file_lock=False)
+        if not document.path.exists() and not document.backup_path.exists():
+            return []
+        value = document.load({'schema_version': SCHEMA_VERSION, 'kind': 'deleted_jobs', 'records': {}})
+        snapshots = value.get('completed_checkpoints', {})
+        result = [Job.from_dict(item) for item in snapshots.values()
+                  if item.get('state') == JobState.COMPLETED.value]
+        if output_directory is not None:
+            # Older releases could write these tombstones only via
+            # delete_completed(). They certify completion, but carry no digest
+            # or Notebook identity. Callers apply stricter legacy safety rules.
+            for job_id, source in value.get('records', {}).items():
+                if job_id in snapshots or job_id in value.get('reconciled_duplicates', {}):
+                    continue
+                result.append(Job(source, id=job_id, state=JobState.COMPLETED,
+                    zip_path=str(Path(output_directory)/(Path(source).stem+'.zip')),
+                    runtime_reason='LEGACY_COMPLETED_TOMBSTONE'))
+        return result
+
+    def archive_redundant_job(self, job: Job, completed: Job) -> None:
+        """Internal verified-completion reconciliation, never delete media."""
+        from .output_ownership import same_source, has_work
+        from .completed_reconciliation import validated_output
+        with _thread_lock(self.directory):
+            current = self.require(job.id)
+            if current.to_dict() != job.to_dict() or has_work(current) or not same_source(current, completed):
+                raise ValueError('REDUNDANT_JOB_CHANGED: 再照合が必要です')
+            if (completed.state is not JobState.COMPLETED or not completed.zip_path
+                    or not validated_output(completed, Path(completed.zip_path).parent)):
+                raise ValueError('COMPLETED_OUTPUT_UNVERIFIED: 成果物を再確認できません')
+            archive = _VersionedDocument(self.directory.parent / 'removed-job-records' / (job.id+'.json'),
+                                         'job', use_file_lock=False)
+            archive.save({'schema_version': SCHEMA_VERSION, 'kind': 'job', 'job': current.to_dict()})
+            tombstones = _VersionedDocument(self.directory.parent / 'deleted_jobs.json', 'deleted_jobs', use_file_lock=False)
+            def remember(value):
+                value['records'][job.id] = str(Path(job.source_path).resolve())
+                value.setdefault('completed_checkpoints', {})[completed.id] = completed.to_dict()
+                value.setdefault('reconciled_duplicates', {})[job.id] = completed.id
+                return value
+            tombstones.update({'schema_version': SCHEMA_VERSION, 'kind': 'deleted_jobs', 'records': {}}, remember)
+            queue_path = self.directory.parent / 'queue.json'
+            if queue_path.is_file():
+                QueueRepository(queue_path).remove(job.id)
+            document = self._document(job.id)
+            with document._operation_lock():
+                document.path.unlink()
+                document.backup_path.unlink(missing_ok=True)
 
     def deleted_source_paths(self) -> set[str]:
         return set(self._deleted_records().values())

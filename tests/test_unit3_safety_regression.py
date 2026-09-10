@@ -152,11 +152,11 @@ def test_pipeline_never_reaches_remote_delete_until_all_twelve_checks_pass(
 
     persisted = jobs.get(job.id)
     assert persisted is not None
-    assert persisted.state is JobState.COMPLETED
-    assert persisted.error_code == "REMOTE_ARTIFACT_DELETE_FAILED"
+    assert persisted.state is JobState.DOWNLOAD_VERIFY_FAILED
+    assert persisted.error_code == "DOWNLOAD_VERIFY_FAILED"
     assert failed_check in (persisted.error_message or "")
     assert notebook.delete_calls == []
-    assert Path(persisted.raw_path or "").read_bytes() == b"download"
+    assert (tmp_path / 'raw_files' / 'lesson.mp4').read_bytes() == b"download"
 
 
 def test_delete_failure_keeps_raw_unchanged_continues_and_persists_retry_metadata(
@@ -174,8 +174,9 @@ def test_delete_failure_keeps_raw_unchanged_continues_and_persists_retry_metadat
     raw = Path(failed_cleanup.raw_path or "")
     before = (raw.read_bytes(), raw.stat().st_size, raw.stat().st_mtime_ns)
     assert failed_cleanup.state is JobState.COMPLETED
-    assert failed_cleanup.error_code == "REMOTE_ARTIFACT_DELETE_FAILED"
-    assert failed_cleanup.error_message == "remote delete unavailable"
+    assert failed_cleanup.error_code is None
+    assert failed_cleanup.error_message is None
+    assert notebook.delete_calls == []
     assert failed_cleanup.zip_path and Path(failed_cleanup.zip_path).is_file()
 
     notebook.fail_delete = False
@@ -185,7 +186,7 @@ def test_delete_failure_keeps_raw_unchanged_continues_and_persists_retry_metadat
     assert retried.state is JobState.COMPLETED
     assert retried.error_code is None
     assert retried.error_message is None
-    assert notebook.delete_calls == [job.id, job.id]
+    assert notebook.delete_calls == [job.id]
 
 
 def test_remote_delete_retry_rechecks_persisted_gate_before_adapter_call(

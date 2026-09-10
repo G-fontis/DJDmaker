@@ -245,7 +245,7 @@ def test_limit_downloaded_validation_and_local_only_cleanup(tmp_path):
     pipe.paths=replace(pipe.paths,ending_video=None)
     pipe.run_cycle()
     assert pipe.jobs.get(job.id).state is JobState.COMPLETED
-    assert pipe.jobs.get(job.id).artifact_status == 'DELETE_PENDING'
+    assert pipe.jobs.get(job.id).artifact_status == 'RETAINED'
     assert remote.events == []
 
 

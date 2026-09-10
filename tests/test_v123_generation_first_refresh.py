@@ -42,7 +42,8 @@ def test_100_jobs_generation_dispatch_before_any_download_or_local(tmp_path):
     assert all(repository.get(f'job{i}').state is JobState.COMPLETED for i in range(90,95))
     assert not any(r['stage'] in {'media.start','ending.start','hls.start','zip.start','download.start'} and r.get('phase')=='動画生成開始フェーズ' for r in records)
     assert any(r['stage']=='phase.b' for r in records)
-    assert len(remote.events)==90
+    assert len(remote.events)==85
+    assert not any(action == 'delete' for action, _ in remote.events)
 
 
 @pytest.mark.parametrize('state',[JobState.GENERATING,JobState.WAITING_VIDEO,JobState.RESERVED_WAITING_CREDIT_RESET,JobState.DOWNLOAD_PENDING,JobState.COMPLETED])
@@ -59,7 +60,9 @@ def test_fatal_does_not_block_cloud_phase_and_retryable_processed(tmp_path):
     pipeline.scheduler=PersistentPollScheduler(jobs)
     pipeline.run_cycle()
     assert ('submit',retry.id) in events
-    assert not any(j==fatal.id for _,j in events)
+    assert ('check',fatal.id) in events
+    assert events.index(('submit',retry.id)) < events.index(('check',fatal.id))
+    assert ('submit',fatal.id) not in events  # P3 diagnosis does not blindly resend.
     assert pipeline.phase=='COLLECT_LOCAL'
 
 

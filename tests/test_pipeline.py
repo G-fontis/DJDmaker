@@ -257,7 +257,7 @@ def test_fake_notebook_pipeline_completes_headlessly(tmp_path):
     assert result.state is JobState.COMPLETED
     assert Path(result.raw_path).name == "SD001_仕事とは.mp4"
     assert Path(result.zip_path).name == "SD001_仕事とは.zip"
-    assert notebook.artifact_delete_calls == [job.id]
+    assert notebook.artifact_delete_calls == []
     assert result.progress_percent == 100.0
 
 
@@ -343,7 +343,7 @@ def test_multi_job_same_preset_preserves_job_identity_and_prompt(tmp_path):
     assert {Path(job.zip_path).stem for job in completed} == {
         Path(job.source_path).stem for job in completed
     }
-    assert set(notebook.artifact_delete_calls) == {job.id for job in jobs_to_run}
+    assert notebook.artifact_delete_calls == []
 
 
 def test_unselected_preset_has_no_internal_fallback_and_creates_no_notebook(tmp_path):
@@ -359,7 +359,7 @@ def test_unselected_preset_has_no_internal_fallback_and_creates_no_notebook(tmp_
 
     failed = jobs.get(job.id)
     assert failed.state is JobState.FAILED
-    assert failed.error_code == "NOTEBOOK_STAGE_FAILED"
+    assert failed.error_code == "PRESET_NOT_SELECTED"
     assert "PRESET_NOT_SELECTED" in failed.error_message
     assert notebook.submit_calls == []
 
@@ -425,7 +425,8 @@ def test_remote_delete_failure_after_raw_does_not_lose_pipeline_progress(tmp_pat
     coordinator(tmp_path, jobs, notebook).run_cycle()
     result = jobs.get(job.id)
     assert result.state is JobState.COMPLETED
-    assert result.error_code == "REMOTE_ARTIFACT_DELETE_FAILED"
+    assert result.error_code is None
+    assert notebook.artifact_delete_calls == []
     assert result.raw_path and Path(result.raw_path).exists()
 
 
@@ -456,7 +457,7 @@ def test_download_restart_reuses_verified_existing_raw(tmp_path):
     coordinator(tmp_path, jobs, notebook).run_cycle()
     assert jobs.get(job.id).state is JobState.COMPLETED
     assert notebook.download_calls == []
-    assert notebook.artifact_delete_calls == [job.id]
+    assert notebook.artifact_delete_calls == []
 
 
 def test_ending_restart_uses_valid_checkpoint_without_reencoding(tmp_path):

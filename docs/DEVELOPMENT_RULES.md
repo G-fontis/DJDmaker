@@ -1,5 +1,22 @@
 # 開発ルール
 
+## Ver1.2.8 26 FAILED統合解消（最新指示）
+
+- 各失敗をA旧期待/B実回帰/C仕様矛盾に分類し、実回帰を期待値変更だけで隠さない。全728以上・source/live/EXE/package Gate前のbuild/commit/push禁止（buildはsource/live Gate後）。
+- 未完生成工程が判明したSource/Preset/旧Quota retryはPriority 1でcheck-before-act。汎用NOTEBOOK_STAGE_FAILED/旧FATALの進捗不明jobはPriority 3で再照合。READYには再送せず、保存後にpriorityを再評価する。
+- 既存ZIP採用・不要job除去には、source digest・job/path整合・他job所有でないこと・ZIP/HLS検証に加え、保存済みZIP SHAまたは入力動画SHAに結び付いたHLS内容一致を要求する。証拠のない旧tombstoneは削除根拠にしない。前回のpathのみlegacy削除許容より本規則を優先する。
+- RAWはサイズ一致だけで同一視せずDownload内容もSHAで照合する。Source retry budget判定はローカルTXT検証より先に行い、上限超過を別エラーで覆わない。
+
+## Ver1.2.8 Notebook再照合・remote動画保持（最優先）
+
+- エラー解除・再実行はCOMPLETEDという記録だけでなく実成果物の存在と正常性を基準にする。同じ正常成果物があれば二重生成しない。成果物欠落時は既存RAW/remote checkpointから復旧し、remoteも未生成の場合に生成する。既存ファイルの対応不明・破損は無断上書きせず対象jobのみ保留する。
+- 2026-09-10追加確定：COMPLETEDと同一台本の不要jobをアプリ自身で再照合する。現在outputの実ZIPをCRC・HLS playlist・全segment存在で検証してから、独自Notebook/RAW等を持たない重複jobだけを復元可能な記録へ退避し、一覧から除去する。tombstoneで再読込時の復活を防ぐ。不正・欠落・異内容・曖昧な対応は削除しない。COMPLETED本体と実成果物・Notebookは保持する。
+
+- `DJD-CHAPPY-V128-NOTEBOOK-FAILED-RECONCILE-PRESERVE-ARTIFACT-FULL-001`を適用する。過去のDownload後artifact削除指示より本規則を優先し、通常pipelineはNotebook・source・完成動画を自動削除しない。RAW 12項目検証は維持する。
+- ローカルTXT欠落とremote生成失敗を分離する。既存Notebookの安全に確認できた最も進んだcheckpointを優先し、READYは回収、GENERATINGは待機とする。READYへのPreset再送・Source再uploadは禁止。
+- FAILEDでもNotebook identityがあれば期限到達時にPriority 3で再照合する。UNKNOWNを生成失敗と断定しない。identity復元は一意な根拠がある場合のみ行い、曖昧なtitleだけで別Notebookへ紐付けない。
+- 本番JSON・成果物は保持し、Acceptanceのstate保存はcopy側に限定する。全source/live/EXE/package Gate前のcommit/pushは禁止。既存Collision・Stop Reason・Current Window修正を維持する。
+
 ## Ver1.2.8 優先指示とCurrent Window恒久仕様
 
 - `DJD-CHAPPY-V128-STARTUP-COLLISION-STOP-REASON-CURRENT-WINDOW-FULL-001`を優先する。source/live Gate前はVer1.2.7を維持し、全Gate前のcommit/pushは禁止。本番検証はコピーで行い、原本・メディア・profileを変更しない。

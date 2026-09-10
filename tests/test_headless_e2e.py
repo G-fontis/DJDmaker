@@ -132,5 +132,5 @@ def test_txt_to_fake_notebook_raw_ending_hls_zip(tmp_path: Path) -> None:
         assert archive.testzip() is None
         assert archive.getinfo("playlist.m3u8").compress_type == ZIP_STORED
         assert any(name.startswith("segment") and name.endswith(".ts") for name in archive.namelist())
-    assert notebook.artifact_delete_calls == [job.id]
+    assert notebook.artifact_delete_calls == []
     assert not hasattr(notebook, "delete_notebook")

@@ -149,20 +149,22 @@ def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) 
                 pipeline.deferred = service.jobs._deferred_state
                 window.start_processing()
                 return
-            expected=[['submit',f'release{i}'] for i in range(2)]+[[action,f'release{i}'] for i in range(2) for action in ('download','delete')]
+            expected=[['submit',f'release{i}'] for i in range(2)]+[['download',f'release{i}'] for i in range(2)]
             stages={r.get('stage') for r in runtime}
             required={'artifact.ready','download.start','raw.saved','ending.skip','hls.start','zip.start','job.next'}
             refreshed={entry['stage'] for entry in table_updates if entry['stage']==entry['display']}
             actions_ok = calls==expected
             if save_fault:
                 actions_ok = (all(calls.count([action,f'release{i}']) == 1 for i in range(2)
-                                  for action in ('submit','download','delete'))
+                                  for action in ('submit','download'))
+                    and not any(action[0] == 'delete' for action in calls)
                     and fault['isolation'] and fault['overlay'] and fault['attempts'] >= 7
                     and {'save.deferred','save.summary','save.recovered'} <= stages
                     and not pipeline.deferred_ids)
             passed=(actions_ok and required<=stages and {'chat.send','generation.accepted','hls.start','COMPLETED'}<=refreshed and not errors and len(dialogs)==4
                     and all(j.state is JobState.COMPLETED and j.txt_move_status=='MOVED'
-                            and j.safety_gate.remote_deletion_allowed and j.ending_result.startswith('SKIPPED') for j in jobs))
+                            and j.safety_gate.remote_deletion_allowed and j.artifact_status == 'RETAINED'
+                            and j.ending_result.startswith('SKIPPED') for j in jobs))
             window.grab().save(str(root/'runtime.png'))
             result=dict(passed=passed,calls=calls,runtime=runtime,dialogs=dialogs,errors=errors,table_updates=table_updates,fault=fault,
                         runtime_labels={key:label.text() for key,(_,label) in window.runtime_labels.items()},

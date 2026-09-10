@@ -119,3 +119,23 @@ def test_existing_identical_raw_can_be_recovered_without_rewrite(tmp_path, monke
     result = RawSafeStore(validator).verify_existing(source, destination)
     assert result.safety_gate.remote_deletion_allowed
     assert destination.stat().st_mtime_ns == before
+
+
+def test_existing_equal_size_foreign_raw_is_rejected_without_rewrite(tmp_path, monkeypatch):
+    source = tmp_path / "download.mp4"
+    destination = tmp_path / "raw" / "lesson.mp4"
+    destination.parent.mkdir()
+    source.write_bytes(b"job-a-video")
+    destination.write_bytes(b"job-b-video")
+    assert source.stat().st_size == destination.stat().st_size
+    payload = {"format": {"duration": "1"}, "streams": [{"codec_type": "video"}]}
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, json.dumps(payload), ""),
+    )
+    validator = VideoValidator(shutil.which("python"), stability_interval_seconds=0)
+    with pytest.raises(RawStoreCollisionError):
+        RawSafeStore(validator).verify_existing(source, destination)
+    assert source.read_bytes() == b"job-a-video"
+    assert destination.read_bytes() == b"job-b-video"

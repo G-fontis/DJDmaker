@@ -64,7 +64,7 @@ class PipelinePaths:
 
 
 from .deferred_recovery import DeferredRecovery
-from .task_discovery import Capabilities, RESCAN_SECONDS, MAX_ERROR_ATTEMPTS, due, terminal
+from .task_discovery import Capabilities, RESCAN_SECONDS, MAX_ERROR_ATTEMPTS, due, terminal, remote_reconcile_candidate
 from djd_maker.core.deferred_state import SaveDeferred
 
 
@@ -229,16 +229,23 @@ class PipelineCoordinator(DeferredRecovery):
     def resume_failed_jobs(self, job_ids: set[str] | None = None) -> list[str]:
         """Once per human Start; keep identity and original preset snapshot."""
         from djd_maker.core.job_migration import failure_class
+        self._reject_output_name_collisions()
         resumed = []
         candidates = self.jobs.list() if job_ids is None else [self.jobs.get(job_id) for job_id in sorted(job_ids)]
         for job in candidates:
-            if job is None or job.id in self.deferred_ids:
+            if job is None or job.id in self.deferred_ids or job.failure_class == 'OUTPUT_BLOCKED':
                 continue
             checkpoint('resume.dequeue', job.id)
             interrupted = job.state is JobState.RECOVERY_PENDING and (job.resume_checkpoint or '').startswith('STOPPED:')
             if job.state is not JobState.FAILED and not interrupted:
                 continue
             if job_ids is not None and job.id not in job_ids:
+                continue
+            if remote_reconcile_candidate(job):
+                with self._job_boundary(job):
+                    self._reconcile_failed_remote(job)
+                    if job.state is not JobState.FAILED:
+                        resumed.append(job.id)
                 continue
             if terminal(job) or job.failure_class == 'FATAL_FAILED':
                 continue
@@ -294,7 +301,15 @@ class PipelineCoordinator(DeferredRecovery):
             return True
         if job.state is JobState.FAILED:
             from djd_maker.core.job_migration import failure_class
-            if job.error_code == 'OUTPUT_NAME_COLLISION':
+            if remote_reconcile_candidate(job) and (
+                    failure_class(job) not in {'SOURCE_UPLOAD_FAILED', 'PRESET_SEND_FAILED',
+                                              'PRESET_RESPONSE_TIMEOUT', 'QUOTA_RECOVERY_PENDING'}
+                    or job.raw_path or job.edited_path or job.hls_checkpoint_directory
+                    or job.artifact_status == 'READY'
+                    or any(job.attempt_by_stage.get(k, 0) >= MAX_ERROR_ATTEMPTS
+                           for k in ('source.reupload', 'generation.failed_retry'))):
+                return False  # Unknown progress: P3. Known retry: P1 check-before-act.
+            if job.failure_class == 'OUTPUT_BLOCKED' or job.error_code == 'OUTPUT_NAME_COLLISION':
                 return False
             return (not job.raw_path and failure_class(job) != 'FATAL_FAILED'
                     and job.attempt_by_stage.get('scheduler.recovery', 0) < MAX_ERROR_ATTEMPTS
@@ -437,6 +452,7 @@ class PipelineCoordinator(DeferredRecovery):
              and j.runtime_reason != 'WAITING_REMOTE_ACCESS')
             and (j.state in {JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING,
                 JobState.DOWNLOADING, JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING}
+                or remote_reconcile_candidate(j)
                 or j.state in self.MEDIA_STATES and j.artifact_status == 'DELETE_PENDING')]
         if remote:
             self._scheduler_status(3, '期限到達動画の確認・Download')
@@ -512,8 +528,7 @@ class PipelineCoordinator(DeferredRecovery):
                         phase='LIMIT_LOCAL_DRAIN', notebook=job.notebook_url or '－'))
                 with operation_scope(update):
                     self._run_notebook_job(job)
-        local = [j for j in self.jobs.list() if j.state in self.MEDIA_STATES and j.id not in self.deferred_ids
-                 and (self.cloud_limit.blocked or j.artifact_status != 'DELETE_PENDING')]
+        local = [j for j in self.jobs.list() if j.state in self.MEDIA_STATES and j.id not in self.deferred_ids]
         self.phase = ('LIMIT_LOCAL_DRAIN' if local else 'LIMIT_WAIT') if self.cloud_limit.blocked else 'COLLECT_LOCAL'
         if local:
             self.runtime_callback(dict(stage='limit.local', phase=self.phase, cloud_limit=self.cloud_limit.status(),
@@ -559,7 +574,7 @@ class PipelineCoordinator(DeferredRecovery):
         self._reject_output_name_collisions()
         # Preserve the existing bounded FFmpeg lane for RAW already on disk.
         # This is local-only: no Notebook is inspected/opened by these workers.
-        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and not self._dispatch_only and job.id not in self.deferred_ids and job.artifact_status != 'DELETE_PENDING']
+        local_media = [job for job in self.jobs.list() if job.state in self.MEDIA_STATES and not self._dispatch_only and job.id not in self.deferred_ids]
         if local_media:
             self._run_local_tasks(local_media)
             if self._generation_preempts():
@@ -652,13 +667,15 @@ class PipelineCoordinator(DeferredRecovery):
     def _idle_reason(self, job: Job) -> str | None:
         if job.duplicate_of_job_id:
             return 'DUPLICATE_SOURCE_REFERENCE'
-        if job.error_code == 'OUTPUT_NAME_COLLISION':
+        if job.failure_class == 'OUTPUT_BLOCKED' or job.error_code == 'OUTPUT_NAME_COLLISION':
             return 'OUTPUT_BLOCKED'
         if job.state is JobState.COMPLETED:
             return 'COMPLETED_SKIP'
         if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
             return None if due(job, self.cloud_limit.clock()) else 'WAITING_FOR_NEXT_CHECK'
         if job.state is JobState.FAILED:
+            if remote_reconcile_candidate(job):
+                return None if due(job, self.cloud_limit.clock()) else 'WAITING_FOR_NEXT_CHECK'
             from djd_maker.core.job_migration import failure_class
             if job.failure_class == 'FATAL_FAILED' or failure_class(job) == 'FATAL_FAILED' or job.error_code == 'OUTPUT_NAME_COLLISION':
                 return 'FATAL_FAILED'
@@ -705,6 +722,13 @@ class PipelineCoordinator(DeferredRecovery):
         # Diagnosis failures belong to the individual persisted retry budget.
 
     def _check_act_job(self, job: Job) -> None:
+        if remote_reconcile_candidate(job):
+            if due(job, self.cloud_limit.clock()):
+                self._reconcile_failed_remote(job)
+            if job.state in {JobState.FAILED, JobState.WAITING_VIDEO} or (
+                    job.state is JobState.WAITING and not self._dispatch_only):
+                self._finish_job(job, job.remote_checkpoint or 'NOTEBOOK_STATE_UNKNOWN')
+                return
         if job.state is JobState.COMPLETED:
             self._finish_job(job, 'COMPLETED_SKIP')
             return
@@ -794,6 +818,7 @@ class PipelineCoordinator(DeferredRecovery):
 
     def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
         """Advance only persisted remote/recovery jobs; never submit new work."""
+        self._reject_output_name_collisions()
         if self.cloud_limit.blocked:
             self._drain_limit_local(local_only=True)
         self.phase = 'COLLECT_LOCAL'
@@ -805,7 +830,7 @@ class PipelineCoordinator(DeferredRecovery):
                 continue
             with self._job_boundary(job):
                 checkpoint('recovery.dequeue', job.id)
-                if job.state not in self.RECOVERY_STATES:
+                if job.state not in self.RECOVERY_STATES and not remote_reconcile_candidate(job):
                     continue
                 deadline = self._parse_utc(job.next_poll_at)
                 if deadline is not None and current < deadline:
@@ -826,7 +851,12 @@ class PipelineCoordinator(DeferredRecovery):
                     self.runtime_callback(dict(record))
                 with operation_scope(update):
                     report_operation('job.start')
-                    self._recover_remote_job(job, checked_at=current)
+                    if remote_reconcile_candidate(job):
+                        self._reconcile_failed_remote(job)
+                        if job.state is JobState.DOWNLOAD_PENDING:
+                            self._run_notebook_job(job)
+                    else:
+                        self._recover_remote_job(job, checked_at=current)
                     if job.state in self.MEDIA_STATES:
                         self._run_media_job(job)
                     self._finish_job(job, job.error_code or job.state.value)
@@ -861,6 +891,101 @@ class PipelineCoordinator(DeferredRecovery):
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError("credit_reset_at must be timezone-aware")
         return parsed.astimezone(UTC)
+
+    def _reconcile_failed_remote(self, job: Job) -> None:
+        """Rebuild a failed checkpoint from evidence, before any retry/send."""
+        checkpoint('resume.remote.check', job.id)
+        now = self.cloud_limit.clock()
+        try:
+            if not Path(job.source_path).is_file():
+                job.local_error_code = 'LOCAL_SOURCE_FILE_MISSING'
+            if job.raw_path and Path(job.raw_path).is_file():
+                from djd_maker.core.output_ownership import path_identity
+                if any(other.id != job.id and other.raw_path
+                       and path_identity(other.raw_path) == path_identity(job.raw_path)
+                       for other in self.jobs.list()):
+                    job.failure_class = 'OUTPUT_BLOCKED'
+                    job.error_code = 'OUTPUT_EXISTING_UNVERIFIED'
+                    job.error_message = 'RAWが他jobにも紐付いています。無断採用しません'
+                    self._save(job)
+                    return
+                validated = self.validator.validate(Path(job.raw_path))
+                if getattr(validated, 'valid', True):
+                    stored = self.raw_store.verify_existing(Path(job.raw_path), Path(job.raw_path))
+                    if stored.safety_gate.failed_checks:
+                        raise ValueError('RAW safety gate failed')
+                    job.safety_gate = stored.safety_gate
+                    job.state = JobState.RAW_READY
+                    job.remote_checkpoint = 'LOCAL_RAW_VALIDATED'
+                    job.error_code = job.error_message = job.failure_class = None
+                    self._save(job)
+                    return
+            if not job.notebook_id and not job.notebook_url:
+                from djd_maker.core.notebook_identity import recover_unique_identity
+                candidates = self.jobs.list()
+                history = getattr(self.jobs, 'completed_checkpoint_history', None)
+                if callable(history):
+                    candidates.extend(history())
+                if not recover_unique_identity(job, candidates):
+                    raise ValueError('NOTEBOOK_IDENTITY_UNRESOLVED: 対応を一意に確認できません。Notebookは新規作成しません')
+                self._save(job)
+            diagnose = getattr(self.notebook, 'diagnose_resume', None)
+            result = diagnose(job) if callable(diagnose) else {'artifact': self.notebook.inspect_status(job)}
+            status = result['artifact']
+            job.artifact_status = status
+            job.source_status = result.get('source', job.source_status)
+            job.last_checked_at = now.isoformat()
+            job.remote_checkpoint = {
+                'READY': 'ARTIFACT_READY', 'GENERATING': 'GENERATION_STARTED',
+                'FAILED': 'ARTIFACT_FAILED', 'NOT_STARTED': 'ARTIFACT_ABSENT',
+            }.get(status, 'ARTIFACT_UNKNOWN')
+            target = None
+            if status == 'READY':
+                target = JobState.DOWNLOAD_PENDING
+                report_operation('artifact.ready', decision='ARTIFACT_READY', next_action='Download開始')
+            elif status == 'GENERATING' or (status == 'NOT_STARTED' and result.get('reply') == 'GENERATION_ACCEPTED'):
+                target = JobState.WAITING_VIDEO
+                job.remote_checkpoint = 'GENERATION_STARTED'
+            elif status == 'FAILED':
+                # The subsequent submit path checks current quota and retries
+                # using the persisted snapshot, never the Studio Retry button.
+                target = JobState.WAITING
+                job.resume_checkpoint = 'FAILED_ARTIFACT_RETRY'
+            elif status == 'WAITING':
+                target = JobState.RESERVED_WAITING_CREDIT_RESET
+            elif status == 'NOT_STARTED':
+                target = JobState.WAITING
+                job.remote_checkpoint = 'SOURCE_READY' if result.get('source') == 'READY' else 'ARTIFACT_ABSENT'
+            if target is None:
+                raise ValueError('NOTEBOOK_STATE_UNKNOWN: remote checkpointを確定できません')
+            job.state = target
+            job.error_code = job.error_message = job.failure_class = None
+            if status == 'NOT_STARTED' and target is JobState.WAITING:
+                # Historical diagnosis describes the resume cause, not current
+                # capability. Only the new send/recheck may block Cloud.
+                if result.get('source') in {'ERROR', 'MISSING', 'FAILED', 'ABSENT'}:
+                    job.failure_class = 'SOURCE_UPLOAD_FAILED'
+                elif result.get('reply') == 'QUOTA_EXHAUSTED':
+                    job.failure_class = 'QUOTA_RECOVERY_PENDING'
+                elif result.get('preset') == 'NOT_SENT':
+                    job.failure_class = 'PRESET_SEND_FAILED'
+                elif result.get('reply') == 'NO_RESPONSE':
+                    job.failure_class = 'PRESET_RESPONSE_TIMEOUT'
+            job.next_poll_at = ((now + timedelta(seconds=RESCAN_SECONDS)).isoformat()
+                                if target is JobState.WAITING_VIDEO else None)
+            self._save(job)
+        except (RunCancelled, BlockingModalError, JobStateSaveError):
+            raise
+        except Exception as exc:
+            key = 'scheduler.recovery'
+            job.attempt_by_stage[key] = job.attempt_by_stage.get(key, 0) + 1
+            job.error_code = 'NOTEBOOK_STATE_UNKNOWN'
+            job.error_message = str(exc)
+            job.remote_checkpoint = 'ARTIFACT_UNKNOWN'
+            job.next_poll_at = (now + timedelta(seconds=RESCAN_SECONDS)).isoformat()
+            if job.attempt_by_stage[key] >= MAX_ERROR_ATTEMPTS:
+                job.failure_class = 'TERMINAL_FAILED'
+            self._save(job)
 
     def _recover_remote_job(self, job: Job, *, checked_at: datetime) -> None:
         """Read the existing Notebook and continue at download only when ready."""
@@ -1051,6 +1176,8 @@ class PipelineCoordinator(DeferredRecovery):
                 gate = getattr(stored, "safety_gate", None)
                 if gate is None:
                     raise RuntimeError("RAW store did not return a deletion safety gate")
+                if gate.failed_checks:
+                    raise RuntimeError('RAW safety gate failed: ' + ', '.join(gate.failed_checks))
                 job.raw_path = str(getattr(media, "path", raw_path))
                 job.raw_size_bytes = getattr(media, "size_bytes", None)
                 job.duration_seconds = getattr(media, "duration_seconds", None)
@@ -1060,27 +1187,9 @@ class PipelineCoordinator(DeferredRecovery):
                 job.audio_codec = getattr(metadata, "audio_codec", None)
                 job.safety_gate = gate
                 job.raw_status = "READY"
-                if self.cloud_limit.blocked:
-                    job.artifact_status = 'DELETE_PENDING'
+                job.artifact_status = 'RETAINED'
                 self._transition(job, JobState.RAW_READY)
-                report_operation('raw.saved', decision='RAW_READY', next_action='artifact削除安全Gateを確認')
-                if self.cloud_limit.blocked:
-                    # Local progress must not depend on another remote action.
-                    # Keep the artifact and the deletion gate for later cleanup.
-                    return
-                try:
-                    require_remote_deletion_gate(gate)
-                    self.notebook.delete_video_artifact(job, gate)
-                    job.artifact_status = 'DELETED'
-                    report_operation('artifact.deleted')
-                except BlockingModalError:
-                    raise
-                except Exception as exc:
-                    # RAW is already durable and verified. Remote cleanup can be
-                    # retried independently and must not destroy local progress.
-                    job.error_code = "REMOTE_ARTIFACT_DELETE_FAILED"
-                    job.error_message = str(exc)
-                    self._save(job)
+                report_operation('raw.saved', decision='RAW_READY', next_action='動画をNotebookに保持してローカル処理')
         except (SourceRetryExhausted, GenerationRetryExhausted) as exc:
             job.error_code = str(exc).split(':', 1)[0]
             job.error_message = str(exc)
@@ -1142,8 +1251,12 @@ class PipelineCoordinator(DeferredRecovery):
                     "WRONG_INPUT_TARGET", "CHAT_HISTORY_CHANGED",
                     "SOURCE_UPLOAD_FAILED", "SOURCE_IDENTITY_CHANGED",
                     "SOURCE_IDENTITY_AMBIGUOUS", "GENERATION_STATE_UNCERTAIN",
+                    "LOCAL_SOURCE_FILE_MISSING",
+                    "PRESET_NOT_SELECTED",
                 }:
                     job.error_code = failure_code
+                    if failure_code == 'LOCAL_SOURCE_FILE_MISSING':
+                        job.local_error_code = failure_code
                 else:
                     job.error_code = job.error_code or "NOTEBOOK_STAGE_FAILED"
                 self._transition(job, JobState.FAILED)
@@ -1151,24 +1264,14 @@ class PipelineCoordinator(DeferredRecovery):
     def _run_media_job(self, job: Job, *, one_task=False) -> None:
         try:
             checkpoint('media.start', job.id)
-            if job.artifact_status == 'DELETE_PENDING' and job.notebook_id and not self.cloud_limit.blocked and not one_task:
-                require_remote_deletion_gate(job.safety_gate)
-                try:
-                    status = self.notebook.inspect_status(job)
-                    if status == 'READY':
-                        self.notebook.delete_video_artifact(job, job.safety_gate)
-                        job.artifact_status = 'DELETED'
-                    elif status == 'NOT_STARTED':
-                        job.artifact_status = 'DELETED'
-                    else:
-                        raise ValueError('ARTIFACT_CLEANUP_UNCERTAIN')
-                    self._save(job)
-                except BlockingModalError:
-                    raise
-                except Exception as error:
-                    job.error_code = 'REMOTE_ARTIFACT_DELETE_FAILED'
-                    job.error_message = str(error)
-                    self._save(job)
+            if job.artifact_status == 'DELETE_PENDING':
+                # Migrate the old pending-cleanup checkpoint without touching
+                # the remote Notebook, including during quota/local-only work.
+                job.artifact_status = 'RETAINED'
+                if job.error_code == 'REMOTE_ARTIFACT_DELETE_FAILED':
+                    job.error_code = None
+                    job.error_message = None
+                self._save(job)
             raw = Path(job.raw_path or "")
             edited = (
                 self.paths.work_directory / job.id / "ending" / f"{job.script_name}.mp4"
@@ -1226,7 +1329,9 @@ class PipelineCoordinator(DeferredRecovery):
                         raise FileExistsError(
                             f"既存ZIPを別工程の成果物として採用しません: {output_zip}"
                         )
-                    if not self._valid_zip(output_zip):
+                    from dataclasses import replace
+                    from djd_maker.core.artifact_ownership import owned_zip
+                    if not owned_zip(replace(job, zip_path=str(output_zip)), output_zip, self.jobs):
                         raise FileExistsError(f"不正な既存ZIPを上書きしません: {output_zip}")
                     job.zip_path = str(output_zip)
                 else:
@@ -1240,6 +1345,8 @@ class PipelineCoordinator(DeferredRecovery):
                                 Path(job.edited_path or edited), output_zip
                             )
                     job.zip_path = str(result.zip_path)
+                from djd_maker.core.artifact_ownership import _digest
+                job.output_zip_sha256 = _digest(output_zip)
                 job.hls_result = "PASS"
                 if job.state is JobState.HLS_ENCODING:
                     self._transition(job, JobState.ZIPPING)

@@ -82,7 +82,7 @@ def run_portable_fake_e2e(report_path: Path) -> int:
         and Path(result.raw_path).is_file()
         and result.zip_path is not None
         and Path(result.zip_path).is_file()
-        and notebook.artifact_delete_calls == [job.id]
+        and notebook.artifact_delete_calls == []
         and result.preset_id == selected_preset.id
         and result.preset_name == selected_preset.name
         and result.preset_body_snapshot == selected_preset.prompt_text

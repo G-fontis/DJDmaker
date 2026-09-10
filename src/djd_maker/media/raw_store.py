@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import file_digest
 import os
 from pathlib import Path
 import shutil
@@ -116,6 +117,9 @@ class RawSafeStore:
         sizes_match = raw_result.size_bytes == source_result.size_bytes
         if not sizes_match:
             raise IOError("existing RAW size does not match downloaded source")
+        with source_path.open('rb') as source_stream, destination_path.open('rb') as raw_stream:
+            if file_digest(source_stream, 'sha256').digest() != file_digest(raw_stream, 'sha256').digest():
+                raise RawStoreCollisionError('existing RAW content does not match downloaded source')
         gate = DownloadSafetyGate(
             download_completed=True,
             not_temporary_file=source_result.not_temporary_file,

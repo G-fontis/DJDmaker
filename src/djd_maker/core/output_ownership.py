@@ -12,6 +12,8 @@ import unicodedata
 from .models import JobState
 from .repositories import _thread_lock
 
+OUTPUT_BLOCK_CODES = {'OUTPUT_NAME_COLLISION', 'OUTPUT_ALREADY_EXISTS', 'OUTPUT_EXISTING_UNVERIFIED'}
+
 
 def path_identity(value):
     return unicodedata.normalize('NFC', str(Path(value).resolve())).casefold()
@@ -46,7 +48,7 @@ def released_terminal(job):
 
 
 def restore_collision(job):
-    if job.error_code != 'OUTPUT_NAME_COLLISION':
+    if job.error_code not in OUTPUT_BLOCK_CODES:
         return
     if job.output_resume_state in JobState._value2member_map_ and job.output_resume_state != 'FAILED':
         job.state = JobState(job.output_resume_state)
@@ -64,6 +66,8 @@ def restore_collision(job):
 
 def reconcile_output_ownership(jobs, output_directory, save=None):
     with import_lock(jobs, output_directory):
+        from .completed_reconciliation import reconcile_completed_duplicates
+        completed_report = reconcile_completed_duplicates(jobs, output_directory)
         # One complete snapshot/plan precedes all saves (no incremental owner
         # election based on records already failed by the same pass).
         values = list({j.id:j for j in jobs.list()}.values())
@@ -72,6 +76,23 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
         digests = {}
         unreadable_sources = []
         for job in values:
+            if job.artifact_status == 'DELETE_PENDING':
+                job.artifact_status = 'RETAINED'
+                if job.error_code == 'REMOTE_ARTIFACT_DELETE_FAILED':
+                    job.error_code = job.error_message = None
+            # A historical COMPLETED flag is not proof that output still
+            # exists. Recover through the existing checkpoint-aware pipeline;
+            # WAITING submission inspects a saved Notebook before generating.
+            target = Path(output_directory)/(job.script_name+'.zip')
+            if (job.state is JobState.COMPLETED and job.zip_path
+                    and path_identity(job.zip_path) == path_identity(target)
+                    and not target.exists()):
+                job.state = (JobState.RAW_READY if job.raw_path and Path(job.raw_path).is_file()
+                             and job.safety_gate.remote_deletion_allowed else JobState.WAITING)
+                job.zip_path = None
+                job.error_code = job.error_message = job.failure_class = None
+                job.runtime_reason = 'OUTPUT_MISSING_RECOVER_CHECKPOINT'
+                job.progress_percent = 0
             if not job.source_sha256 and not has_work(job) and Path(job.source_path).is_file():
                 key = path_identity(job.source_path)
                 if key not in digests:
@@ -129,6 +150,19 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
         for job in values:
             if job.id in aliases:
                 continue
+            media_claims = {path_identity(path) for path in (job.raw_path, job.edited_path) if path}
+            if job.state is not JobState.COMPLETED and media_claims and any(
+                    other.id != job.id and media_claims.intersection(
+                        path_identity(path) for path in (other.raw_path, other.edited_path) if path)
+                    for other in values):
+                if job.failure_class != 'OUTPUT_BLOCKED':
+                    job.output_resume_state = job.state.value
+                job.state = JobState.FAILED
+                job.failure_class = 'OUTPUT_BLOCKED'
+                job.error_code = 'OUTPUT_EXISTING_UNVERIFIED'
+                job.error_message = '同じRAWまたは編集済み動画を複数jobが所有しています。採用・変換せず確認待ちにします。'
+                job.runtime_reason = 'OUTPUT_BLOCKED'
+                continue
             owner = conflicts.get(job.id)
             if owner:
                 if job.error_code != 'OUTPUT_NAME_COLLISION':
@@ -141,6 +175,37 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
                 job.runtime_reason = 'OUTPUT_BLOCKED'
             else:
                 restore_collision(job)
+                if job.state is JobState.COMPLETED:
+                    continue
+                target = Path(output_directory)/(job.script_name+'.zip')
+                if target.is_file():
+                    from .completed_reconciliation import validated_output
+                    from dataclasses import replace
+                    valid = validated_output(replace(job, zip_path=str(target)), output_directory)
+                    from .artifact_ownership import owned_zip
+                    if owned_zip(job, target, values):
+                        job.state = JobState.COMPLETED
+                        job.progress_percent = 100
+                        job.error_code = job.error_message = job.failure_class = None
+                        job.remote_checkpoint = 'LOCAL_ZIP_VALIDATED'
+                        continue
+                    job.output_resume_state = job.state.value
+                    job.state = JobState.FAILED
+                    job.failure_class = 'OUTPUT_BLOCKED'
+                    job.error_code = 'OUTPUT_ALREADY_EXISTS' if valid else 'OUTPUT_EXISTING_UNVERIFIED'
+                    job.error_message = ('同名の既存ZIPがあります。再生成・上書きは行いません。'
+                                         'jobとの対応を確認してください。他のjobは継続します。')
+                    job.runtime_reason = 'OUTPUT_BLOCKED'
+                elif job.state in {JobState.WAITING, JobState.UPLOADING, JobState.FAILED} and not job.raw_path:
+                    existing = [Path(output_directory)/(job.script_name+suffix) for suffix in ('.mp4', '.m3u8')]
+                    existing.append(Path(output_directory)/job.script_name/'playlist.m3u8')
+                    if any(path.is_file() for path in existing):
+                        job.output_resume_state = job.state.value
+                        job.state = JobState.FAILED
+                        job.failure_class = 'OUTPUT_BLOCKED'
+                        job.error_code = 'OUTPUT_EXISTING_UNVERIFIED'
+                        job.error_message = 'outputに同名の動画/HLSがあります。対応未確認のため再生成せず保留します。'
+                        job.runtime_reason = 'OUTPUT_BLOCKED'
         changed = []
         for job in values:
             if job.to_dict() != before[job.id]:
@@ -152,4 +217,5 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
                     with isolate_auxiliary_save(jobs,job):
                         jobs.save(job)
         return dict(changed=changed, duplicate_references=aliases, conflicts=conflicts,
+                    completed_reconciliation=completed_report,
                     stale_owners=stale, unreadable_sources=unreadable_sources, jobs=len(values))

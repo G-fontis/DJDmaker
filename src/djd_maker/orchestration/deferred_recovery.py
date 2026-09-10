@@ -114,12 +114,16 @@ class DeferredRecovery:
             return durable
         if durable.presentation_revision > job.presentation_revision:
             job = durable
+        if job.failure_class == 'OUTPUT_BLOCKED' or durable.failure_class == 'OUTPUT_BLOCKED':
+            return durable if durable.failure_class == 'OUTPUT_BLOCKED' else job
         if job.error_code == 'OUTPUT_NAME_COLLISION':
             job.state = JobState.FAILED
             return job
         output = self.paths.output_directory / f'{job.script_name}.zip'
         if job.presentation_stage in {'zip.complete', 'COMPLETED'} and output.is_file():
-            if not self._valid_zip(output):
+            from dataclasses import replace
+            from djd_maker.core.artifact_ownership import owned_zip
+            if not owned_zip(replace(job, zip_path=str(output)), output, self.jobs):
                 return None
             job.zip_path = str(output)
             job.hls_result = 'PASS'
@@ -129,17 +133,24 @@ class DeferredRecovery:
         download = self.paths.work_directory / job.id / 'download' / f'{job.script_name}.mp4'
         raw = Path(job.raw_path) if job.raw_path else self.paths.raw_directory / f'{job.script_name}.mp4'
         if raw.is_file() and (job.raw_path or job.download_status == 'DOWNLOADED'):
+            from djd_maker.core.output_ownership import path_identity
+            if (not job.raw_path and not download.is_file()) or any(
+                    other.id != job.id and other.raw_path and path_identity(other.raw_path) == path_identity(raw)
+                    for other in self.jobs.list()):
+                return None
             checked = self.validator.validate(raw)
             if not getattr(checked, 'valid', True):
                 return None
             # Reuse the original RAW safety validator; never infer the 12 gates
             # from existence alone. No new remote download is invoked here.
             stored = self.raw_store.verify_existing(download if download.is_file() else raw, raw)
+            if stored.safety_gate.failed_checks:
+                return None
             job.raw_path = str(raw)
             job.safety_gate = stored.safety_gate
             job.raw_status = 'READY'
             if job.artifact_status != 'DELETED':
-                job.artifact_status = 'DELETE_PENDING'
+                job.artifact_status = 'RETAINED'
             job.state = JobState.RAW_READY
             if job.edited_path and Path(job.edited_path).is_file():
                 if getattr(self.validator.validate(Path(job.edited_path)), 'valid', True):
