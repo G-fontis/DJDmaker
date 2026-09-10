@@ -5,6 +5,20 @@ from .viewmodels import state_display, job_stage_texts
 
 
 @dataclass(frozen=True)
+class LifecycleViewModel:
+    text: str
+
+    @classmethod
+    def from_status(cls,status):
+        reason=status.get('stop_reason') or {}
+        waiting=(status.get('runtime') or {}).get('stage') == 'scheduler.wait'
+        state='一時停止' if status.get('paused') else ('次回確認待機中' if waiting else '処理中') if status.get('active') else '停止' if reason else '待機中'
+        return cls(f"現在状態: {state}\n最終停止理由: {reason.get('message','未停止')}\n"
+                   f"最後に選択したtask: {status.get('last_task') or '－'}\n"
+                   f"次回確認時刻: {status.get('next_scan_at') or '－'}")
+
+
+@dataclass(frozen=True)
 class JobViewModel:
     id: str
     name: str

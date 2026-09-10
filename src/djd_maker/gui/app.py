@@ -50,6 +50,8 @@ def build_desktop(
     settings = settings_repository.load()
     from djd_maker.core.cloud_limit import CloudLimitGate
     cloud_limit = CloudLimitGate(root / 'system' / 'cloud-limit.json')
+    from djd_maker.core.output_ownership import reconcile_output_ownership
+    reconcile_output_ownership(job_repository, _resolved(root, settings.output_directory))
     reconcile_completed_txt(job_repository, _resolved(root, settings.raw_directory))
     browser = browser_manager or BrowserManager(
         root / "browser" / "chrome-profile",

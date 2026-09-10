@@ -73,6 +73,10 @@ def job_stage_texts(job: Job) -> tuple[str, str, str]:
 
 
 def state_display(job: Job) -> str:
+    if job.duplicate_of_job_id:
+        return f'重複参照（処理job: {job.duplicate_of_job_id}）'
+    if job.failure_class == 'OUTPUT_BLOCKED':
+        return '出力競合・要確認（他job継続）'
     if job.state is JobState.COMPLETED:
         return "○ 完成"
     if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}:

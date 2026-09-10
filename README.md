@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver1.2.7
+# 台本から授業動画つくるマシーン Ver1.2.8
 
 台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、任意Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.2.7。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 1.2.8。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
 
@@ -33,7 +33,9 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.2.7`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver1.2.8`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+
+Ver1.2.8では起動・再読込時に現行の出力所有権を照合します。同じTXTの未着手重複jobはIDを保持した「重複参照」として表示し、二重生成と誤FAILEDを防ぎます。異なる有効jobの本当の出力競合だけを対象jobに表示し、他jobは継続します。既存完成物は上書きしません。未完了jobが残る間は自動終了せず、実行可能taskがない間は次回確認まで待機します。両GUIに停止理由・最後のtask・次回確認時刻を表示します。詳細は[Ver1.2.8 検証記録](docs/v128-collision-stop-reason-current-window.md)を参照してください。
 
 Ver1.2.7では、Source失敗を読み込み中と区別し、対象の失敗entryだけを除去して同じTXTを再uploadします。正常SourceやNotebookは削除しません。動画生成失敗時はStudioの再試行ボタンを使わず、job開始時に保存したPreset本文を中央Chatへ再送し、新しい生成状態を確認します。再試行は最大3回、実上限中は保留します。詳細は[Ver1.2.7 検証記録](docs/v127-source-failed-retry-quota-priority.md)を参照してください。
 

@@ -294,6 +294,8 @@ class PipelineCoordinator(DeferredRecovery):
             return True
         if job.state is JobState.FAILED:
             from djd_maker.core.job_migration import failure_class
+            if job.error_code == 'OUTPUT_NAME_COLLISION':
+                return False
             return (not job.raw_path and failure_class(job) != 'FATAL_FAILED'
                     and job.attempt_by_stage.get('scheduler.recovery', 0) < MAX_ERROR_ATTEMPTS
                     and due(job, self.cloud_limit.clock()))
@@ -378,7 +380,21 @@ class PipelineCoordinator(DeferredRecovery):
         return self.capabilities.can_generate and any(self._needs_dispatch(j) for j in self.jobs.list())
 
     def all_tasks_completed(self):
-        return not self.deferred_ids and all(terminal(j) for j in self.jobs.list())
+        return self.final_discovery()['complete']
+
+    def final_discovery(self):
+        """Fresh durable scan immediately before automatic completion."""
+        from .task_discovery import final_discovery
+        result = final_discovery(self.jobs.list(), self.cloud_limit.clock(),
+                                 self.cloud_limit.blocked, self.deferred_ids)
+        errors = getattr(self.jobs, 'list_with_errors', None)
+        if callable(errors):
+            _, unreadable = errors()
+            result['unreadable_jobs'] = list(unreadable)
+            if unreadable:
+                result['complete'] = False
+        self.final_discovery_result = result
+        return result
 
     def _scheduler_status(self, priority, task):
         from dataclasses import asdict
@@ -392,7 +408,7 @@ class PipelineCoordinator(DeferredRecovery):
             completed=sum(j.state is JobState.COMPLETED for j in self.jobs.list()),
             retry_attempts={j.id: j.attempt_by_stage.get('scheduler.recovery', 0) for j in self.jobs.list()
                             if j.attempt_by_stage.get('scheduler.recovery', 0)},
-            terminal_failed=sum(j.failure_class in {'TERMINAL_FAILED', 'FATAL_FAILED'} for j in self.jobs.list()))
+            terminal_failed=sum(terminal(j) and j.state is not JobState.COMPLETED and not j.duplicate_of_job_id for j in self.jobs.list()))
         if view == self.scheduler_view:
             return
         self.scheduler_view = view
@@ -634,6 +650,10 @@ class PipelineCoordinator(DeferredRecovery):
                     report_operation('job.result', outcome=job.state.value, processed=self._media_completed)
 
     def _idle_reason(self, job: Job) -> str | None:
+        if job.duplicate_of_job_id:
+            return 'DUPLICATE_SOURCE_REFERENCE'
+        if job.error_code == 'OUTPUT_NAME_COLLISION':
+            return 'OUTPUT_BLOCKED'
         if job.state is JobState.COMPLETED:
             return 'COMPLETED_SKIP'
         if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
@@ -678,7 +698,9 @@ class PipelineCoordinator(DeferredRecovery):
         if previous != (job.runtime_outcome, job.runtime_reason) or previous_stage != job.presentation_stage:
             self._save(job)
         report_operation('job.result', decision=reason, outcome=job.runtime_outcome,
-                         notebook=job.notebook_url or '－')
+                         notebook=job.notebook_url or '－',
+                         **({'message':f'ファイル {job.script_name} はエラーになりました。他のjobを継続します。{job.error_message or reason}'}
+                            if job.state is JobState.FAILED else {}))
         self._no_op_count = self._no_op_count + 1 if no_op else 0
         # Diagnosis failures belong to the individual persisted retry budget.
 
@@ -1062,6 +1084,10 @@ class PipelineCoordinator(DeferredRecovery):
         except (SourceRetryExhausted, GenerationRetryExhausted) as exc:
             job.error_code = str(exc).split(':', 1)[0]
             job.error_message = str(exc)
+            # The adapter explicitly certifies exhaustion. Persist that fact
+            # before discovery so migration cannot demote it to generic fatal.
+            stage = 'source.reupload' if isinstance(exc, SourceRetryExhausted) else 'generation.failed_retry'
+            job.attempt_by_stage[stage] = max(MAX_ERROR_ATTEMPTS, job.attempt_by_stage.get(stage, 0))
             job.failure_class = 'TERMINAL_FAILED'
             job.state = JobState.FAILED
             self._save(job)
@@ -1240,30 +1266,12 @@ class PipelineCoordinator(DeferredRecovery):
                 self._transition(job, JobState.FAILED)
 
     def _reject_output_name_collisions(self) -> None:
-        """Fail duplicate active stems before either job can claim shared paths."""
-
-        by_stem: dict[str, list[Job]] = {}
-        for job in self.jobs.list():
-            if job.state is not JobState.FAILED:
-                by_stem.setdefault(job.script_name.casefold(), []).append(job)
-        for duplicates in by_stem.values():
-            if len(duplicates) < 2:
-                continue
-            completed = [job for job in duplicates if job.state is JobState.COMPLETED]
-            owner = min(
-                completed or duplicates,
-                key=lambda item: (item.created_at, item.id),
-            )
-            for job in duplicates:
-                if job.id == owner.id or job.state in {JobState.COMPLETED, JobState.FAILED}:
-                    continue
-                job.error_code = "OUTPUT_NAME_COLLISION"
-                job.error_message = (
-                    f"output stem {job.script_name!r} is already owned by job {owner.id}"
-                )
-                if job.id not in self.deferred_ids:
-                    with self._job_boundary(job):
-                        self._transition(job, JobState.FAILED)
+        from djd_maker.core.output_ownership import reconcile_output_ownership
+        def persist(job):
+            if job.id not in self.deferred_ids:
+                with self._job_boundary(job):
+                    self._save(job)
+        self.ownership_report = reconcile_output_ownership(self.jobs, self.paths.output_directory, persist)
 
     @staticmethod
     def _valid_zip(path: Path) -> bool:

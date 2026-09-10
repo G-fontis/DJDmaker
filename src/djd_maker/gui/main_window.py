@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.7"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.8"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -239,6 +239,10 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.phase_counts_label = QLabel('生成・回収集計: －')
         runtime_grid.addWidget(self.phase_counts_label, 5, 0, 1, 2)
         runtime_grid.addWidget(self.runtime_messages, 6, 0, 1, 2)
+        self.lifecycle_label = QLabel()
+        self.lifecycle_label.setWordWrap(True)
+        self.lifecycle_label.setMinimumHeight(self.lifecycle_label.fontMetrics().lineSpacing()*4+8)
+        runtime_grid.addWidget(self.lifecycle_label,7,0,1,2)
         root.addWidget(runtime)
         self._runtime_record = {}
         self._runtime_timer = QTimer(self)
@@ -784,6 +788,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._update_action_state()
         if operation != "reload":
             self.reload_jobs(local_only=True)
+        reason = self._current_runtime_status.get('stop_reason') or {}
+        if reason:
+            self.statusBar().showMessage(reason['message'])
 
     def _operation_failed(self, operation: str, message: str) -> None:
         if operation in {"start", "recover"}:
@@ -795,6 +802,14 @@ class MainWindow(Phase2Presentation, QMainWindow):
 
     def _apply_runtime_status(self, status: object) -> None:
         if isinstance(status, dict):
+            from .presentation_models import LifecycleViewModel
+            self.lifecycle_label.setText(LifecycleViewModel.from_status(status).text)
+            # The explicit legacy 680px window minimum does not grow with new
+            # nested rows. Reserve their minimum height instead of clipping the
+            # stop reason under the job table at Phase1's smallest size.
+            if self.settings.gui_type == 'PHASE1':
+                self.setMinimumHeight(max(680, self.centralWidget().minimumSizeHint().height()
+                                          + self.statusBar().sizeHint().height()))
             self._current_runtime_status = dict(status)
             self._paused = bool(status.get('paused', False))
             self._active_run = bool(status.get('active', status.get('running', False)))
@@ -854,6 +869,8 @@ class MainWindow(Phase2Presentation, QMainWindow):
                 self.credit_state_label.setText('AI LIMIT / CLOUD PAUSED')
                 self.credit_reset_label.setText(f"Notebook再開予定: {limit.get('cloud_resume_at') or '時刻確認必要'}")
             self._update_action_state()
+            if status.get('stop_reason'):
+                self.statusBar().showMessage(status['stop_reason']['message'])
 
     def _render_deferred_overlays(self):
         # Presentation only: never modify Job or paint a failed save as success.

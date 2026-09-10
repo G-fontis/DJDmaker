@@ -1,5 +1,13 @@
 # 開発ルール
 
+## Ver1.2.8 優先指示とCurrent Window恒久仕様
+
+- `DJD-CHAPPY-V128-STARTUP-COLLISION-STOP-REASON-CURRENT-WINDOW-FULL-001`を優先する。source/live Gate前はVer1.2.7を維持し、全Gate前のcommit/pushは禁止。本番検証はコピーで行い、原本・メディア・profileを変更しない。
+- 「Google/Chrome起動Window確認は、過去のclose/open履歴を参照せず、現在そのWindow/Processが存在するかだけで判定する。ユーザーの明示的な変更指示がない限り、この判定ロジックを変更してはならない。」AST/動作contractで履歴への依存を防止する。
+- 出力所有権は現在のjob identityと実際の出力pathから全体照合してから保存する。同一sourceの重複読込は排他し、旧重複レコードは元IDを保持した非実行参照として統合する。正常成果物を上書きしない。真の競合のみ対象jobをblockedとし、他jobを継続する。
+- 自動終了直前に全jobを再走査する。未完了・将来待機・再試行可能・状態不明・保存保留は完了ではない。全有効jobがCOMPLETEDまたは再試行枯渇TERMINAL_FAILEDの場合のみ全行程終了。単なるFATAL_FAILEDという旧分類だけで完了扱いしない。
+- 全exit pathに停止理由codeと日本語messageを持ち、両GUIへ共通表示する。Pause/待機は停止と区別する。
+
 ## Ver1.2.7 優先指示
 
 - `DJD-CHAPPY-V127-SOURCE-FAILED-RETRY-QUOTA-PRIORITY-FULL-001` を適用。調査・実装中は1.2.6を維持し、source/live Gate前のversion変更・build、全Gate前のcommit/pushは禁止。

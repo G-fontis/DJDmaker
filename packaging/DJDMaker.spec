@@ -50,7 +50,9 @@ a = Analysis(
     runtime_hooks=[str(PROJECT_ROOT / "packaging" / "runtime_hooks" / "portable_paths.py")],
     excludes=["pytest", "pytestqt", "tkinter"],
     noarchive=False,
-    optimize=1,
+    # Keep runtime invariants and the opt-in frozen acceptance checks enabled.
+    # optimize=1 would silently remove assert-based validation from the EXE.
+    optimize=0,
 )
 pyz = PYZ(a.pure)
 
@@ -80,5 +82,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="DJDmaker_Ver1.2.7",
+    name="DJDmaker_Ver1.2.8",
 )

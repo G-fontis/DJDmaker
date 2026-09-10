@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,9 +60,11 @@ def test_no_database_dependency_or_file_is_tracked_in_source_tree() -> None:
         "raw_files",
         "work",
     }
-    candidates = (
-        path
-        for path in ROOT.rglob("*")
-        if not excluded_roots.intersection(path.relative_to(ROOT).parts)
-    )
-    assert not [path for path in candidates if path.suffix.lower() in forbidden_suffixes]
+    # Prune exactly the existing exclusions before traversal: acceptance Chrome
+    # profiles can contain very large caches, none of which this test audits.
+    forbidden = []
+    for directory, children, files in os.walk(ROOT):
+        children[:] = [name for name in children if name not in excluded_roots]
+        forbidden.extend(Path(directory) / name for name in files + children
+                         if Path(name).suffix.lower() in forbidden_suffixes)
+    assert not forbidden

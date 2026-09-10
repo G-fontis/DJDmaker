@@ -140,12 +140,10 @@ class BrowserManager:
                 if process.poll() is not None:
                     self._auth_process = None
                     raise BrowserStartError("Googleログイン用Chromeが起動直後に終了しました")
-            self._navigation_result = "auth-chrome-opened"
         process.wait()
         with self._guard:
             if self._auth_process is process:
                 self._auth_process = None
-            self._navigation_result = "auth-chrome-closed"
             return self.runtime_status()
 
     @staticmethod

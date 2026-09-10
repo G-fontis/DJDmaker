@@ -73,6 +73,10 @@ class GuiPipelineController:
         self._error_callback: Callable[[str, str], None] = lambda _op, _message: None
         self._last_states: dict[str, JobState] = {}
         self._runtime: dict[str, object] = {}
+        self._stop_reason = None
+        self._stop_request_reason = None
+        self._last_task = None
+        self._next_scan_at = None
         self._job_callback = lambda _job: None
         self._job_updates_bound = False
         self._job_snapshots = {job.id:job for job in self.jobs.list()}
@@ -88,6 +92,11 @@ class GuiPipelineController:
 
     def _runtime_update(self, record: dict) -> None:
         with self._guard:
+            if record.get('scheduler'):
+                view=record['scheduler']
+                self._next_scan_at=view.get('next_scan_at')
+                if view.get('priority') != 5:
+                    self._last_task=view.get('task')
             previous = self._runtime
             self._runtime = dict(record)
             snapshots = list(self._job_snapshots.values())
@@ -96,6 +105,12 @@ class GuiPipelineController:
             self._log_callback({'level': record.get('level', 'INFO'), 'stage': record.get('stage', ''),
                                 'message': record.get('message', record.get('stage', '')),
                                 'runtime': dict(record)})
+
+    def _set_stop_reason(self, code, detail=''):
+        from djd_maker.core.stop_reason import StopReason
+        self._stop_reason = StopReason.make(code,detail)
+        self._runtime_update({**self._runtime, 'stage':'lifecycle.'+code,
+            'message':self._stop_reason.message, 'stop_reason':self._stop_reason.to_dict()})
 
     def bind(
         self,
@@ -117,20 +132,32 @@ class GuiPipelineController:
         return value.resolve() if value.is_absolute() else (self.app_root / value).resolve()
 
     def reload(self) -> list[Job]:
+        from djd_maker.core.output_ownership import import_lock
+        with import_lock(self.jobs,self.app_root/'system/jobs'):
+            return self._reload_serialized()
+
+    def _reload_serialized(self) -> list[Job]:
         from djd_maker.core.deferred_state import store_for
+        from djd_maker.core.output_ownership import path_identity, source_digest, reconcile_output_ownership
         source_root = self._input_directory()
         source_root.mkdir(parents=True, exist_ok=True)
-        existing = {str(Path(job.source_path).resolve()) for job in self.jobs.list()}
+        existing = {path_identity(job.source_path) for job in self.jobs.list()}
         deferred = store_for(self.jobs)
-        existing.update(str(Path(entry.snapshot['source_path']).resolve())
+        existing.update(path_identity(entry.snapshot['source_path'])
                         for entry in deferred.entries.values() if entry.snapshot.get('source_path'))
         deleted = getattr(self.jobs, "deleted_source_paths", None)
         if callable(deleted):
-            existing.update(deleted())
+            existing.update(path_identity(p) for p in deleted())
         for source in sorted(source_root.glob("*.txt"), key=lambda item: item.name.casefold()):
-            resolved = str(source.resolve())
+            resolved = path_identity(source)
             if resolved not in existing and source.is_file():
-                job = Job(resolved)
+                try:
+                    digest = source_digest(source)
+                except OSError as exc:
+                    digest = None
+                    self._log_callback({'level':'WARNING','stage':'source.identity',
+                        'message':f'台本 {source.name} のハッシュを読めません。対象jobで再確認します。他の台本を継続します。{exc}'})
+                job = Job(str(source.resolve()), source_sha256=digest)
                 try:
                     self.jobs.save(job)
                 except JobStateSaveError as error:
@@ -138,6 +165,9 @@ class GuiPipelineController:
                     self._runtime_update(dict(stage='save.deferred', job_id=job.id, job=job.script_name,
                         level='WARNING', message='新規jobの状態保存を保留しました。他の台本を続行します。'))
                 existing.add(resolved)
+        output = Path(self.settings.output_directory)
+        output = output if output.is_absolute() else self.app_root/output
+        self.ownership_report = reconcile_output_ownership(self.jobs, output)
         values = self.jobs.list()
         self._jobs_callback(values)
         self._publish_status(values)
@@ -185,6 +215,8 @@ class GuiPipelineController:
                 self.pipeline = None
             self._paused = False
             self.cancellation.reset()
+            self._stop_reason = None
+            self._stop_request_reason = None
             self._phase = "preflight" if self.pipeline_factory is not None else "processing"
             self._worker = threading.Thread(
                 target=self._run_loop,
@@ -210,6 +242,8 @@ class GuiPipelineController:
                 raise RuntimeError("未回収動画の回収処理が構成されていません")
             self._recovering = True
             self.cancellation.reset()
+            self._stop_reason = None
+            self._stop_request_reason = None
             self._recovery_done.clear()
             self._phase = "recovery"
         try:
@@ -228,12 +262,18 @@ class GuiPipelineController:
             values = self.jobs.list()
             self._jobs_callback(values)
             self._publish_status(values)
+            self._set_stop_reason('RECOVERY_CHECK_FINISHED')
             return {
                 "pending": len(pending_before),
                 "checked": len(processed),
             }
         except RunCancelled:
+            self._set_stop_reason(self._stop_request_reason or 'USER_STOP')
             return {'pending': 0, 'checked': 0, 'stopped': True}
+        except Exception as exc:
+            from djd_maker.core.stop_reason import exception_reason
+            self._set_stop_reason(exception_reason(exc),str(exc))
+            raise
         finally:
             try:
                 with cancellation_scope(None):
@@ -243,6 +283,8 @@ class GuiPipelineController:
                     self._recovering = False
                     self._phase = "idle"
                     self._recovery_done.set()
+                if self._stop_reason is None:
+                    self._set_stop_reason(self._stop_request_reason or 'TERMINAL_GLOBAL_ERROR')
                 self._publish_status()
 
     def refresh_credit(self) -> dict[str, object]:
@@ -257,6 +299,8 @@ class GuiPipelineController:
             self._paused = True
             self.scheduler.pause()
         self._runtime_update({**self._runtime, 'stage': 'pause'})
+        self._runtime_update({**self._runtime, 'stage':'pause',
+            'message':'一時停止しています。開始操作で同じ位置から再開します。'})
         self._publish_status()
         return self.status()
 
@@ -267,6 +311,8 @@ class GuiPipelineController:
         return self.start()
 
     def request_stop(self) -> None:
+        if self._stop_request_reason is None:
+            self._stop_request_reason = 'USER_STOP'
         self.scheduler.stop()
         self.cancellation.request()
         self._phase = 'STOP_REQUESTED'
@@ -298,9 +344,11 @@ class GuiPipelineController:
         self._publish_status()
         if self._phase == 'STOPPED':
             self._runtime_update({**self._runtime, 'stage': 'stop.complete'})
+            self._set_stop_reason(self._stop_request_reason or 'USER_STOP')
         return self.status()
 
     def shutdown(self) -> None:
+        self._stop_request_reason = 'APP_CLOSE'
         result = self.stop()
         if result["running"]:
             self._log_callback({'level':'ERROR', 'stage':'shutdown-timeout', 'message':json.dumps(self.cancellation.diagnostic())})
@@ -345,6 +393,8 @@ class GuiPipelineController:
                 try:
                     self.pipeline = self.pipeline_factory()
                 except Exception as exc:
+                    from djd_maker.core.stop_reason import exception_reason
+                    self._set_stop_reason(exception_reason(exc),str(exc))
                     cleanup_browser = not bool(
                         getattr(exc, "preserve_browser", False)
                     )
@@ -388,6 +438,7 @@ class GuiPipelineController:
                             }
                         )
                         self._error_callback("pipeline", str(exc))
+                        raise
                     values = self.jobs.list()
                     for job in values:
                         previous = self._last_states.get(job.id)
@@ -410,30 +461,42 @@ class GuiPipelineController:
                     if not self._job_updates_bound:
                         self._jobs_callback(values)
                     self._publish_status(values)
-                    complete = getattr(self.pipeline, 'all_tasks_completed', None)
-                    if callable(complete) and complete():
+                    from .task_discovery import final_discovery
+                    from datetime import datetime, UTC
+                    discover = getattr(self.pipeline,'final_discovery',None)
+                    scan = discover() if callable(discover) else final_discovery(
+                        self.jobs.list(),datetime.now(UTC),False,getattr(self.pipeline,'deferred_ids',set()))
+                    self.final_discovery_result = scan
+                    if scan['complete']:
+                        self._set_stop_reason('ALL_TASKS_COMPLETED')
                         break
-                    if not callable(complete) and values and all(
-                        job.id in getattr(self.pipeline, 'deferred_ids', set()) or job.state
-                        in {
-                            JobState.COMPLETED,
-                            JobState.FAILED,
-                            JobState.DOWNLOAD_VERIFY_FAILED,
-                        }
-                        for job in values
-                    ):
-                        break
+                    if not scan['runnable']:
+                        self._runtime_update({**self._runtime,'stage':'scheduler.wait',
+                            'message':'現在実行可能なjobがないため、次回確認まで待機しています。',
+                            'wait_reason':'NO_RUNNABLE_TASK_WAIT'})
                 interval = getattr(self.pipeline, 'wait_seconds', 0) or self.cycle_interval_seconds
                 self.cancellation.wait(interval)
         except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError) as exc:
+            from djd_maker.core.stop_reason import exception_reason
+            self._set_stop_reason(exception_reason(exc),str(exc))
             self.cancellation.request()
             self._error_callback('modal' if isinstance(exc, BlockingModalError) else 'pipeline', str(exc))
         except RunCancelled:
+            self._set_stop_reason(self._stop_request_reason or 'USER_STOP')
             self._log_callback({'level':'INFO', 'stage':'stopped', 'message':json.dumps(self.cancellation.diagnostic())})
+        except Exception as exc:
+            from djd_maker.core.stop_reason import exception_reason
+            self._set_stop_reason(exception_reason(exc),str(exc))
+            self._error_callback('pipeline',str(exc))
         finally:
+            if self._stop_reason is None:
+                self._set_stop_reason(self._stop_request_reason or 'TERMINAL_GLOBAL_ERROR')
             summary = getattr(self.pipeline, 'deferred_summary', None)
             if callable(summary):
-                summary()
+                try:
+                    summary()
+                except Exception as exc:
+                    self._set_stop_reason('STORAGE_FATAL',str(exc))
             # No terminal job can require another Notebook poll. Keep scheduler
             # state aligned with the stopped worker after natural completion too.
             self.scheduler.stop()
@@ -480,6 +543,9 @@ class GuiPipelineController:
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
             "phase": self._phase,
             "runtime": dict(self._runtime),
+            "stop_reason": self._stop_reason.to_dict() if self._stop_reason else None,
+            "last_task": self._last_task,
+            "next_scan_at": self._next_scan_at,
             **self._credit_status(values),
         }
 

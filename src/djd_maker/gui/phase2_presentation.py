@@ -237,6 +237,12 @@ class Phase2Presentation:
         self.phase_counts_label = QLabel('生成・回収集計: －')
         self.phase_counts_label.setWordWrap(True)
         runtime_grid.addWidget(self.phase_counts_label, 10, 0)
+        self.lifecycle_label = QLabel()
+        self.lifecycle_label.setWordWrap(True)
+        self.lifecycle_label.setMinimumHeight(self.lifecycle_label.fontMetrics().lineSpacing()*4+8)
+        # Keep the stop explanation above the long diagnostics in the existing
+        # scroll column so it is visible without scrolling after a stop.
+        current.body.addWidget(self.lifecycle_label)
         self.runtime_messages.hide()
         current.body.addWidget(runtime)
         self._runtime_record = {}

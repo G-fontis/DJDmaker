@@ -131,6 +131,9 @@ class Job:
     generation_prompt: str | None = None
     generation_started_at: str | None = None
     generation_retry_turn_count: int | None = None
+    duplicate_of_job_id: str | None = None
+    output_conflict_job_id: str | None = None
+    output_resume_state: str | None = None
     next_poll_at: str | None = None
     last_polled_at: str | None = None
     credit_state: str = "CREDIT_UNKNOWN"
