@@ -297,6 +297,8 @@ class PipelineCoordinator(DeferredRecovery):
     def _needs_dispatch(self, job: Job) -> bool:
         if job.id in self.deferred_ids or terminal(job):
             return False
+        if job.failure_class in {'OUTPUT_BLOCKED', 'TERMINAL_FAILED'} or job.error_code == 'OUTPUT_NAME_COLLISION':
+            return False
         if job.state in {JobState.WAITING, JobState.UPLOADING}:
             return True
         if job.state is JobState.FAILED:
@@ -348,6 +350,7 @@ class PipelineCoordinator(DeferredRecovery):
                     self._save(job)
         self._refresh_capabilities()
         self._reject_output_name_collisions()
+        self._reconcile_unprocessed()
         self._progress_jobs = {j.id:j for j in self.jobs.list()}
         if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
             self.wait_seconds = 0
@@ -367,6 +370,20 @@ class PipelineCoordinator(DeferredRecovery):
                 self._retry_deferred()
             self._phase_event('COLLECT_LOCAL')
         self._discover_remaining_tasks()
+
+    def _reconcile_unprocessed(self):
+        from .task_discovery import no_generation_checkpoint
+        values = [j for j in self.jobs.list() if j.id not in self.deferred_ids and no_generation_checkpoint(j)]
+        repair = [j for j in values if j.state not in {JobState.WAITING, JobState.UPLOADING}]
+        if repair:
+            self.runtime_callback(dict(stage='STATE_RECONCILIATION_REQUIRED',
+                message=f'生成checkpointのない未処理job {len(repair)}件を再分類します'))
+        for job in repair:
+            with self._job_boundary(job):
+                job.state = JobState.WAITING
+                job.failure_class = job.error_code = job.error_message = None
+                job.next_poll_at = None
+                self._save(job)
 
     def _refresh_capabilities(self):
         """Recheck on the browser owner thread, never inside an FFmpeg worker."""
@@ -388,10 +405,15 @@ class PipelineCoordinator(DeferredRecovery):
                         self.cloud_limit.defer_recheck()
                         self.runtime_callback(dict(stage='limit.recheck.failed', level='WARNING',
                             message=f'上限解除を確認できません。待機を維持して再確認します: {type(exc).__name__}'))
+                else:
+                    self.cloud_limit.defer_recheck()
+                    self.runtime_callback(dict(stage='limit.recheck.unavailable', level='WARNING',
+                        message='現在Notebookの確認経路がありません。生成せず再確認を待ちます。'))
         self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
 
     def _generation_preempts(self):
         self._refresh_capabilities()
+        self._reconcile_unprocessed()
         return self.capabilities.can_generate and any(self._needs_dispatch(j) for j in self.jobs.list())
 
     def all_tasks_completed(self):
@@ -424,12 +446,23 @@ class PipelineCoordinator(DeferredRecovery):
             retry_attempts={j.id: j.attempt_by_stage.get('scheduler.recovery', 0) for j in self.jobs.list()
                             if j.attempt_by_stage.get('scheduler.recovery', 0)},
             terminal_failed=sum(terminal(j) and j.state is not JobState.COMPLETED and not j.duplicate_of_job_id for j in self.jobs.list()))
+        jobs = self.jobs.list()
+        view['discovery'] = dict(total_jobs=len(jobs),
+            generation_candidates=sum(self._needs_dispatch(j) for j in jobs),
+            local_candidates=sum(j.state in self.MEDIA_STATES and j.id not in self.deferred_ids for j in jobs),
+            download_candidates=sum(j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} and j.id not in self.deferred_ids for j in jobs),
+            retry_candidates=sum(j.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED} and not terminal(j)
+                                 and j.failure_class != 'OUTPUT_BLOCKED' and j.id not in self.deferred_ids for j in jobs),
+            blocked_duplicates=sum(bool(j.duplicate_of_job_id) for j in jobs),
+            output_blocked=sum(j.failure_class == 'OUTPUT_BLOCKED' for j in jobs),
+            terminal_failed=view['terminal_failed'], cloud_capability=self.cloud_limit.status()['reconciliation'],
+            limit_source=self.cloud_limit.state.get('message'), resume_at=self.cloud_limit.state.get('cloud_resume_at'))
         if view == self.scheduler_view:
             return
         self.scheduler_view = view
         self.runtime_callback(dict(stage='scheduler.wait' if priority == 5 else 'scheduler.task',
             scheduler=dict(self.scheduler_view), phase=self.phase, cloud_limit=self.cloud_limit.status(),
-            message=f'優先度{priority}: {task}'))
+            message=f'優先度{priority}: {task} / discovery={view["discovery"]}'))
 
     def _discover_remaining_tasks(self):
         self.wait_seconds = 0
@@ -466,6 +499,8 @@ class PipelineCoordinator(DeferredRecovery):
                 # Re-evaluate generation priority before processing another error.
                 if job.state is JobState.WAITING and not self.cloud_limit.blocked:
                     return
+        if self._generation_preempts():
+            return
         runnable = any(j.id not in self.deferred_ids and not terminal(j) and
             (j.state in self.MEDIA_STATES or
              (self._needs_dispatch(j) and not self.cloud_limit.blocked) or
@@ -473,7 +508,11 @@ class PipelineCoordinator(DeferredRecovery):
             for j in self.jobs.list())
         if not self.all_tasks_completed() and not runnable:
             self.wait_seconds = RESCAN_SECONDS
-            self._scheduler_status(5, '現在実行可能なtaskなし。10分後に再確認します')
+            if self.cloud_limit.blocked and self.cloud_limit.recheck_delay < RESCAN_SECONDS:
+                self.wait_seconds = max(1, self.cloud_limit.recheck_delay)
+                self._scheduler_status(5, 'Cloud状態の再確認待ち。未処理候補を保持しています')
+            else:
+                self._scheduler_status(5, '候補と期限を再評価済み。次の期限まで待機します')
 
     def _recover_error_task(self, job):
         checkpoint('error.recovery', job.id)
@@ -519,6 +558,8 @@ class PipelineCoordinator(DeferredRecovery):
             download = self.paths.work_directory / job.id / 'download' / f'{job.script_name}.mp4'
             if not download.is_file() and (local_only or not getattr(self.notebook, 'download_during_limit_verified', False)):
                 continue
+            if self._generation_preempts():
+                return
             with self._job_boundary(job):
                 checkpoint('limit.download.dequeue', job.id)
                 def update(stage, fields):

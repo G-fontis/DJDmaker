@@ -819,6 +819,11 @@ class MainWindow(Phase2Presentation, QMainWindow):
             view = status.get('scheduler') or (record.get('scheduler') if isinstance(record, dict) else None)
             if view:
                 self.scheduler_label.setText(f"優先度: {view['priority']} / {view['task']} / Capability: {view['capabilities']} / 次回巡回: {view.get('next_scan_at') or '－'} / 再試行: {view.get('retry_attempts', {})} / terminal: {view['terminal_failed']}")
+                discovery = view.get('discovery')
+                if discovery:
+                    self.scheduler_label.setText(self.scheduler_label.text() +
+                        f" / Generation候補: {discovery['generation_candidates']} / Local候補: {discovery['local_candidates']}"
+                        f" / Download候補: {discovery['download_candidates']} / Retry候補: {discovery['retry_candidates']}")
             if isinstance(record, dict) and str(record.get('stage', '')).startswith('save.'):
                 job_id = record.get('job_id')
                 if job_id:
@@ -866,8 +871,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
                 f"リセット時刻: {credit_reset_at or '－'}"
             )
             if limit.get('active'):
-                self.credit_state_label.setText('AI LIMIT / CLOUD PAUSED')
-                self.credit_reset_label.setText(f"Notebook再開予定: {limit.get('cloud_resume_at') or '時刻確認必要'}")
+                needs_recheck = limit.get('reconciliation') == 'LIMIT_UNKNOWN_NEEDS_RECHECK' or not limit.get('cloud_resume_at')
+                self.credit_state_label.setText('Cloud状態: 再確認必要' if needs_recheck else 'AI LIMIT / CLOUD PAUSED')
+                self.credit_reset_label.setText('現在のNotebook状態を確認します' if needs_recheck else f"Notebook再開予定: {limit['cloud_resume_at']}")
             self._update_action_state()
             if status.get('stop_reason'):
                 self.statusBar().showMessage(status['stop_reason']['message'])

@@ -7,6 +7,27 @@ RESCAN_SECONDS = 600
 MAX_ERROR_ATTEMPTS = 3
 
 
+def no_generation_checkpoint(job):
+    """Pre-generation records only; never erase legacy in-flight checkpoints."""
+    if (job.duplicate_of_job_id or job.failure_class in {'OUTPUT_BLOCKED', 'TERMINAL_FAILED'}
+            # A recorded operational failure is not an untouched job. Keep it
+            # on the existing bounded recovery/identity-reconciliation path.
+            or job.error_code not in {None, '', 'QUOTA_EXHAUSTED', 'CLOUD_BLOCKED_UNTIL'}
+            or any(job.attempt_by_stage.get(k, 0) >= MAX_ERROR_ATTEMPTS
+                   for k in ('scheduler.recovery', 'source.reupload', 'generation.failed_retry'))):
+        return False
+    if job.state not in {JobState.WAITING, JobState.UPLOADING, JobState.FAILED,
+                          JobState.CREDIT_EXHAUSTED, JobState.RECOVERY_PENDING}:
+        return False
+    return (not any((job.notebook_id, job.notebook_url, job.generation_started_at,
+                     job.raw_path, job.edited_path, job.zip_path, job.hls_checkpoint_directory,
+                     job.zip_checkpoint_path, job.remote_checkpoint, job.resume_checkpoint,
+                     job.reservation_created_at))
+            and job.source_status in {'UNKNOWN', 'ABSENT', 'MISSING'}
+            and job.artifact_status in {'NOT_CHECKED', 'ABSENT', 'NOT_STARTED', 'UNKNOWN'}
+            and not job.safety_gate.remote_deletion_allowed)
+
+
 @dataclass(frozen=True)
 class Capabilities:
     can_generate: bool

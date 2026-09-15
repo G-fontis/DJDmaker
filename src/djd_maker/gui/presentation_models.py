@@ -49,6 +49,8 @@ class CreditLimitViewModel:
     def from_status(cls, state):
         if not state.get('active'):
             return cls(False,'AI使用量上限: 未検出')
+        if state.get('reconciliation') == 'LIMIT_UNKNOWN_NEEDS_RECHECK' or not state.get('cloud_resume_at'):
+            return cls(True, 'Cloud状態: 再確認必要 — 保存されたLimit情報の期限が不明または経過しています。現在のNotebook状態を確認します。')
         seconds=state.get('remaining_seconds')
         remaining = '時刻確認必要' if seconds is None else f'{seconds//3600:02}:{seconds//60%60:02}:{seconds%60:02}'
         return cls(True,f"AI LIMIT / CLOUD PAUSED — Notebook再開予定: {state.get('cloud_resume_at') or '時刻確認必要'} / 残り: {remaining} / ローカル処理を優先")

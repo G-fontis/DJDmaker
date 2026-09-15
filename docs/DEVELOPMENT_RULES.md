@@ -1,5 +1,11 @@
 # 開発ルール
 
+## Ver1.2.8 未処理job・Cloud優先復旧（最新）
+
+- 保存済みLimitで期限不明/不正/経過の場合は現在NotebookのLimit UIとChat有効状態をbounded再確認する。確認成功時だけ解除し、確認不能を利用可能とみなさない。現時点のQuota返信は保持し、再確認backoffを設ける。無期限停止や10分固定待機で再確認を飛ばさない。
+- 生成候補数とCloud capabilityは別々に記録する。GUIの待機ラベルを生成済み証拠にしない。完全未処理の前工程レコードを再分類し、duplicate/OUTPUT_BLOCKED/明示terminal/既存checkpointは保護する。
+- 各Local/Download開始前とWait前に生成優先を再確認する。現行本番393 JSONは読み取り専用とし、Acceptance保存はcopy側に限定する。全746以上testsとlive/EXE/package Gate前のcommit/push禁止。
+
 ## Ver1.2.8 26 FAILED統合解消（最新指示）
 
 - 各失敗をA旧期待/B実回帰/C仕様矛盾に分類し、実回帰を期待値変更だけで隠さない。全728以上・source/live/EXE/package Gate前のbuild/commit/push禁止（buildはsource/live Gate後）。

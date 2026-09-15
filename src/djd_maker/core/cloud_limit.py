@@ -73,9 +73,25 @@ class CloudLimitGate:
 
     @property
     def due(self):
-        value = self.state.get('cloud_resume_at')
-        probe = self.state.get('next_recheck_at', value)
-        return self.blocked and value is not None and self.clock() >= max(datetime.fromisoformat(value), datetime.fromisoformat(probe))
+        return self.blocked and self.recheck_delay == 0
+
+    def _date(self, name):
+        try:
+            value = datetime.fromisoformat(self.state.get(name) or '')
+            return value if value.utcoffset() is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def recheck_delay(self):
+        now = self.clock()
+        resume = self._date('cloud_resume_at')
+        probe = self._date('next_recheck_at')
+        # Retry backoff is bounded; corrupt/old future probes cannot suspend forever.
+        if probe and probe > now + timedelta(seconds=120):
+            probe = None
+        deadlines = [value for value in (resume, probe) if value is not None]
+        return max(0, (max(deadlines)-now).total_seconds()) if deadlines else 0
 
     def defer_recheck(self, seconds=120):
         self.state['next_recheck_at'] = (self.clock()+timedelta(seconds=seconds)).isoformat()
@@ -87,6 +103,10 @@ class CloudLimitGate:
                           notebook_url=notebook_url or self.state.get('notebook_url'),
                           cloud_blocked_until=reset.isoformat() if reset else None,
                           cloud_resume_at=(reset + timedelta(minutes=LIMIT_RESUME_MARGIN_MINUTES)).isoformat() if reset else None)
+        self.state['observed_at'] = self.clock().isoformat()
+        if reset is None:
+            # A current quota reply remains effective until a later UI recheck.
+            self.state['next_recheck_at'] = (self.clock()+timedelta(seconds=120)).isoformat()
         self._save()
 
     def release(self):
@@ -97,6 +117,9 @@ class CloudLimitGate:
         self.document.save(dict(schema_version=SCHEMA_VERSION, kind='cloud_limit', **self.state))
 
     def status(self):
-        value = self.state.get('cloud_resume_at')
-        remaining = max(0, int((datetime.fromisoformat(value)-self.clock()).total_seconds())) if value else None
-        return dict(self.state, remaining_seconds=remaining)
+        value = self._date('cloud_resume_at')
+        remaining = max(0, int((value-self.clock()).total_seconds())) if value else None
+        needs = self.blocked and (value is None or self.clock() >= value)
+        return dict(self.state, remaining_seconds=remaining,
+                    reconciliation='LIMIT_UNKNOWN_NEEDS_RECHECK' if needs else 'DEADLINE_WAIT' if self.blocked else 'AVAILABLE',
+                    recheck_seconds=self.recheck_delay if self.blocked else 0)
