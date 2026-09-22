@@ -163,7 +163,7 @@ class Phase2Presentation:
         self.completion_group = QGroupBox("授業作成 完了")
         completion_layout = QHBoxLayout(self.completion_group)
         self.completion_label = QLabel()
-        self.completion_output_button = QPushButton("完成ZIPフォルダ")
+        self.completion_output_button = QPushButton("完成成果物フォルダ")
         self.completion_raw_button = QPushButton("RAWフォルダ")
         self.completion_error_button = QPushButton("エラー確認")
         completion_layout.addWidget(self.completion_label, 1)

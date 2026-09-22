@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -157,6 +158,10 @@ class Job:
     ending_result: str | None = None
     zip_path: str | None = None
     output_zip_sha256: str | None = None
+    hls_zip_enabled: bool = True
+    final_mp4_path: str | None = None
+    final_mp4_sha256: str | None = None
+    zip_result: str | None = None
     hls_result: str | None = None
     hls_checkpoint_directory: str | None = None
     hls_source_sha256: str | None = None
@@ -189,6 +194,12 @@ class Job:
 
     def transition_to(self, target: JobState) -> None:
         target = JobState(target)
+        if self.state is JobState.ENDING and target is JobState.COMPLETED and not self.hls_zip_enabled:
+            if not self.final_mp4_path or not self.final_mp4_sha256:
+                raise InvalidStateTransition('OFF completion requires a published MP4')
+            self.state = target
+            self.updated_at = utc_now()
+            return
         if target not in ALLOWED_TRANSITIONS[self.state]:
             raise InvalidStateTransition(f"{self.state} -> {target} is not allowed")
         self.state = target
@@ -210,7 +221,16 @@ class Job:
         return snapshot
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
+        # Scheduler snapshots are a hot path (tens of thousands per large
+        # queue). Immutable scalar fields need no recursive dataclass walk.
+        # Keep the exact asdict shape and independent mutable containers.
+        data = {}
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if type(value) in (str, int, float, bool, type(None)):
+                data[item.name] = value
+            else:
+                data[item.name] = asdict(value) if is_dataclass(value) else deepcopy(value)
         data["state"] = self.state.value
         return data
 

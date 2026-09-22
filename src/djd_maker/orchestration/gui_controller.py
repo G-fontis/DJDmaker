@@ -355,6 +355,20 @@ class GuiPipelineController:
             raise RuntimeError("pipeline worker did not stop safely")
 
     def retry(self, job_id: str, stage: str) -> Job:
+        previous = self.jobs.get(job_id)
+        if stage == 'hls' and previous and previous.state is JobState.COMPLETED and not previous.hls_zip_enabled:
+            with self._guard:
+                if self.status().get('active') or self._paused:
+                    raise ValueError('停止してからHLS再処理を指定してください')
+                current = self.settings_provider() if self.settings_provider else self.settings
+                if not current.hls_zip_enabled:
+                    raise ValueError('設定で「HLS＆ZIP化する」をONにしてください')
+                from djd_maker.core.final_mp4 import queue_hls_from_mp4
+                from djd_maker.media.validator import VideoValidator
+                directory = (self.app_root / current.output_directory).resolve()
+                result = queue_hls_from_mp4(previous, directory, VideoValidator(), self.jobs)
+                self._jobs_callback(self.jobs.list())
+                return result
         if self.pipeline is None:
             raise RuntimeError("pipeline must be started before retry")
         if job_id in getattr(self.pipeline, 'deferred_ids', set()):

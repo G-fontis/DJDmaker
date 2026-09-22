@@ -9,6 +9,9 @@ from zipfile import ZipFile, BadZipFile
 
 def validated_output(job, output_directory):
     from .output_ownership import path_identity
+    if not getattr(job, 'hls_zip_enabled', True):
+        from .final_mp4 import owned_mp4, output_target
+        return owned_mp4(job, output_target(job, output_directory))
     if not job.zip_path:
         return False
     package = Path(job.zip_path)
@@ -89,7 +92,9 @@ def reconcile_completed_duplicates(repository, output_directory):
             continue
         if owner.id not in checked:
             from .artifact_ownership import owned_zip
-            checked[owner.id] = owned_zip(owner, Path(output_directory)/(owner.script_name+'.zip'), values)
+            from .final_mp4 import owned_mp4, output_target
+            check = owned_zip if owner.hls_zip_enabled else owned_mp4
+            checked[owner.id] = check(owner, output_target(owner, output_directory), values)
         if not checked[owner.id]:
             unverified.append(job.id)
             continue

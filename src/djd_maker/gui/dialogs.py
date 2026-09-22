@@ -7,6 +7,7 @@ from typing import Protocol
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -104,9 +105,11 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         preset_repository: PresetRepositoryPort | None = None,
+        processing: bool = False,
     ) -> None:
         super().__init__(parent)
         self.preset_repository = preset_repository
+        self._gui_type = settings.gui_type
         self.setWindowTitle("設定")
         self.setMinimumWidth(620)
         layout = QVBoxLayout(self)
@@ -115,8 +118,13 @@ class SettingsDialog(QDialog):
 
         self.input_directory_edit = self._directory_row(form, "台本フォルダー", settings.input_directory)
         self.raw_directory_edit = self._directory_row(form, "RAW保存先", settings.raw_directory)
-        self.output_directory_edit = self._directory_row(form, "ZIP出力先", settings.output_directory)
+        self.output_directory_edit = self._directory_row(form, "成果物出力先", settings.output_directory)
         self.ending_video_edit = self._file_row(form, "Ending動画", settings.ending_video)
+        self.hls_zip_checkbox = QCheckBox("HLS＆ZIP化する")
+        self.hls_zip_checkbox.setChecked(settings.hls_zip_enabled)
+        self.hls_zip_checkbox.setEnabled(not processing)
+        form.addRow(self.hls_zip_checkbox)
+        form.addRow(QLabel("OFF時は完成MP4を保存します。実行中は変更できません。"))
 
         self.first_check_spin = QSpinBox()
         self.first_check_spin.setRange(1, 86400)
@@ -300,6 +308,8 @@ class SettingsDialog(QDialog):
             notebook_poll_seconds=self.poll_spin.value(),
             audio_tail_padding_seconds=0.5,
             ffmpeg_concurrency=int(self.ffmpeg_concurrency_combo.currentText()),
+            gui_type=self._gui_type,
+            hls_zip_enabled=self.hls_zip_checkbox.isChecked(),
         )
 
     def _validate_and_accept(self) -> None:
@@ -348,6 +358,8 @@ class JobDetailDialog(QDialog):
         form.addRow("End処理済み", QLabel(job.edited_path or "－"))
         form.addRow("Ending結果", QLabel(job.ending_result or "－"))
         form.addRow("ZIP", QLabel(job.zip_path or "－"))
+        form.addRow("完成MP4", QLabel(job.final_mp4_path or "－"))
+        form.addRow("HLS＆ZIP化する", QLabel('ON' if job.hls_zip_enabled else 'OFF（設定によりスキップ）'))
         form.addRow("HLS結果", QLabel(job.hls_result or "－"))
         form.addRow("試行回数", QLabel(", ".join(f"{k}: {v}" for k, v in job.attempt_by_stage.items()) or "－"))
         form.addRow("エラーコード", QLabel(job.error_code or "－"))
@@ -369,6 +381,7 @@ class JobDetailDialog(QDialog):
         self.retry_hls_button = QPushButton("HLSから再実行")
         self.open_raw_button = QPushButton("RAWを開く")
         self.open_zip_button = QPushButton("ZIPを開く")
+        self.open_mp4_button = QPushButton("完成MP4を開く")
         self.open_notebook_button = QPushButton("Notebookを開く")
         buttons = (
             (self.retry_job_button, "job"),
@@ -382,6 +395,7 @@ class JobDetailDialog(QDialog):
         actions.addWidget(self.open_raw_button, 2, 0)
         actions.addWidget(self.open_zip_button, 2, 1)
         actions.addWidget(self.open_notebook_button, 3, 0, 1, 2)
+        actions.addWidget(self.open_mp4_button, 4, 0, 1, 2)
         layout.addLayout(actions)
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
@@ -396,9 +410,14 @@ class JobDetailDialog(QDialog):
             job.state is JobState.DOWNLOAD_VERIFY_FAILED and bool(job.notebook_id and job.notebook_url)
         )
         self.retry_ending_button.setEnabled(failed and raw is not None)
-        self.retry_hls_button.setEnabled(failed and edited is not None)
+        self.retry_hls_button.setEnabled((failed and edited is not None) or (
+            job.state is JobState.COMPLETED and not job.hls_zip_enabled
+            and safe_existing_file(job.final_mp4_path) is not None))
+        self.retry_hls_button.setToolTip('完成MP4から再処理する場合は、設定をONにして指定後、開始してください。')
         self.open_raw_button.setEnabled(raw is not None)
         self.open_zip_button.setEnabled(zip_path is not None)
+        self.open_mp4_button.setEnabled(safe_existing_file(job.final_mp4_path) is not None)
+        self.open_mp4_button.clicked.connect(lambda: open_local_path(Path(job.final_mp4_path or ''), parent=self))
         self.open_notebook_button.setEnabled(
             bool(job.notebook_url and job.notebook_url.startswith("https://notebook.google.com/"))
         )

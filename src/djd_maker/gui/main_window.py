@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver1.2.8"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.0"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -153,7 +153,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         grid = QGridLayout(paths)
         self.input_path_edit, self.open_input_button = self._path_row(grid, 0, "台本フォルダー")
         self.raw_path_edit, self.open_raw_folder_button = self._path_row(grid, 1, "RAW保存先")
-        self.output_path_edit, self.open_output_button = self._path_row(grid, 2, "ZIP出力先")
+        self.output_path_edit, self.open_output_button = self._path_row(grid, 2, "成果物出力先")
         self.ending_path_edit = QLineEdit()
         self.ending_path_edit.setReadOnly(True)
         self.change_ending_button = QPushButton("Ending変更…")
@@ -272,7 +272,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.completion_group = QGroupBox("授業作成 完了")
         completion_layout = QHBoxLayout(self.completion_group)
         self.completion_label = QLabel()
-        self.completion_output_button = QPushButton("完成ZIPフォルダ")
+        self.completion_output_button = QPushButton("完成成果物フォルダ")
         self.completion_raw_button = QPushButton("RAWフォルダ")
         self.completion_error_button = QPushButton("エラー確認")
         completion_layout.addWidget(self.completion_label, 1)
@@ -508,6 +508,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
             self.settings,
             self,
             preset_repository=self.preset_repository,
+            processing=self._active_run or self._running or self._paused,
         )
         accepted = dialog.exec()
         self._refresh_preset_view()  # CRUD persists even when settings is cancelled.
@@ -613,7 +614,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.total_label.setText(f"全Job: {summary.total}")
         self.active_label.setText(f"処理中: {summary.active}")
         self.notebook_complete_label.setText(f"Notebook完了: {summary.notebook_complete}/{summary.total}")
-        self.zip_complete_label.setText(f"ZIP完了: {summary.zip_complete}/{summary.total}")
+        self.zip_complete_label.setText(f"ZIP完了: {summary.zip_complete}/{summary.total}" + (f" / MP4完了: {summary.mp4_complete}" if summary.mp4_complete else ''))
         self.error_label.setText(f"Error: {summary.errors}")
         runtime_id = getattr(self, '_runtime_record', {}).get('job_id')
         current = next((job for job in self.jobs if job.id == runtime_id), None)
@@ -634,19 +635,21 @@ class MainWindow(Phase2Presentation, QMainWindow):
         )
         raw_count = sum(bool(job.raw_path) for job in self.jobs)
         self.completion_label.setText(
-            f"全 {summary.total}授業 / 完成 {summary.zip_complete} / "
+            f"全 {summary.total}授業 / 完成 {summary.zip_complete + summary.mp4_complete} / "
             f"エラー {summary.errors} / RAW {raw_count}本 / 完成ZIP {summary.zip_complete}本"
+            + (f" / 完成MP4 {summary.mp4_complete}本" if summary.mp4_complete else '')
             + (f" / 状態保存保留 {len(self._deferred_overlays)}件（完全成功ではありません）" if self._deferred_overlays else '')
         )
         self.completion_group.setVisible(all_finished or bool(self._deferred_overlays))
         if self.settings.gui_type == 'PHASE2':
             self.total_metric.setValue(summary.total)
-            self.complete_metric.setValue(summary.zip_complete)
+            self.complete_metric.setValue(summary.zip_complete + summary.mp4_complete)
             self.error_metric.setValue(summary.errors)
             self.active_metric.setValue(summary.active)
             self.job_total_badge.setText(f'TOTAL {summary.total}')
             self.progress_bar.setValue(int(current.progress_percent) if current else 0)
-            for key, state in (JobViewModel.from_job(current).timeline if current else [(k,'waiting') for k in self.pipeline_steps]):
+            idle_steps = [(k, 'skipped' if not self.settings.hls_zip_enabled and k in {'hls','zip'} else 'waiting') for k in self.pipeline_steps]
+            for key, state in (JobViewModel.from_job(current).timeline if current else idle_steps):
                 self.pipeline_steps[key].setState(state)
             import shutil
             try:

@@ -25,14 +25,21 @@ def _reconcile_completed_txt(jobs, raw_directory: Path) -> int:
             try:
                 source = Path(job.source_path)
                 destination = raw_directory / source.name
-                if source.suffix.casefold() != ".txt" or not job.zip_path:
+                if source.suffix.casefold() != ".txt":
                     raise ValueError("TXT_MOVE_IDENTITY_UNVERIFIED")
-                archive_path = Path(job.zip_path)
-                if archive_path.stem.casefold() != source.stem.casefold():
-                    raise ValueError("TXT_MOVE_IDENTITY_UNVERIFIED")
-                with ZipFile(archive_path) as archive:
-                    if not archive.namelist() or archive.testzip() is not None:
-                        raise ValueError("TXT_MOVE_ZIP_INVALID")
+                if job.hls_zip_enabled:
+                    if not job.zip_path:
+                        raise ValueError("TXT_MOVE_IDENTITY_UNVERIFIED")
+                    archive_path = Path(job.zip_path)
+                    if archive_path.stem.casefold() != source.stem.casefold():
+                        raise ValueError("TXT_MOVE_IDENTITY_UNVERIFIED")
+                    with ZipFile(archive_path) as archive:
+                        if not archive.namelist() or archive.testzip() is not None:
+                            raise ValueError("TXT_MOVE_ZIP_INVALID")
+                else:
+                    from .final_mp4 import owned_mp4
+                    if not job.final_mp4_path or not owned_mp4(job, Path(job.final_mp4_path), jobs):
+                        raise ValueError('TXT_MOVE_MP4_INVALID')
                 if not source.is_file():
                     if not destination.is_file() or not job.source_sha256:
                         raise ValueError("TXT_MOVE_SOURCE_MISSING")

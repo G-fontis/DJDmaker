@@ -16,8 +16,11 @@ class AppSettings:
     audio_tail_padding_seconds: float = 0.5
     ffmpeg_concurrency: int = 1
     gui_type: str = 'PHASE1'
+    hls_zip_enabled: bool = True
 
     def validate(self) -> None:
+        if type(self.hls_zip_enabled) is not bool:
+            raise ValueError('hls_zip_enabled must be boolean')
         if self.gui_type not in {'PHASE1', 'PHASE2'}:
             raise ValueError('unsupported gui_type')
         if self.first_notebook_check_seconds < 1:

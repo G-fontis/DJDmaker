@@ -120,7 +120,15 @@ class DeferredRecovery:
             job.state = JobState.FAILED
             return job
         output = self.paths.output_directory / f'{job.script_name}.zip'
-        if job.presentation_stage in {'zip.complete', 'COMPLETED'} and output.is_file():
+        if not job.hls_zip_enabled and job.final_mp4_path:
+            from djd_maker.core.final_mp4 import owned_mp4, output_target, SKIPPED
+            target = output_target(job, self.paths.output_directory)
+            if owned_mp4(job, target, self.jobs) and getattr(self.validator.validate(target), 'valid', True):
+                job.state = JobState.COMPLETED
+                job.hls_result = job.zip_result = SKIPPED
+                job.progress_percent = 100
+                return job
+        if job.hls_zip_enabled and job.presentation_stage in {'zip.complete', 'COMPLETED'} and output.is_file():
             from dataclasses import replace
             from djd_maker.core.artifact_ownership import owned_zip
             if not owned_zip(replace(job, zip_path=str(output)), output, self.jobs):
@@ -154,8 +162,8 @@ class DeferredRecovery:
             job.state = JobState.RAW_READY
             if job.edited_path and Path(job.edited_path).is_file():
                 if getattr(self.validator.validate(Path(job.edited_path)), 'valid', True):
-                    job.state = JobState.HLS_ENCODING
-            if job.presentation_stage in {'zip.start', 'zip.complete', 'ZIPPING', 'COMPLETED'}:
+                    job.state = JobState.HLS_ENCODING if job.hls_zip_enabled else JobState.ENDING
+            if job.hls_zip_enabled and job.presentation_stage in {'zip.start', 'zip.complete', 'ZIPPING', 'COMPLETED'}:
                 job.state = JobState.ZIPPING
             return job
         if download.is_file():

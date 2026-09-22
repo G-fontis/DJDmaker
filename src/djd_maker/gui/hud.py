@@ -271,6 +271,7 @@ class PipelineStepWidget(QWidget):
 
     def setState(self, state: str) -> None:  # noqa: N802
         self.state = state
+        self.setToolTip('設定によりスキップ' if state == 'skipped' else '')
         self.update()
 
     def paintEvent(self, _event) -> None:  # type: ignore[no-untyped-def]
@@ -295,7 +296,8 @@ class PipelineStepWidget(QWidget):
         painter.drawText(QRectF(center.x() - 15, center.y() - 15, 30, 30), Qt.AlignmentFlag.AlignCenter, glyph)
         painter.setPen(QColor(PALETTE["text"] if self.state != "waiting" else PALETTE["secondary"]))
         painter.setFont(QFont("Yu Gothic UI", 8))
-        painter.drawText(QRectF(0, 49, self.width(), 20), Qt.AlignmentFlag.AlignHCenter, self.label)
+        label = self.label + ' スキップ' if self.state == 'skipped' else self.label
+        painter.drawText(QRectF(0, 49, self.width(), 20), Qt.AlignmentFlag.AlignHCenter, label)
 
 
 def sidebar_button(text: str, *, role: str = "sidebar") -> QPushButton:

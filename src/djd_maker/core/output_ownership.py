@@ -35,6 +35,7 @@ def same_source(a, b):
 
 def has_work(job):
     return bool(job.notebook_id or job.notebook_url or job.raw_path or job.zip_path
+                or job.final_mp4_path
                 or job.generation_started_at)
 
 
@@ -65,6 +66,7 @@ def restore_collision(job):
 
 
 def reconcile_output_ownership(jobs, output_directory, save=None):
+    from .final_mp4 import output_target, owned_mp4
     with import_lock(jobs, output_directory):
         from .completed_reconciliation import reconcile_completed_duplicates
         completed_report = reconcile_completed_duplicates(jobs, output_directory)
@@ -83,13 +85,32 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
             # A historical COMPLETED flag is not proof that output still
             # exists. Recover through the existing checkpoint-aware pipeline;
             # WAITING submission inspects a saved Notebook before generating.
-            target = Path(output_directory)/(job.script_name+'.zip')
-            if (job.state is JobState.COMPLETED and job.zip_path
-                    and path_identity(job.zip_path) == path_identity(target)
+            target = output_target(job, output_directory)
+            published = job.zip_path if job.hls_zip_enabled else job.final_mp4_path
+            if job.state is JobState.COMPLETED and not job.hls_zip_enabled:
+                # OFF completion is proof-bound, not merely a historical flag.
+                # Keep a changed/foreign final file and block only this job.
+                recorded = Path(published) if published else target
+                if recorded.is_file() and not owned_mp4(job, recorded, values):
+                    job.state = JobState.FAILED
+                    job.output_resume_state = JobState.RAW_READY.value if job.raw_path else JobState.WAITING.value
+                    job.failure_class = 'OUTPUT_BLOCKED'
+                    job.error_code = 'OUTPUT_EXISTING_UNVERIFIED'
+                    job.error_message = '完成MP4の所有権または内容を再検証できません。既存ファイルは保持しました。'
+                    job.runtime_reason = 'OUTPUT_BLOCKED'
+                elif not published and not recorded.exists():
+                    job.state = (JobState.RAW_READY if job.raw_path and Path(job.raw_path).is_file()
+                                 and job.safety_gate.remote_deletion_allowed else JobState.WAITING)
+                    job.runtime_reason = 'OUTPUT_MISSING_RECOVER_CHECKPOINT'
+            if (job.state is JobState.COMPLETED and published
+                    and path_identity(published) == path_identity(target)
                     and not target.exists()):
                 job.state = (JobState.RAW_READY if job.raw_path and Path(job.raw_path).is_file()
                              and job.safety_gate.remote_deletion_allowed else JobState.WAITING)
-                job.zip_path = None
+                if job.hls_zip_enabled:
+                    job.zip_path = None
+                else:
+                    job.final_mp4_path = job.final_mp4_sha256 = None
                 job.error_code = job.error_message = job.failure_class = None
                 job.runtime_reason = 'OUTPUT_MISSING_RECOVER_CHECKPOINT'
                 job.progress_percent = 0
@@ -128,11 +149,12 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
         for job in values:
             if job.id in aliases:
                 continue
-            target = Path(output_directory) / (job.script_name+'.zip')
+            target = output_target(job, output_directory)
             if job.state is JobState.COMPLETED:
                 # Historical completion in another output directory is not a
                 # claim on this directory. Existing media remain untouched.
-                if not job.zip_path or not Path(job.zip_path).is_file() or path_identity(job.zip_path) != path_identity(target):
+                published = job.zip_path if job.hls_zip_enabled else job.final_mp4_path
+                if not published or not Path(published).is_file() or path_identity(published) != path_identity(target):
                     stale.append(job.id)
                     continue
             elif released_terminal(job) or (
@@ -174,20 +196,26 @@ def reconcile_output_ownership(jobs, output_directory, save=None):
                 job.state = JobState.FAILED
                 job.runtime_reason = 'OUTPUT_BLOCKED'
             else:
+                if (not job.hls_zip_enabled and job.failure_class == 'OUTPUT_BLOCKED'
+                        and job.final_mp4_path and Path(job.final_mp4_path).is_file()
+                        and not owned_mp4(job, Path(job.final_mp4_path), values)):
+                    continue
                 restore_collision(job)
                 if job.state is JobState.COMPLETED:
                     continue
-                target = Path(output_directory)/(job.script_name+'.zip')
+                target = output_target(job, output_directory)
                 if target.is_file():
                     from .completed_reconciliation import validated_output
                     from dataclasses import replace
-                    valid = validated_output(replace(job, zip_path=str(target)), output_directory)
+                    candidate = replace(job, **({'zip_path':str(target)} if job.hls_zip_enabled else {'final_mp4_path':str(target)}))
+                    valid = validated_output(candidate, output_directory)
                     from .artifact_ownership import owned_zip
-                    if owned_zip(job, target, values):
+                    check = owned_zip if job.hls_zip_enabled else owned_mp4
+                    if check(job, target, values):
                         job.state = JobState.COMPLETED
                         job.progress_percent = 100
                         job.error_code = job.error_message = job.failure_class = None
-                        job.remote_checkpoint = 'LOCAL_ZIP_VALIDATED'
+                        job.remote_checkpoint = 'LOCAL_ZIP_VALIDATED' if job.hls_zip_enabled else 'LOCAL_MP4_VALIDATED'
                         continue
                     job.output_resume_state = job.state.value
                     job.state = JobState.FAILED

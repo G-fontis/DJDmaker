@@ -36,6 +36,8 @@ class JobViewModel:
                  JobState.RESERVED_WAITING_CREDIT_RESET:3}.get(job.state,2)
         timeline = tuple((key, 'done' if job.state is JobState.COMPLETED or n < index else
             ('error' if job.state is JobState.FAILED else 'active') if n == index else 'waiting') for n,key in enumerate(order))
+        if not job.hls_zip_enabled:
+            timeline = tuple((key, 'skipped' if key in {'hls','zip'} else state) for key,state in timeline)
         return cls(job.id,job.script_name,tuple(job_stage_texts(job)),state_display(job),
                    int(max(0,min(100,job.progress_percent))),timeline, job.generation_started_at or '－')
 

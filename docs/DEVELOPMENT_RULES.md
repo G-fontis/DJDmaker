@@ -150,6 +150,8 @@
 
 ## Job state JSON persistence
 
+- Ver2.0 HLS/ZIP任意化: `hls_zip_enabled`は既定ON。共通設定をrun単位で固定し、実行中は変更不可。OFFは検証済み完成MP4を永続保存してCOMPLETEDとし、HLS/ZIPを`SKIPPED_BY_SETTING`にする。RAW・既存HLS/ZIP・remote artifactを削除しない。ON再処理は完成MP4を検証して明示的に指定し、Notebookを再生成しない。
+
 - job JSONはresolved path単位のprocess内mutexで直列化する。job保存にfilesystem lock fileを使わない。
 - atomic saveは同一directory tempへのwrite、flush、fsync、handle close、backup、`os.replace`の順を守る。
 - PermissionErrorおよびWinError 5/32だけをbounded retryする。復旧成功時はWARNING/INFOログだけとし、GUI modalやpipeline failureを発生させない。

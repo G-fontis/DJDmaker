@@ -6,5 +6,6 @@
   "first_notebook_check_seconds": 600,
   "notebook_poll_seconds": 120,
   "audio_tail_padding_seconds": 0.5,
-  "ffmpeg_concurrency": 1
+  "ffmpeg_concurrency": 1,
+  "hls_zip_enabled": true
 }

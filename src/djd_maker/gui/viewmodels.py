@@ -49,7 +49,7 @@ def job_stage_texts(job: Job) -> tuple[str, str, str]:
     }
     notebook_done = notebook_done or job.presentation_stage in {'generation.accepted', 'reservation.complete'}
     ending_done = bool(job.edited_path)
-    hls_done = job.state is JobState.COMPLETED and bool(job.zip_path)
+    hls_done = job.hls_zip_enabled and job.state is JobState.COMPLETED and bool(job.zip_path)
     notebook_active = job.state in {
         JobState.UPLOADING,
         JobState.CREDIT_EXHAUSTED,
@@ -63,7 +63,7 @@ def job_stage_texts(job: Job) -> tuple[str, str, str]:
     return (
         _mark(notebook_done, notebook_active, failed and not notebook_done, "Notebook"),
         '○ Endスキップ' if (job.ending_result or '').startswith('SKIPPED') else _mark(ending_done, job.state is JobState.ENDING, failed and bool(job.raw_path) and not ending_done, "End"),
-        ('▶ ZIP作成中' if job.presentation_stage == 'zip.start' or job.state is JobState.ZIPPING else '▶ HLS変換中' if job.presentation_stage == 'hls.start' or job.state is JobState.HLS_ENCODING else _mark(
+        '－ 設定によりスキップ' if not job.hls_zip_enabled else ('▶ ZIP作成中' if job.presentation_stage == 'zip.start' or job.state is JobState.ZIPPING else '▶ HLS変換中' if job.presentation_stage == 'hls.start' or job.state is JobState.HLS_ENCODING else _mark(
             hls_done,
             job.state in {JobState.HLS_ENCODING, JobState.ZIPPING},
             failed and ending_done and not hls_done,
@@ -125,6 +125,7 @@ class JobSummary:
     notebook_complete: int
     zip_complete: int
     errors: int
+    mp4_complete: int = 0
 
 
 def summarize_jobs(jobs: Iterable[Job]) -> JobSummary:
@@ -133,8 +134,9 @@ def summarize_jobs(jobs: Iterable[Job]) -> JobSummary:
         total=len(values),
         active=sum(job.state in ACTIVE_STATES for job in values),
         notebook_complete=sum(job_stage_texts(job)[0] == '○ Notebook完了' for job in values),
-        zip_complete=sum(job.state is JobState.COMPLETED and bool(job.zip_path) for job in values),
+        zip_complete=sum(job.hls_zip_enabled and job.state is JobState.COMPLETED and bool(job.zip_path) for job in values),
         errors=sum(job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED} for job in values),
+        mp4_complete=sum(job.state is JobState.COMPLETED and not job.hls_zip_enabled and bool(job.final_mp4_path) for job in values),
     )
 
 

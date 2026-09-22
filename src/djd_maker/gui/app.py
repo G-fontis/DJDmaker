@@ -113,6 +113,7 @@ def build_desktop(
             scheduler=scheduler,
             generation_preset=selected_preset,
             cloud_limit=gate,
+            hls_zip_enabled=current.hls_zip_enabled,
         )
 
     def pipeline_factory() -> PipelineCoordinator:

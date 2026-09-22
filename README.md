@@ -1,15 +1,27 @@
-# 台本から授業動画つくるマシーン Ver1.2.8
+# 台本から授業動画つくるマシーン Ver2.0
 
-台本TXTからNotebookLM動画を生成・回収し、音声末尾処理、任意Ending付与、HLS変換、ZIP化までをジョブ単位で実行するWindowsデスクトップアプリです。
+台本TXTからNotebookLM動画を生成・回収し、任意Ending付与と、設定に応じたHLS/ZIP化または完成MP4保存までをジョブ単位で実行するWindowsデスクトップアプリです。
 
 GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成<br>
 Created by 福ゼミ塾長
 
 ## Version
 
-Version 1.2.8。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 2.0.0（GUI表記 Ver2.0）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
-PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、動画artifact限定Web削除、Fake Notebook E2Eを含みます。NotebookLMのlive acceptanceでは、動画回収、12項目のRAW安全gate、artifact限定削除、refresh後の非復活まで確認しています。
+PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、Fake Notebook E2Eを含みます。通常処理ではNotebook・source・remote動画artifactを保持し、回収したRAWを12項目の安全gateで検証します。
+
+### HLS＆ZIP化する
+
+設定画面の「HLS＆ZIP化する」は既定ONです。Phase1/Phase2共通で、再起動後も保持します。
+
+- ON：RAW → 任意Ending → HLS → ZIP → 完成。
+- OFF：RAW → 任意Ending → `<成果物出力先>/completed_mp4/<台本名>.mp4` → 完成。HLS/ZIPは「設定によりスキップ」です。
+- 実行・Pause中は変更できません。新しいStartで未完了jobへ設定を適用し、同一run内で混在させません。
+- OFF完成後にHLSが必要なら、停止中に設定をONへ変更し、ジョブ詳細の「HLSから再実行」を指定して開始します。完成MP4を再利用し、Notebookを再生成しません。
+- 設定を切り替えてもRAW・既存HLS/ZIP・完成MP4・remote動画を削除しません。完成jobは設定変更だけでは再処理しません。
+
+詳細は[Ver2.0 検証記録](docs/v20-hls-zip-optional.md)を参照してください。
 
 このリポジトリではDBを使用しません。設定、キュー、状態、ジョブはアプリ配置フォルダ内のJSONへ原子的に保存する設計です。生成動画、ブラウザプロファイル、Cookie、ログ、秘密情報はGit管理対象外です。
 
@@ -33,7 +45,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver1.2.8`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver2.0`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 Ver1.2.8では起動・再読込時に現行の出力所有権を照合します。同じTXTの未着手重複jobはIDを保持した「重複参照」として表示し、二重生成と誤FAILEDを防ぎます。異なる有効jobの本当の出力競合だけを対象jobに表示し、他jobは継続します。既存完成物は上書きしません。未完了jobが残る間は自動終了せず、実行可能taskがない間は次回確認まで待機します。両GUIに停止理由・最後のtask・次回確認時刻を表示します。詳細は[Ver1.2.8 検証記録](docs/v128-collision-stop-reason-current-window.md)を参照してください。
 
@@ -47,7 +59,7 @@ Ver1.2.1ではStop/Window ×の協調停止と所有automation process限定の�
 
 Ver1.2.6では、AI使用量上限・Chat無効の明示表示、または今回の生成依頼に対応する返信の「動画生成に必要なクォータ不足」を検出すると、生成を後回しにします。almost警告だけ、回答中の一時的な入力無効化、過去の返信だけでは停止しません。解除時刻に固定5分を加えて `system/cloud-limit.json` に保存し、期限後も現在のUIを再確認してから再開します。時刻を取得できなければ自動再開しません。検証結果・配布SHA-256は[Ver1.2.6 Release Gate](docs/v126-final-release.md)を参照してください。
 
-上限中は新規Notebook、source投入、Preset/Chat送信、新規予約を行いません。ローカルRAW検証・Ending（任意）・HLS/ZIP・TXT移動・保存復旧の後も、期限到達jobの完成確認・Downloadを継続します。回収可否はクォータと無関係です。未削除artifactは保持して削除待ち状態を残します。実行可能な作業がなく未完了jobがあれば10分待機して再探索し、全件完了またはterminalになるまで自動終了しません。Errorはcheckpointから最大3回再試行し、失敗したjobだけをterminalとして他jobを続行します。
+上限中は新規Notebook、source投入、Preset/Chat送信、新規予約を行いません。ローカルRAW検証・Ending（任意）・設定に応じたHLS/ZIP・TXT移動・保存復旧の後も、期限到達jobの完成確認・Downloadを継続します。回収可否はクォータと無関係です。remote artifactは回収後も保持し、削除待ちを必須工程にしません。実行可能な作業がなく未完了jobがあれば10分待機して再探索し、全件完了またはterminalになるまで自動終了しません。Errorはcheckpointから最大3回再試行し、失敗したjobだけをterminalとして他jobを続行します。
 
 画面下部の `GUIタイプ` から白基調PHASE1とCyber HUD PHASE2を選択できます。GUI選択は次回起動時も復元します。両画面は同じ操作ID・処理・Preset Repository/ViewModelを使用し、切替後はjob・runtime・presetを自動表示します。同一sessionのpreset選択は共有し、アプリ再起動時は未選択になります。切替は処理停止中のみで、一時停止中は切替できません。一時停止は次のNotebook移動・送信・Download・ローカル工程開始を止めます。開始済みの短い操作やFFmpegは安全checkpointまで進め、`授業動画作成開始`で同じ位置から再開します。独立した`再開`ボタンはありません。
 
@@ -82,8 +94,8 @@ Start後のPre-flightと動画完成までの処理は自動で、正常時に�
 1. `input`へ台本TXTを配置し、設定画面で`raw_files`、`output`、Ending動画、動画生成プリセットを指定します。プリセット一覧は保存されますが、起動ごとに使用するプリセットを選択します。
 2. 必要な場合は`Googleログイン`を押し、通常Chromeでログイン後、そのChromeを閉じます。CookieやpasswordをアプリやGitへ保存しません。
 3. `授業動画作成開始`を押すと7項目の内部Pre-flight後、Notebook作成、rename、source投入、source ready監視、メインチャットへのpreset送信、Notebook側の自動動画生成、scheduler監視、Downloadをjob単位で実行します。sourceの待機期限では状態を再診断し、明示的に失敗したentryだけを同じTXTで再uploadします（最大3回）。状態不明のままPresetを送信せず、Error Recoveryへ移します。
-4. DownloadしたMP4を検証して`raw_files`へ永久保存した後、動画artifactだけをWeb UIから削除します。Notebook本体と正常sourceは削除しません。失敗sourceの限定削除は前項の復旧時だけです。
-5. RAWにEnding処理を行い、6秒segmentのHLSと無圧縮ZIPを`output`へ作成します。
+4. DownloadしたMP4を検証して`raw_files`へ永久保存します。Notebook本体・正常source・動画artifactは保持します。失敗sourceの限定削除は前項の復旧時だけです。
+5. Ending設定があれば結合します。「HLS＆ZIP化する」がONなら6秒segmentのHLSと無圧縮ZIPを`output`へ作成し、OFFなら`output/completed_mp4`の完成MP4までで終了します。
 
 一時停止は新しい工程の開始を止め、保存済みdeadlineとjob状態を維持します。再開・アプリ再起動後も同一NotebookやDownloadを重複作成しない設計です。RAWは後工程で上書き・削除されません。
 
@@ -92,7 +104,7 @@ Start後のPre-flightと動画完成までの処理は自動で、正常時に�
 ```text
 input/       台本TXT
 raw_files/   回収済み未編集MP4（上書き・自動削除禁止）
-output/      完成ZIP
+output/      完成ZIP / completed_mp4内の完成MP4
 work/        ジョブ別の一時成果物
 system/      settings.json / presets.json / queue.json / state.json / jobs/*.json
 logs/        実行ログ
@@ -109,7 +121,7 @@ docs/        調査・設計資料
 - 生成開始前と生成要求の状態進行時にNotebookLMの明示的なクレジット表示を確認します。
 - クレジット枯渇時に即時生成を繰り返しません。現在は新規予約を行わず、上限解除時刻+5分まで待機します。旧予約コード・selector・testは後方互換のため保持していますが、production生成経路からは呼びません。
 - 旧予約済みjobは破壊せず、既存remote artifactの回収対象として保持します。リセット時刻は当日または翌日のtimezone付き日時として扱います。
-- 予約・未回収状態は`system/jobs/*.json`に保持されます。［未回収動画のチェックから続ける］は既存Notebook/artifactだけを確認し、新規Notebookや重複動画を生成しません。リセット前は何も操作しません。
+- 予約・未回収状態は`system/jobs/*.json`に保持されます。［未回収動画のチェックから続ける］は既存Notebook/artifactだけを確認し、新規Notebookや重複動画を生成しません。完成確認・Downloadはクォータのリセット前でも可能です。
 - ジョブJSON保存はjob/path単位のprocess内mutex、同一directoryの一時ファイル、flush/fsync、backup、atomic replaceを使用します。Windowsの一時的なWinError 5/32はbounded retryで内部復旧し、復旧できた場合はダイアログを表示しません。
 
 詳細: [Ver1.1 credit/recovery/storage実装記録](docs/v11-credit-recovery-storage.md)

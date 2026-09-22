@@ -287,7 +287,10 @@ class IdlePipeline:
 def test_gui_controller_publishes_pause_resume_stop_state_transitions(
     tmp_path: Path,
 ) -> None:
-    jobs = MemoryJobs()
+    # Pause an active waiting run, not an empty queue which legitimately races
+    # to ALL_TASKS_COMPLETED before the test thread can press Pause.
+    jobs = MemoryJobs(Job('waiting.txt', state=JobState.WAITING_VIDEO,
+                          next_poll_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat()))
     scheduler = PersistentPollScheduler(jobs)
     statuses: list[dict[str, object]] = []
     controller = GuiPipelineController(

@@ -30,6 +30,8 @@ LABELS = {
     'save.recovered': '状態保存を復旧', 'save.unresolved': '状態保存保留',
     'save.summary': '保存保留を含む処理結果',
     'zip.publish': '検証済みZIPを公開',
+    'mp4.publish': '完成MP4保存（HLS/ZIPは設定によりスキップ）',
+    'mp4.complete': '完成MP4検証完了',
     'phase.a': '動画生成開始フェーズ', 'phase.b': '動画回収・変換フェーズ',
     'REMOTE_ARTIFACT_READY': '動画完成・回収待ち',
     'notebook.create': 'Notebook作成中', 'notebook.created': 'Notebook作成完了',

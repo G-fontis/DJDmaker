@@ -729,8 +729,10 @@ class JobRepository:
             current = self.require(job.id)
             if current.to_dict() != job.to_dict() or has_work(current) or not same_source(current, completed):
                 raise ValueError('REDUNDANT_JOB_CHANGED: 再照合が必要です')
-            if (completed.state is not JobState.COMPLETED or not completed.zip_path
-                    or not validated_output(completed, Path(completed.zip_path).parent)):
+            output_path = completed.zip_path if completed.hls_zip_enabled else completed.final_mp4_path
+            output_root = (Path(output_path).parent if completed.hls_zip_enabled else Path(output_path).parent.parent) if output_path else None
+            if (completed.state is not JobState.COMPLETED or output_root is None
+                    or not validated_output(completed, output_root)):
                 raise ValueError('COMPLETED_OUTPUT_UNVERIFIED: 成果物を再確認できません')
             archive = _VersionedDocument(self.directory.parent / 'removed-job-records' / (job.id+'.json'),
                                          'job', use_file_lock=False)

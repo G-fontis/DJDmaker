@@ -125,9 +125,12 @@ class PipelineCoordinator(DeferredRecovery):
         scheduler: PollSchedulerPort | None = None,
         generation_preset: Preset | None = None,
         cloud_limit: CloudLimitGate | None = None,
+        hls_zip_enabled: bool | None = None,
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
+        if hls_zip_enabled is not None and type(hls_zip_enabled) is not bool:
+            raise ValueError('hls_zip_enabled must be boolean or persisted-mode None')
         if paths.ending_video is not None and not paths.ending_video.is_file():
             raise FileNotFoundError(f"Ending動画が未設定または存在しません: {paths.ending_video}")
         self.jobs = jobs
@@ -140,6 +143,8 @@ class PipelineCoordinator(DeferredRecovery):
         self.ffmpeg_concurrency = ffmpeg_concurrency
         self.scheduler = scheduler
         self.generation_preset = generation_preset
+        self._run_hls_zip_enabled = hls_zip_enabled
+        self._mode_snapshotted: set[str] = set()
         self.cloud_limit = cloud_limit or CloudLimitGate(
             Path(getattr(jobs, 'directory', paths.work_directory / 'jobs')).parent / 'cloud-limit.json')
         self.runtime_callback = lambda _record: None
@@ -162,11 +167,45 @@ class PipelineCoordinator(DeferredRecovery):
     def begin_run(self) -> None:
         """Reset local queue bookkeeping only; never opens a Notebook."""
         self._resume_attempted.clear()
+        self._mode_snapshotted.clear()
+        self._snapshot_output_modes()
         self._no_op_count = 0
         self._idle_announced.clear()
         self._deferred_attempts.clear()
         for entry in self.deferred.entries.values():
             self._deferred_notice(entry, 'save.deferred', '保存保留journalを検出しました。再実行前に成果物を照合します。')
+
+    def _snapshot_output_modes(self) -> None:
+        """Human-run option is immutable; completed jobs retain their output mode."""
+        for job in self.jobs.list():
+            if job.id in self._mode_snapshotted or job.id in self.deferred_ids or job.state is JobState.COMPLETED:
+                continue
+            if self._run_hls_zip_enabled is None and job.hls_zip_enabled:
+                self._mode_snapshotted.add(job.id)
+                continue
+            with self._job_boundary(job):
+                before = job.to_dict()
+                if self._run_hls_zip_enabled is not None:
+                    job.hls_zip_enabled = self._run_hls_zip_enabled
+                if not job.hls_zip_enabled:
+                    from djd_maker.core.final_mp4 import SKIPPED
+                    job.hls_result = job.zip_result = SKIPPED
+                    if job.state in {JobState.HLS_ENCODING, JobState.ZIPPING}:
+                        job.state = JobState.ENDING
+                        job.presentation_stage = 'ENDING'
+                elif job.hls_result == 'SKIPPED_BY_SETTING':
+                    job.hls_result = job.zip_result = None
+                if job.to_dict() != before:
+                    self._save(job)
+                self._mode_snapshotted.add(job.id)
+
+    def _finish_mp4(self, job: Job) -> None:
+        from djd_maker.core.final_mp4 import publish_mp4, SKIPPED
+        report_operation('mp4.publish', decision='HLS/ZIPは設定によりスキップ', next_action='完成MP4保存')
+        publish_mp4(job, self.paths.output_directory, self.validator, self.jobs, self._save)
+        job.hls_result = job.zip_result = SKIPPED
+        report_operation('mp4.complete', decision='完成MP4検証済み', next_action='完成・台本移動')
+        self._transition(job, JobState.COMPLETED)
 
     def _save(self, job: Job) -> None:
         if job.id in self.deferred_ids:
@@ -185,7 +224,7 @@ class PipelineCoordinator(DeferredRecovery):
         if self._dispatch_only:
             generated = sum(j.state in {JobState.GENERATING,JobState.WAITING_VIDEO,JobState.DOWNLOAD_PENDING,JobState.DOWNLOADING,JobState.COMPLETED} or bool(j.raw_path) for j in jobs)
             return f'生成開始済: {generated}/{len(jobs)} / 旧予約: {sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)} / 残り: {sum(self._needs_dispatch(j) for j in jobs)}'
-        return f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}'
+        return f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED and j.hls_zip_enabled for j in jobs)} / MP4完了: {sum(j.state is JobState.COMPLETED and not j.hls_zip_enabled for j in jobs)}'
 
     def _stage_event(self, job: Job, stage: str) -> None:
         if stage in {'state.saved', 'job.start', 'job.result', 'job.next', 'limit.warning'} or job.state is JobState.COMPLETED:
@@ -258,7 +297,7 @@ class PipelineCoordinator(DeferredRecovery):
                     if getattr(self.validator.validate(Path(job.raw_path)), "valid", True):
                         target = JobState.RAW_READY
                         if job.edited_path and Path(job.edited_path).is_file() and getattr(self.validator.validate(Path(job.edited_path)), "valid", True):
-                            target = JobState.ZIPPING if job.resume_checkpoint == "ZIPPING" else JobState.HLS_ENCODING
+                            target = (JobState.ZIPPING if job.resume_checkpoint == "ZIPPING" else JobState.HLS_ENCODING) if job.hls_zip_enabled else JobState.ENDING
                 elif job.notebook_id and job.notebook_url:
                     diagnose = getattr(self.notebook, "diagnose_resume", None)
                     diagnosis = diagnose(job) if callable(diagnose) else {"artifact": self.notebook.inspect_status(job)}
@@ -325,7 +364,7 @@ class PipelineCoordinator(DeferredRecovery):
         reserved = sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)
         remaining = sum(self._needs_dispatch(j) for j in jobs)
         summary = (f'生成開始済: {generated}/{len(jobs)} / 旧予約: {reserved} / 残り: {remaining}' if phase == 'GENERATION_DISPATCH'
-                   else f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED for j in jobs)}')
+                   else f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED and j.hls_zip_enabled for j in jobs)} / MP4完了: {sum(j.state is JobState.COMPLETED and not j.hls_zip_enabled for j in jobs)}')
         summary += f' / 状態保存保留: {len(self.deferred_ids)}'
         decision = ('保存保留jobは未解決のまま隔離し、安全な他jobの回収を続行します' if self.deferred_ids
                     else '全jobの生成投入判定が完了しました')
@@ -335,6 +374,7 @@ class PipelineCoordinator(DeferredRecovery):
 
     def run_cycle(self) -> None:
         checkpoint('pipeline.cycle')
+        self._snapshot_output_modes()
         for job in self.jobs.list():
             if terminal(job) or job.id in self.deferred_ids or not job.next_poll_at:
                 continue
@@ -577,7 +617,7 @@ class PipelineCoordinator(DeferredRecovery):
         if local:
             self._run_local_tasks(local)
         checkpoint('completed.txt.reconcile')
-        if any(j.state is JobState.COMPLETED and j.zip_path for j in self.jobs.list()):
+        if any(j.state is JobState.COMPLETED and (j.zip_path or j.final_mp4_path) for j in self.jobs.list()):
             self.reconcile_completed_txt()
         self._retry_deferred(local_only=True)
 
@@ -859,6 +899,7 @@ class PipelineCoordinator(DeferredRecovery):
 
     def run_recovery_cycle(self, *, now: datetime | None = None) -> list[str]:
         """Advance only persisted remote/recovery jobs; never submit new work."""
+        self._snapshot_output_modes()
         self._reject_output_name_collisions()
         if self.cloud_limit.blocked:
             self._drain_limit_local(local_only=True)
@@ -1305,6 +1346,14 @@ class PipelineCoordinator(DeferredRecovery):
     def _run_media_job(self, job: Job, *, one_task=False) -> None:
         try:
             checkpoint('media.start', job.id)
+            # A deferred journal can be reconciled during this cycle, after
+            # the initial snapshot pass. Apply the immutable run choice before
+            # any local converter, never the recovered journal's stale mode.
+            if self._run_hls_zip_enabled is not None and job.hls_zip_enabled != self._run_hls_zip_enabled:
+                job.hls_zip_enabled = self._run_hls_zip_enabled
+                if job.hls_zip_enabled and job.hls_result == 'SKIPPED_BY_SETTING':
+                    job.hls_result = job.zip_result = None
+                self._save(job)
             if job.artifact_status == 'DELETE_PENDING':
                 # Migrate the old pending-cleanup checkpoint without touching
                 # the remote Notebook, including during quota/local-only work.
@@ -1319,6 +1368,12 @@ class PipelineCoordinator(DeferredRecovery):
             )
             output_zip = self.paths.output_directory / f"{job.script_name}.zip"
 
+            if not job.hls_zip_enabled and job.state in {JobState.HLS_ENCODING, JobState.ZIPPING}:
+                job.state = JobState.ENDING
+            if not job.hls_zip_enabled and job.state is JobState.ENDING and job.edited_path:
+                self._finish_mp4(job)
+                return
+
             if job.state is JobState.RAW_READY:
                 self._transition(job, JobState.ENDING)
 
@@ -1329,7 +1384,10 @@ class PipelineCoordinator(DeferredRecovery):
                         raise ValueError('Endingスキップ元RAWの検証に失敗しました')
                     job.edited_path = str(raw)
                     job.ending_result = 'SKIPPED (not configured)'
-                    report_operation('ending.skip', decision='RAW_READY', next_action='HLS変換')
+                    report_operation('ending.skip', decision='RAW_READY', next_action='HLS変換' if job.hls_zip_enabled else '完成MP4保存')
+                    if not job.hls_zip_enabled:
+                        self._finish_mp4(job)
+                        return
                     self._transition(job, JobState.HLS_ENCODING)
                     if one_task:
                         return
@@ -1359,6 +1417,9 @@ class PipelineCoordinator(DeferredRecovery):
                     job.edited_path = str(edited)
                     job.ending_result = "PASS (checkpoint)"
                 report_operation('ending.complete')
+                if not job.hls_zip_enabled:
+                    self._finish_mp4(job)
+                    return
                 self._transition(job, JobState.HLS_ENCODING)
                 if one_task:
                     return
@@ -1389,6 +1450,7 @@ class PipelineCoordinator(DeferredRecovery):
                 from djd_maker.core.artifact_ownership import _digest
                 job.output_zip_sha256 = _digest(output_zip)
                 job.hls_result = "PASS"
+                job.zip_result = "PASS"
                 if job.state is JobState.HLS_ENCODING:
                     self._transition(job, JobState.ZIPPING)
                 self._transition(job, JobState.COMPLETED)
