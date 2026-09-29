@@ -1,5 +1,11 @@
 # 開発ルール
 
+## 別PCでの開発再開
+
+- GitHub `main`をclone/pullした後、Dropboxの`VSCode_local\DJDmaker\manifest.json`と`README_PC_MIGRATION.txt`を確認し、local-onlyデータを安全に復元してから作業を開始する。
+- `tools/restore_pc_migration.py`は既定dry-runで使い、hash一致と`CONFLICT`なしを確認してから`--apply`する。既存fileを自動上書き・削除しない。
+- settingsのPC固有pathは次PCで再確認する。Google認証は通常AUTH Chromeで再ログインし、browser profile、Cookies、Login Data、Web Data、token、credentialをPC間移行しない。
+
 ## Ver1.2.8 未処理job・Cloud優先復旧（最新）
 
 - 保存済みLimitで期限不明/不正/経過の場合は現在NotebookのLimit UIとChat有効状態をbounded再確認する。確認成功時だけ解除し、確認不能を利用可能とみなさない。現時点のQuota返信は保持し、再確認backoffを設ける。無期限停止や10分固定待機で再確認を飛ばさない。
