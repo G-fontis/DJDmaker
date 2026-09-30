@@ -71,7 +71,7 @@ def build_desktop(
         selected_preset = (
             preset_repository.require_selected() if require_preset else None
         )
-        ending_path = _resolved(root, current.ending_video) if current.ending_video else None
+        ending_path = _resolved(root, current.ending_video) if current.ending_enabled and current.ending_video else None
         if ending_path is not None and not ending_path.is_file():
             raise FileNotFoundError("選択したEnding動画が存在しません。再選択または設定を空にしてください")
         scheduler.first_poll_seconds = current.first_notebook_check_seconds
@@ -114,6 +114,9 @@ def build_desktop(
             generation_preset=selected_preset,
             cloud_limit=gate,
             hls_zip_enabled=current.hls_zip_enabled,
+            ending_enabled=current.ending_enabled,
+            tail_cut_enabled=current.tail_cut_enabled,
+            encode_enabled=current.encode_enabled,
         )
 
     def pipeline_factory() -> PipelineCoordinator:

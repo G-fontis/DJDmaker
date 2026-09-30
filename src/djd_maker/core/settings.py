@@ -17,10 +17,16 @@ class AppSettings:
     ffmpeg_concurrency: int = 1
     gui_type: str = 'PHASE1'
     hls_zip_enabled: bool = True
+    ending_enabled: bool = False
+    tail_cut_enabled: bool = False
+    encode_enabled: bool = False
 
     def validate(self) -> None:
         if type(self.hls_zip_enabled) is not bool:
             raise ValueError('hls_zip_enabled must be boolean')
+        for name in ('ending_enabled', 'tail_cut_enabled', 'encode_enabled'):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f'{name} must be boolean')
         if self.gui_type not in {'PHASE1', 'PHASE2'}:
             raise ValueError('unsupported gui_type')
         if self.first_notebook_check_seconds < 1:

@@ -145,6 +145,10 @@ class Job:
     last_checked_at: str | None = None
     artifact_status: str = "NOT_CHECKED"
     download_status: str = "PENDING"
+    download_attempt_count: int = 0
+    small_download_attempts: int = 0
+    download_size_gate_status: str = "PENDING"
+    download_validation_status: str = "PENDING"
     raw_status: str = "PENDING"
     recovery_retry_count: int = 0
     raw_path: str | None = None
@@ -156,6 +160,11 @@ class Job:
     cut_position_seconds: float | None = None
     edited_path: str | None = None
     ending_result: str | None = None
+    tail_cut_result: str | None = None
+    encode_result: str | None = None
+    ending_enabled: bool = True
+    tail_cut_enabled: bool = True
+    encode_enabled: bool = True
     zip_path: str | None = None
     output_zip_sha256: str | None = None
     hls_zip_enabled: bool = True
@@ -237,6 +246,11 @@ class Job:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Job:
         values = dict(data)
+        # Ver2.0 jobs had one combined Ending/Tail/Encode stage.  Preserve its
+        # behaviour instead of applying arbitrary new defaults during migration.
+        if not {'ending_enabled', 'tail_cut_enabled', 'encode_enabled'} & values.keys():
+            skipped = str(values.get('ending_result') or '').startswith('SKIPPED')
+            values['ending_enabled'] = values['tail_cut_enabled'] = values['encode_enabled'] = not skipped
         values["state"] = JobState(values["state"])
         gate = values.get("safety_gate", {})
         values["safety_gate"] = DownloadSafetyGate(**gate)

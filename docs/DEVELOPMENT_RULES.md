@@ -33,6 +33,17 @@
 
 - `DJD-CHAPPY-V128-STARTUP-COLLISION-STOP-REASON-CURRENT-WINDOW-FULL-001`を優先する。source/live Gate前はVer1.2.7を維持し、全Gate前のcommit/pushは禁止。本番検証はコピーで行い、原本・メディア・profileを変更しない。
 - 「Google/Chrome起動Window確認は、過去のclose/open履歴を参照せず、現在そのWindow/Processが存在するかだけで判定する。ユーザーの明示的な変更指示がない限り、この判定ロジックを変更してはならない。」AST/動作contractで履歴への依存を防止する。
+
+## Ver2.1 Download・Notebook作成・ローカル処理契約
+
+- Notebook動画Downloadは10 MiB（10,485,760 bytes）をサイズ再試行境界とする。初回＋再Download 2回の合計3回が上限で、3回とも未満なら`ACCEPTED_AFTER_3_SMALL_DOWNLOADS`としてサイズ再試行だけを終了する。4回目は禁止する。
+- 小容量受入れは動画正常性の受入れではない。ffprobe、video stream、positive duration、RAW保存・再検証を含む既存12項目gateを必ず通し、`DOWNLOAD_VALIDATED`相当の永続状態より前にEnding・末尾カット・Encode・HLS・ZIPを開始しない。
+- Download回数、小容量回数、サイズ判定、validation判定をjob JSONへ保存する。再起動で回数を初期化しない。再取得は一時pathへ完了後、正式pathへatomic replaceし、`(1)`等の重複名や`.crdownload`を完成扱いしない。
+- Notebook作成のPre-flightと実クリックは同じsemantic selector集合を使用する。role/accessibility name、aria-label、visible text、stable home containerを優先し、Home上のvisibleかつenabledな一意の作成controlだけを操作する。modal guard後に作成し、Notebook ID/URLを保存してからsource投入へ進む。
+- `ending_enabled`、`tail_cut_enabled`、`encode_enabled`は独立した共通設定とする。Phase1/Phase2で同じ値を読み、実行開始時にjobへsnapshotし、実行中は変更不可とする。OFF工程は`SKIPPED_BY_SETTING`で完了条件を満たす。
+- ローカル処理順はRAW validation→末尾カット→Ending付与→Encode。内部で安全に1 commandへ統合してよいが、設定上の意味と結果状態は独立させる。Encode OFFはstream copy/remuxを使用し、互換性不足を理由に黙って全面再Encodeしない。
+- Ver2.0 settings migrationは旧挙動を保持する。旧設定にEnding pathがあれば3項目すべてON、なければ3項目すべてOFFとして補完する。推測で全利用者を一律値へ変更しない。
+- Ver2.1のsource/live Gate完了前はversion変更・build・commit・pushを行わない。Notebook作成live Gateが失敗した場合はreleaseをBLOCKEDとする。
 - 出力所有権は現在のjob identityと実際の出力pathから全体照合してから保存する。同一sourceの重複読込は排他し、旧重複レコードは元IDを保持した非実行参照として統合する。正常成果物を上書きしない。真の競合のみ対象jobをblockedとし、他jobを継続する。
 - 自動終了直前に全jobを再走査する。未完了・将来待機・再試行可能・状態不明・保存保留は完了ではない。全有効jobがCOMPLETEDまたは再試行枯渇TERMINAL_FAILEDの場合のみ全行程終了。単なるFATAL_FAILEDという旧分類だけで完了扱いしない。
 - 全exit pathに停止理由codeと日本語messageを持ち、両GUIへ共通表示する。Pause/待機は停止と区別する。

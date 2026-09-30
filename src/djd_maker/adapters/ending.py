@@ -175,5 +175,103 @@ class EndingEngineAdapter:
         finally:
             staging.unlink(missing_ok=True)
 
+    def process_options(
+        self,
+        raw_video: Path,
+        ending_video: Path | None,
+        output_path: Path,
+        *,
+        ending_enabled: bool,
+        tail_cut_enabled: bool,
+        encode_enabled: bool,
+        padding_seconds: float = 0.5,
+    ) -> MediaResult:
+        """Apply three independent local options without changing immutable RAW.
+
+        Encode OFF always uses stream copy.  In particular, an incompatible
+        Ending is reported as an error; it is never silently re-encoded.
+        """
+        if not any((ending_enabled, tail_cut_enabled, encode_enabled)):
+            validated = self.validator.validate(Path(raw_video))
+            return MediaResult(Path(raw_video), validated.metadata.duration_seconds,
+                               validated.size_bytes)
+        if ending_enabled and ending_video is None:
+            raise EndingProcessingError('Ending is enabled but no Ending video is configured')
+        if ending_enabled and tail_cut_enabled and encode_enabled:
+            return self.process(Path(raw_video), Path(ending_video), Path(output_path), padding_seconds)
+
+        raw_video, output_path = Path(raw_video), Path(output_path)
+        if output_path.exists():
+            raise EndingOutputCollisionError(f"output already exists: {output_path}")
+        main = self.validator.validate(raw_video).metadata
+        last_audio_end = None
+        cut = main.duration_seconds
+        if tail_cut_enabled:
+            try:
+                last_audio_end = self.find_last_audio_end(raw_video, main)
+            except EndingProcessingError:
+                last_audio_end = main.duration_seconds
+            cut = min(main.duration_seconds, last_audio_end + padding_seconds)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        staging = output_path.with_name(f".{output_path.name}.{uuid4().hex}.staging.mp4")
+        trimmed = output_path.with_name(f".{output_path.name}.{uuid4().hex}.trimmed.mp4")
+        concat_list = output_path.with_name(f".{output_path.name}.{uuid4().hex}.concat.txt")
+        try:
+            if ending_enabled and encode_enabled:
+                ending_meta = self.validator.validate(Path(ending_video)).metadata
+                command = [
+                    str(self.ffmpeg_path), '-hide_banner', '-nostdin', '-y',
+                    '-i', str(raw_video), '-i', str(ending_video),
+                    '-filter_complex', self._filter(main, ending_meta, cut),
+                    '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'medium',
+                    '-crf', '20', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart',
+                    str(staging),
+                ]
+                self._run(command, 'local processing')
+            elif ending_enabled:
+                first = raw_video
+                if tail_cut_enabled:
+                    self._run([
+                        str(self.ffmpeg_path), '-hide_banner', '-nostdin', '-y',
+                        '-i', str(raw_video), '-t', f'{cut:.6f}', '-map', '0', '-c', 'copy',
+                        str(trimmed),
+                    ], 'tail cut stream copy')
+                    self.validator.validate(trimmed, reject_temporary=False)
+                    first = trimmed
+                def concat_entry(path: Path) -> str:
+                    return "file '" + str(path.resolve()).replace("'", "'\\''") + "'\n"
+                concat_list.write_text(concat_entry(first) + concat_entry(Path(ending_video)), encoding='utf-8')
+                self._run([
+                    str(self.ffmpeg_path), '-hide_banner', '-nostdin', '-y', '-f', 'concat',
+                    '-safe', '0', '-i', str(concat_list), '-map', '0', '-c', 'copy',
+                    '-movflags', '+faststart', str(staging),
+                ], 'ending stream copy')
+            else:
+                command = [str(self.ffmpeg_path), '-hide_banner', '-nostdin', '-y', '-i', str(raw_video)]
+                if tail_cut_enabled:
+                    command += ['-t', f'{cut:.6f}']
+                command += ['-map', '0:v:0', '-map', '0:a:0?']
+                if encode_enabled:
+                    command += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
+                                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']
+                else:
+                    command += ['-c', 'copy']
+                command.append(str(staging))
+                self._run(command, 'local processing')
+            staged = self.validator.validate(staging, reject_temporary=False)
+            try:
+                checkpoint('local.publish')
+                os.link(staging, output_path)
+            except FileExistsError:
+                raise EndingOutputCollisionError(f'output already exists: {output_path}') from None
+            staging.unlink()
+            published = self.validator.validate(output_path)
+            return MediaResult(output_path, published.metadata.duration_seconds, published.size_bytes,
+                               last_audio_end, cut if tail_cut_enabled else None)
+        finally:
+            staging.unlink(missing_ok=True)
+            trimmed.unlink(missing_ok=True)
+            concat_list.unlink(missing_ok=True)
+
 
 EndingAdapter = EndingEngineAdapter

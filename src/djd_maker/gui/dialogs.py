@@ -120,6 +120,17 @@ class SettingsDialog(QDialog):
         self.raw_directory_edit = self._directory_row(form, "RAW保存先", settings.raw_directory)
         self.output_directory_edit = self._directory_row(form, "成果物出力先", settings.output_directory)
         self.ending_video_edit = self._file_row(form, "Ending動画", settings.ending_video)
+        self.ending_checkbox = QCheckBox("Ending付与")
+        self.tail_cut_checkbox = QCheckBox("末尾カット")
+        self.encode_checkbox = QCheckBox("エンコード")
+        for checkbox, checked in (
+            (self.ending_checkbox, settings.ending_enabled),
+            (self.tail_cut_checkbox, settings.tail_cut_enabled),
+            (self.encode_checkbox, settings.encode_enabled),
+        ):
+            checkbox.setChecked(checked)
+            checkbox.setEnabled(not processing)
+            form.addRow(checkbox)
         self.hls_zip_checkbox = QCheckBox("HLS＆ZIP化する")
         self.hls_zip_checkbox.setChecked(settings.hls_zip_enabled)
         self.hls_zip_checkbox.setEnabled(not processing)
@@ -310,6 +321,9 @@ class SettingsDialog(QDialog):
             ffmpeg_concurrency=int(self.ffmpeg_concurrency_combo.currentText()),
             gui_type=self._gui_type,
             hls_zip_enabled=self.hls_zip_checkbox.isChecked(),
+            ending_enabled=self.ending_checkbox.isChecked(),
+            tail_cut_enabled=self.tail_cut_checkbox.isChecked(),
+            encode_enabled=self.encode_checkbox.isChecked(),
         )
 
     def _validate_and_accept(self) -> None:
@@ -318,6 +332,8 @@ class SettingsDialog(QDialog):
             value.validate()
             if not value.input_directory or not value.raw_directory or not value.output_directory:
                 raise ValueError("3つのフォルダーを設定してください")
+            if value.ending_enabled and not value.ending_video:
+                raise ValueError("Ending付与をONにする場合はEnding動画を選択してください")
         except ValueError as exc:
             QMessageBox.warning(self, "設定を確認してください", str(exc))
             return
@@ -357,6 +373,11 @@ class JobDetailDialog(QDialog):
         form.addRow("cut位置", QLabel(str(job.cut_position_seconds) if job.cut_position_seconds is not None else "－"))
         form.addRow("End処理済み", QLabel(job.edited_path or "－"))
         form.addRow("Ending結果", QLabel(job.ending_result or "－"))
+        form.addRow("末尾カット結果", QLabel(job.tail_cut_result or "－"))
+        form.addRow("エンコード結果", QLabel(job.encode_result or "－"))
+        form.addRow("Ending付与", QLabel('ON' if job.ending_enabled else 'OFF（設定によりスキップ）'))
+        form.addRow("末尾カット", QLabel('ON' if job.tail_cut_enabled else 'OFF（設定によりスキップ）'))
+        form.addRow("エンコード", QLabel('ON' if job.encode_enabled else 'OFF（設定によりスキップ）'))
         form.addRow("ZIP", QLabel(job.zip_path or "－"))
         form.addRow("完成MP4", QLabel(job.final_mp4_path or "－"))
         form.addRow("HLS＆ZIP化する", QLabel('ON' if job.hls_zip_enabled else 'OFF（設定によりスキップ）'))

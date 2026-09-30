@@ -278,7 +278,9 @@ def test_download_raw_save_failure_reuses_same_download(tmp_path, stage):
     pipeline = coordinator(tmp_path, jobs, remote)
     for _ in range(3):
         pipeline.run_cycle()
-    assert remote.download_calls == ['one']
+    # All three size attempts happen once; subsequent save-recovery cycles
+    # reuse the accepted candidate and never start a fourth download.
+    assert remote.download_calls == ['one'] * 3
     assert jobs.get('one').state is JobState.COMPLETED
     assert Path(jobs.get('one').raw_path).read_bytes() == b'fixture media'
     assert not pipeline.deferred_ids

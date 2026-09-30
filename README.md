@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver2.0
+# 台本から授業動画つくるマシーン Ver2.1
 
 台本TXTからNotebookLM動画を生成・回収し、任意Ending付与と、設定に応じたHLS/ZIP化または完成MP4保存までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 2.0.0（GUI表記 Ver2.0）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 2.1.0（GUI表記 Ver2.1）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、Fake Notebook E2Eを含みます。通常処理ではNotebook・source・remote動画artifactを保持し、回収したRAWを12項目の安全gateで検証します。
 
@@ -20,6 +20,12 @@ PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非
 - 実行・Pause中は変更できません。新しいStartで未完了jobへ設定を適用し、同一run内で混在させません。
 - OFF完成後にHLSが必要なら、停止中に設定をONへ変更し、ジョブ詳細の「HLSから再実行」を指定して開始します。完成MP4を再利用し、Notebookを再生成しません。
 - 設定を切り替えてもRAW・既存HLS/ZIP・完成MP4・remote動画を削除しません。完成jobは設定変更だけでは再処理しません。
+
+### ローカル動画処理
+
+設定画面では「Ending付与」「末尾カット」「エンコード」を個別にON/OFFできます。3項目はPhase1/Phase2で共有し、開始時の値を各jobへ固定します。処理順はRAW安全検証→末尾カット→Ending付与→エンコードです。OFFの工程は設定によるスキップとして記録され、HLS＆ZIP設定とは独立しています。エンコードOFF時は可能な限りstream copyを使い、互換性がないEndingを黙って再エンコードすることはありません。
+
+動画Downloadは10 MiB未満の場合に最大2回再取得し、合計3回でサイズ再試行を終了します。3回とも小さくてもffprobeと既存RAW安全gateは省略せず、正常動画と確認できた場合だけ後工程へ進みます。
 
 詳細は[Ver2.0 検証記録](docs/v20-hls-zip-optional.md)を参照してください。
 
@@ -45,7 +51,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver2.0`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver2.1`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 Ver1.2.8では起動・再読込時に現行の出力所有権を照合します。同じTXTの未着手重複jobはIDを保持した「重複参照」として表示し、二重生成と誤FAILEDを防ぎます。異なる有効jobの本当の出力競合だけを対象jobに表示し、他jobは継続します。既存完成物は上書きしません。未完了jobが残る間は自動終了せず、実行可能taskがない間は次回確認まで待機します。両GUIに停止理由・最後のtask・次回確認時刻を表示します。詳細は[Ver1.2.8 検証記録](docs/v128-collision-stop-reason-current-window.md)を参照してください。
 

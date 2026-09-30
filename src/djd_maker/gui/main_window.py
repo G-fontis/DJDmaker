@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.0"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.1"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -713,7 +713,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
                 "動画生成プリセットを登録・選択してください。",
             )
             return
-        if self.settings.ending_video and self._ending_path() is None:
+        if self.settings.ending_enabled and self._ending_path() is None:
             QMessageBox.warning(
                 self,
                 "Endingファイルが見つかりません",
@@ -733,7 +733,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.controller.login()
 
     def recover_pending(self) -> None:
-        if self.settings.ending_video and self._ending_path() is None:
+        if self.settings.ending_enabled and self._ending_path() is None:
             QMessageBox.warning(
                 self,
                 "Endingファイルが見つかりません",

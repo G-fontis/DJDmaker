@@ -38,7 +38,8 @@ def test_generating_deadline_due_reschedule_then_ready_same_job(tmp_path):
     remote.statuses[job.id] = 'READY'
     clock.advance(1)
     pipeline.run_cycle()
-    assert calls[-2:] == [('poll', job.id), ('download', job.id)]
+    assert ('poll', job.id) in calls
+    assert calls[-3:] == [('download', job.id)] * 3
     assert not any(action == 'delete' for action, _ in calls)
     completed = jobs.get(job.id)
     assert completed.state is JobState.COMPLETED

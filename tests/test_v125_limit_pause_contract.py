@@ -246,7 +246,9 @@ def test_limit_downloaded_validation_and_local_only_cleanup(tmp_path):
     pipe.run_cycle()
     assert pipe.jobs.get(job.id).state is JobState.COMPLETED
     assert pipe.jobs.get(job.id).artifact_status == 'RETAINED'
-    assert remote.events == []
+    # Existing unvalidated tiny download counts as attempt one; two remaining
+    # retries are allowed independently of the Cloud/Chat quota state.
+    assert remote.events == [('download', job.id)] * 2
 
 
 @pytest.mark.parametrize('gui',['PHASE1','PHASE2'])

@@ -214,12 +214,13 @@ def test_recovery_after_reset_checks_existing_artifact_and_finishes_without_dupl
     assert Path(completed.zip_path or "").is_file()
     assert notebook.submit_calls == []
     assert notebook.inspect_calls == ["reserved-job"]
-    assert notebook.download_calls == ["reserved-job"]
+    # The tiny fixture exercises Ver2.1's bounded small-file policy.
+    assert notebook.download_calls == ["reserved-job"] * 3
 
     assert pipeline.run_recovery_cycle(now=now + timedelta(minutes=1)) == []
     assert notebook.submit_calls == []
     assert notebook.inspect_calls == ["reserved-job"]
-    assert notebook.download_calls == ["reserved-job"]
+    assert notebook.download_calls == ["reserved-job"] * 3
 
 
 class MemorySettings:

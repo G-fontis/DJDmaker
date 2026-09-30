@@ -49,6 +49,12 @@ class EndingEngine(Protocol):
         self, raw_video: Path, ending_video: Path, output_path: Path, padding_seconds: float
     ) -> MediaResult: ...
 
+    def process_options(
+        self, raw_video: Path, ending_video: Path | None, output_path: Path, *,
+        ending_enabled: bool, tail_cut_enabled: bool, encode_enabled: bool,
+        padding_seconds: float,
+    ) -> MediaResult: ...
+
 
 class HlsEngine(Protocol):
     def convert_validate_and_zip(self, video: Path, output_zip: Path) -> HlsResult: ...

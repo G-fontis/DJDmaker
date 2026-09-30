@@ -7,5 +7,8 @@
   "notebook_poll_seconds": 120,
   "audio_tail_padding_seconds": 0.5,
   "ffmpeg_concurrency": 1,
+  "ending_enabled": false,
+  "tail_cut_enabled": false,
+  "encode_enabled": false,
   "hls_zip_enabled": true
 }

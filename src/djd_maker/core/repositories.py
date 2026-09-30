@@ -295,7 +295,15 @@ class SettingsRepository:
     def load(self) -> AppSettings:
         document = self._document.load(self._default())
         try:
-            settings = AppSettings(**document["settings"])
+            values = dict(document["settings"])
+            # The Ver2.0 pipeline enabled the combined local stage exactly
+            # when an Ending file was configured.  Use that fact for all three
+            # new independent switches when loading an old settings document.
+            legacy_enabled = bool(values.get('ending_video'))
+            values.setdefault('ending_enabled', legacy_enabled)
+            values.setdefault('tail_cut_enabled', legacy_enabled)
+            values.setdefault('encode_enabled', legacy_enabled)
+            settings = AppSettings(**values)
             settings.validate()
             return settings
         except (KeyError, TypeError, ValueError) as error:

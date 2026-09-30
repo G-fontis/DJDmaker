@@ -19,6 +19,11 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'download.small.retry': '小容量動画を再ダウンロード',
+    'download.small.accept': '3回の小容量Download後に動画正常性を確認',
+    'local.start': 'ローカル動画処理を開始',
+    'local.complete': 'ローカル動画処理完了',
+    'local.skip': 'ローカル動画処理は設定によりスキップ',
     'generation.failed.retry': '失敗動画のPreset再送',
     'generation.retry.pending': '失敗動画の再生成待ち',
     'generation.retry.confirm': '再生成開始をStudioで確認',

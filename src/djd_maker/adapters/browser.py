@@ -400,20 +400,10 @@ class BrowserManager:
     def ensure_required_selectors(self, page: Any) -> bool:
         if self._selector_probe is not None:
             return bool(self._selector_probe(page))
-        deadline = time.monotonic() + self.timeout_ms / 1000
-        while time.monotonic() < deadline:
-            for name in ("新規作成", "ノートブックを新規作成", "Create new notebook"):
-                try:
-                    control = page.get_by_role("button", name=name, exact=True)
-                    if control.count() and control.first.is_visible(timeout=300):
-                        return True
-                except Exception:
-                    continue
-            try:
-                page.wait_for_timeout(250)
-            except Exception:
-                interruptible_sleep(0.25)
-        return False
+        # One semantic selector contract is shared by pre-flight and the
+        # actual click path, preventing those two paths from drifting apart.
+        from .notebook import NotebookDomAdapter
+        return NotebookDomAdapter.preflight_home_page(page, timeout_ms=min(self.timeout_ms, 60_000))
 
     @staticmethod
     def _safe_url(page: Any) -> str:

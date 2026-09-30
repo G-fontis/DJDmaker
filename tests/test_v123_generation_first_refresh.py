@@ -42,7 +42,8 @@ def test_100_jobs_generation_dispatch_before_any_download_or_local(tmp_path):
     assert all(repository.get(f'job{i}').state is JobState.COMPLETED for i in range(90,95))
     assert not any(r['stage'] in {'media.start','ending.start','hls.start','zip.start','download.start'} and r.get('phase')=='動画生成開始フェーズ' for r in records)
     assert any(r['stage']=='phase.b' for r in records)
-    assert len(remote.events)==85
+    # Five deliberately tiny fixtures each require the bounded three attempts.
+    assert len(remote.events)==95
     assert not any(action == 'delete' for action, _ in remote.events)
 
 

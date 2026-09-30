@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import time
 import threading
+import os
 from pathlib import Path
 from typing import Any, Protocol
 from zipfile import BadZipFile, ZipFile
@@ -23,6 +24,9 @@ from djd_maker.core.cloud_limit import CloudLimitGate, CloudLimitReached
 from djd_maker.adapters.notebook_modal import BlockingModalError
 from djd_maker.adapters.notebook import SourceRetryExhausted, GenerationRetryExhausted
 from djd_maker.core.runtime_operation import operation_scope, report_operation, local_task_scope, LocalTaskComplete
+from djd_maker.core.download_policy import (
+    MAX_DOWNLOAD_ATTEMPTS, decide_download_size,
+)
 
 
 class NoOpJobTransitionError(RuntimeError):
@@ -126,11 +130,20 @@ class PipelineCoordinator(DeferredRecovery):
         generation_preset: Preset | None = None,
         cloud_limit: CloudLimitGate | None = None,
         hls_zip_enabled: bool | None = None,
+        ending_enabled: bool | None = None,
+        tail_cut_enabled: bool | None = None,
+        encode_enabled: bool | None = None,
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
         if hls_zip_enabled is not None and type(hls_zip_enabled) is not bool:
             raise ValueError('hls_zip_enabled must be boolean or persisted-mode None')
+        for name, value in (
+            ('ending_enabled', ending_enabled), ('tail_cut_enabled', tail_cut_enabled),
+            ('encode_enabled', encode_enabled),
+        ):
+            if value is not None and type(value) is not bool:
+                raise ValueError(f'{name} must be boolean or persisted-mode None')
         if paths.ending_video is not None and not paths.ending_video.is_file():
             raise FileNotFoundError(f"Ending動画が未設定または存在しません: {paths.ending_video}")
         self.jobs = jobs
@@ -144,6 +157,11 @@ class PipelineCoordinator(DeferredRecovery):
         self.scheduler = scheduler
         self.generation_preset = generation_preset
         self._run_hls_zip_enabled = hls_zip_enabled
+        self._run_local_options = (ending_enabled, tail_cut_enabled, encode_enabled)
+        if all(value is None for value in self._run_local_options) and paths.ending_video is None:
+            # Compatibility for pre-Ver2.1 callers: an absent Ending path meant
+            # that the whole combined local stage was skipped.
+            self._run_local_options = (False, False, False)
         self._mode_snapshotted: set[str] = set()
         self.cloud_limit = cloud_limit or CloudLimitGate(
             Path(getattr(jobs, 'directory', paths.work_directory / 'jobs')).parent / 'cloud-limit.json')
@@ -180,13 +198,29 @@ class PipelineCoordinator(DeferredRecovery):
         for job in self.jobs.list():
             if job.id in self._mode_snapshotted or job.id in self.deferred_ids or job.state is JobState.COMPLETED:
                 continue
-            if self._run_hls_zip_enabled is None and job.hls_zip_enabled:
+            if (self._run_hls_zip_enabled is None and job.hls_zip_enabled
+                    and all(value is None for value in self._run_local_options)):
                 self._mode_snapshotted.add(job.id)
                 continue
             with self._job_boundary(job):
                 before = job.to_dict()
                 if self._run_hls_zip_enabled is not None:
                     job.hls_zip_enabled = self._run_hls_zip_enabled
+                for field_name, value in zip(
+                    ('ending_enabled', 'tail_cut_enabled', 'encode_enabled'),
+                    self._run_local_options,
+                ):
+                    if value is not None:
+                        setattr(job, field_name, value)
+                for field_name, enabled in (
+                    ('ending_result', job.ending_enabled),
+                    ('tail_cut_result', job.tail_cut_enabled),
+                    ('encode_result', job.encode_enabled),
+                ):
+                    if not enabled:
+                        setattr(job, field_name, 'SKIPPED_BY_SETTING')
+                    elif getattr(job, field_name) == 'SKIPPED_BY_SETTING':
+                        setattr(job, field_name, None)
                 if not job.hls_zip_enabled:
                     from djd_maker.core.final_mp4 import SKIPPED
                     job.hls_result = job.zip_result = SKIPPED
@@ -1069,6 +1103,95 @@ class PipelineCoordinator(DeferredRecovery):
                 job.failure_class = 'TERMINAL_FAILED'
             self._save(job)
 
+    def _download_with_size_gate(self, job: Job, destination: Path) -> Path:
+        """Download at most three times and persist every decision boundary."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if job.download_validation_status == 'DOWNLOAD_VALIDATED' and destination.is_file():
+            return destination
+        legacy_raw = self.paths.raw_directory / f'{job.script_name}.mp4'
+        if destination.is_file() and legacy_raw.is_file() and job.download_attempt_count == 0:
+            try:
+                verified = self.raw_store.verify_existing(destination, legacy_raw)
+                gate = getattr(verified, 'safety_gate', None)
+                if gate is not None and not gate.failed_checks:
+                    job.download_attempt_count = 1
+                    job.download_size_gate_status = 'LEGACY_RAW_ALREADY_VALIDATED'
+                    job.download_validation_status = 'DOWNLOAD_VALIDATED'
+                    self._save(job)
+                    return destination
+            except Exception:
+                pass
+        while True:
+            checkpoint('download.size_gate')
+            # A legacy/crash-recovered canonical file represents one completed
+            # attempt even when old JSON has no counter.
+            if destination.is_file() and job.download_attempt_count == 0:
+                job.download_attempt_count = 1
+                self._save(job)
+
+            candidate = destination.with_name(
+                f'.{destination.stem}.attempt-{job.download_attempt_count}{destination.suffix}'
+            )
+            current = candidate if candidate.is_file() else destination if destination.is_file() else None
+            needs_download = current is None or (
+                job.download_size_gate_status == 'RETRY_SMALL_DOWNLOAD'
+                and job.download_attempt_count < MAX_DOWNLOAD_ATTEMPTS
+                and current == destination
+            ) or (
+                job.download_status.startswith('DOWNLOADING_ATTEMPT_')
+                and job.download_attempt_count < MAX_DOWNLOAD_ATTEMPTS
+                and current == destination
+            )
+            if needs_download:
+                if job.download_attempt_count >= MAX_DOWNLOAD_ATTEMPTS:
+                    if destination.is_file():
+                        current = destination
+                    else:
+                        raise RuntimeError('DOWNLOAD_ATTEMPTS_EXHAUSTED_WITHOUT_FILE')
+                else:
+                    job.download_attempt_count += 1
+                    job.download_status = f'DOWNLOADING_ATTEMPT_{job.download_attempt_count}'
+                    job.download_size_gate_status = 'PENDING'
+                    self._save(job)
+                    target = (destination if not destination.exists() else
+                              destination.with_name(
+                                  f'.{destination.stem}.attempt-{job.download_attempt_count}{destination.suffix}'))
+                    target.unlink(missing_ok=True)
+                    self.notebook.download_artifact(job, target)
+                    if not target.is_file() or target.suffix.casefold() == '.crdownload':
+                        raise RuntimeError('DOWNLOAD_DID_NOT_PUBLISH_COMPLETE_FILE')
+                    if target != destination:
+                        os.replace(target, destination)
+                    current = destination
+
+            assert current is not None
+            # A retry candidate left after a crash is published atomically now.
+            if current != destination:
+                os.replace(current, destination)
+                current = destination
+            size = current.stat().st_size
+            decision = decide_download_size(size, job.download_attempt_count)
+            if size < 10 * 1024 * 1024:
+                job.small_download_attempts = max(
+                    job.small_download_attempts, job.download_attempt_count
+                )
+            job.download_size_gate_status = decision.status
+            job.download_status = 'DOWNLOADED_SIZE_ACCEPTED' if decision.accepted else 'REDOWNLOAD_REQUIRED'
+            self._save(job)
+            if decision.retry:
+                report_operation(
+                    'download.small.retry',
+                    decision=f'{size} bytes / attempt {job.download_attempt_count}',
+                    next_action=f'動画サイズが10MiB未満のため再ダウンロード（残り{MAX_DOWNLOAD_ATTEMPTS-job.download_attempt_count}回）',
+                )
+                continue
+            if decision.status == 'ACCEPTED_AFTER_3_SMALL_DOWNLOADS':
+                report_operation(
+                    'download.small.accept',
+                    decision='3回のダウンロードがすべて10MiB未満',
+                    next_action='元動画が小容量の可能性があるため動画正常性を確認',
+                )
+            return destination
     def _recover_remote_job(self, job: Job, *, checked_at: datetime) -> None:
         """Read the existing Notebook and continue at download only when ready."""
         if not job.notebook_id or not job.notebook_url:
@@ -1243,8 +1366,7 @@ class PipelineCoordinator(DeferredRecovery):
                     / "download"
                     / f"{job.script_name}.mp4"
                 )
-                if not download.exists():
-                    self.notebook.download_artifact(job, download)
+                download = self._download_with_size_gate(job, download)
                 job.download_status = "DOWNLOADED"
                 raw_validation_started = True
                 report_operation('download.complete')
@@ -1269,6 +1391,7 @@ class PipelineCoordinator(DeferredRecovery):
                 job.audio_codec = getattr(metadata, "audio_codec", None)
                 job.safety_gate = gate
                 job.raw_status = "READY"
+                job.download_validation_status = 'DOWNLOAD_VALIDATED'
                 job.artifact_status = 'RETAINED'
                 self._transition(job, JobState.RAW_READY)
                 report_operation('raw.saved', decision='RAW_READY', next_action='動画をNotebookに保持してローカル処理')
@@ -1325,6 +1448,7 @@ class PipelineCoordinator(DeferredRecovery):
             job.resume_checkpoint = job.state.value
             if job.state is JobState.DOWNLOADING:
                 job.error_code = "DOWNLOAD_VERIFY_FAILED"
+                job.download_validation_status = 'FAIL'
                 self._transition(job, JobState.DOWNLOAD_VERIFY_FAILED)
             elif job.state not in {JobState.FAILED, JobState.COMPLETED}:
                 failure_code = str(exc).split(":", 1)[0]
@@ -1343,9 +1467,69 @@ class PipelineCoordinator(DeferredRecovery):
                     job.error_code = job.error_code or "NOTEBOOK_STAGE_FAILED"
                 self._transition(job, JobState.FAILED)
 
+    def _run_independent_local_options(self, job: Job, raw: Path, edited: Path) -> None:
+        enabled = (job.ending_enabled, job.tail_cut_enabled, job.encode_enabled)
+        if job.ending_enabled and self.paths.ending_video is None:
+            raise ValueError('ENDING_ENABLED_WITHOUT_FILE')
+        if not any(enabled):
+            validated = self.validator.validate(raw)
+            if not getattr(validated, 'valid', True):
+                raise ValueError('LOCAL_OPTIONS_OFF_RAW_VALIDATION_FAILED')
+            job.edited_path = str(raw)
+            job.ending_result = job.tail_cut_result = job.encode_result = 'SKIPPED_BY_SETTING'
+            self._save(job)
+            report_operation('local.skip', decision='ALL_LOCAL_OPTIONS_OFF')
+            return
+        existing_is_valid = False
+        if edited.exists():
+            try:
+                existing_is_valid = getattr(self.validator.validate(edited), 'valid', True)
+            except Exception:
+                existing_is_valid = False
+        suffix = ' (checkpoint)' if existing_is_valid else ''
+        if not existing_is_valid:
+            edited.unlink(missing_ok=True)
+            processor = getattr(self.ending, 'process_options', None)
+            if not callable(processor):
+                raise RuntimeError('LOCAL_OPTIONS_NOT_SUPPORTED_BY_ENGINE')
+            result = processor(
+                raw, self.paths.ending_video, edited,
+                ending_enabled=job.ending_enabled,
+                tail_cut_enabled=job.tail_cut_enabled,
+                encode_enabled=job.encode_enabled,
+                padding_seconds=0.5,
+            )
+            job.edited_path = str(result.path)
+            job.last_audio_position_seconds = getattr(result, 'last_audio_end_seconds', None)
+            job.cut_position_seconds = getattr(result, 'cut_at_seconds', None)
+        else:
+            job.edited_path = str(edited)
+        job.ending_result = ('PASS' + suffix if job.ending_enabled else 'SKIPPED_BY_SETTING')
+        job.tail_cut_result = ('PASS' + suffix if job.tail_cut_enabled else 'SKIPPED_BY_SETTING')
+        job.encode_result = ('PASS' + suffix if job.encode_enabled else 'SKIPPED_BY_SETTING')
+        self._save(job)
+        report_operation('local.complete', decision=(
+            f'ending={job.ending_enabled},tail={job.tail_cut_enabled},encode={job.encode_enabled}'))
+
     def _run_media_job(self, job: Job, *, one_task=False) -> None:
         try:
             checkpoint('media.start', job.id)
+            if job.download_validation_status not in {
+                'DOWNLOAD_VALIDATED', 'PASS', 'PASS_LEGACY_RAW_REVALIDATED'
+            }:
+                if job.safety_gate.remote_deletion_allowed:
+                    job.download_validation_status = 'DOWNLOAD_VALIDATED'
+                    self._save(job)
+                else:
+                    # Pre-Ver2.1 jobs reached RAW_READY only after the old
+                    # mandatory validation path. Revalidate the persisted RAW
+                    # during schema migration; new downloads never use this.
+                    raw_candidate = Path(job.raw_path or '')
+                    legacy = self.validator.validate(raw_candidate)
+                    if not raw_candidate.is_file() or not getattr(legacy, 'valid', True):
+                        raise RuntimeError('DOWNLOAD_VALIDATED_REQUIRED_BEFORE_LOCAL_PROCESSING')
+                    job.download_validation_status = 'PASS_LEGACY_RAW_REVALIDATED'
+                    self._save(job)
             # A deferred journal can be reconciled during this cycle, after
             # the initial snapshot pass. Apply the immutable run choice before
             # any local converter, never the recovered journal's stale mode.
@@ -1376,6 +1560,17 @@ class PipelineCoordinator(DeferredRecovery):
 
             if job.state is JobState.RAW_READY:
                 self._transition(job, JobState.ENDING)
+
+            if job.state is JobState.ENDING and (
+                job.ending_enabled, job.tail_cut_enabled, job.encode_enabled
+            ) != (True, True, True):
+                self._run_independent_local_options(job, raw, edited)
+                if not job.hls_zip_enabled:
+                    self._finish_mp4(job)
+                    return
+                self._transition(job, JobState.HLS_ENCODING)
+                if one_task:
+                    return
 
             if job.state is JobState.ENDING:
                 if self.paths.ending_video is None:
@@ -1416,6 +1611,9 @@ class PipelineCoordinator(DeferredRecovery):
                 else:
                     job.edited_path = str(edited)
                     job.ending_result = "PASS (checkpoint)"
+                job.tail_cut_result = job.ending_result
+                job.encode_result = job.ending_result
+                self._save(job)
                 report_operation('ending.complete')
                 if not job.hls_zip_enabled:
                     self._finish_mp4(job)

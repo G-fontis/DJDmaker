@@ -280,6 +280,12 @@ class PlaywrightArtifactDownload:
 
 
 CREATE_NOTEBOOK = (
+    ("role", "button", "ノートブックを作成"),
+    ("role", "button", "新しいノートブック"),
+    ("role", "button", "Create notebook"),
+    ("role", "link", "ノートブックを作成"),
+    ("css", "main button[aria-label*='ノートブック'][aria-label*='作成']", ""),
+    ("css", "main button[aria-label*='notebook' i][aria-label*='create' i]", ""),
     ("role", "button", "新規作成"),
     ("role", "button", "ノートブックを新規作成"),
     ("role", "button", "Create new notebook"),
@@ -525,7 +531,7 @@ class NotebookDomAdapter:
         """Confirm the home create control without clicking or creating anything."""
         adapter = cls(page, timeout_ms=timeout_ms)
         try:
-            adapter._first_visible(CREATE_NOTEBOOK, "Notebook作成ボタン")
+            adapter._first_enabled_visible(CREATE_NOTEBOOK, "Notebook作成ボタン")
         except DomMismatchError:
             return False
         return True
@@ -550,7 +556,11 @@ class NotebookDomAdapter:
     def create_notebook(self) -> ResumeMetadata:
         self.check_usage_limit()
         self.page.goto(self.HOME_URL, wait_until="domcontentloaded")
-        self._first_visible(CREATE_NOTEBOOK, "Notebook作成ボタン").click()
+        self.ensure_interactable()
+        parsed_home = urlparse(self.page.url)
+        if parsed_home.hostname != 'notebook.google.com' or parsed_home.path not in {'', '/'}:
+            raise DomMismatchError('Notebook home以外では作成ボタンを操作しません')
+        self._first_enabled_visible(CREATE_NOTEBOOK, "Notebook作成ボタン").click()
         self.page.wait_for_url("**/notebook/**", timeout=self.timeout_ms)
         deadline = active_monotonic() + self.timeout_ms / 1000
         notebook_id = ""
