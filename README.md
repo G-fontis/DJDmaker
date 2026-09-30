@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver2.1
+# 台本から授業動画つくるマシーン Ver2.2
 
 台本TXTからNotebookLM動画を生成・回収し、任意Ending付与と、設定に応じたHLS/ZIP化または完成MP4保存までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,7 +7,7 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 2.1.0（GUI表記 Ver2.1）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 2.2.0（GUI表記 Ver2.2）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、Fake Notebook E2Eを含みます。通常処理ではNotebook・source・remote動画artifactを保持し、回収したRAWを12項目の安全gateで検証します。
 
@@ -25,7 +25,7 @@ PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非
 
 設定画面では「Ending付与」「末尾カット」「エンコード」を個別にON/OFFできます。3項目はPhase1/Phase2で共有し、開始時の値を各jobへ固定します。処理順はRAW安全検証→末尾カット→Ending付与→エンコードです。OFFの工程は設定によるスキップとして記録され、HLS＆ZIP設定とは独立しています。エンコードOFF時は可能な限りstream copyを使い、互換性がないEndingを黙って再エンコードすることはありません。
 
-動画Downloadは10 MiB未満の場合に最大2回再取得し、合計3回でサイズ再試行を終了します。3回とも小さくてもffprobeと既存RAW安全gateは省略せず、正常動画と確認できた場合だけ後工程へ進みます。
+動画Downloadはブラウザ完了、一時拡張子消失、サイズ安定、ffprobeを確認した後、実RAWから計測した「動画1秒あたりのMiB」下限でも検証します。10 MiB未満の最初の2回は従来どおり再取得し、3回目以降は統計的に正常なら小容量動画を許可します。異常時は初回＋最大5回（合計6回）まで再取得し、7回目や品質NGの後工程開始は行いません。
 
 詳細は[Ver2.0 検証記録](docs/v20-hls-zip-optional.md)を参照してください。
 
@@ -51,7 +51,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver2.1`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver2.2`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 Ver1.2.8では起動・再読込時に現行の出力所有権を照合します。同じTXTの未着手重複jobはIDを保持した「重複参照」として表示し、二重生成と誤FAILEDを防ぎます。異なる有効jobの本当の出力競合だけを対象jobに表示し、他jobは継続します。既存完成物は上書きしません。未完了jobが残る間は自動終了せず、実行可能taskがない間は次回確認まで待機します。両GUIに停止理由・最後のtask・次回確認時刻を表示します。詳細は[Ver1.2.8 検証記録](docs/v128-collision-stop-reason-current-window.md)を参照してください。
 
@@ -68,6 +68,8 @@ Ver1.2.6では、AI使用量上限・Chat無効の明示表示、または今回
 上限中は新規Notebook、source投入、Preset/Chat送信、新規予約を行いません。ローカルRAW検証・Ending（任意）・設定に応じたHLS/ZIP・TXT移動・保存復旧の後も、期限到達jobの完成確認・Downloadを継続します。回収可否はクォータと無関係です。remote artifactは回収後も保持し、削除待ちを必須工程にしません。実行可能な作業がなく未完了jobがあれば10分待機して再探索し、全件完了またはterminalになるまで自動終了しません。Errorはcheckpointから最大3回再試行し、失敗したjobだけをterminalとして他jobを続行します。
 
 画面下部の `GUIタイプ` から白基調PHASE1とCyber HUD PHASE2を選択できます。GUI選択は次回起動時も復元します。両画面は同じ操作ID・処理・Preset Repository/ViewModelを使用し、切替後はjob・runtime・presetを自動表示します。同一sessionのpreset選択は共有し、アプリ再起動時は未選択になります。切替は処理停止中のみで、一時停止中は切替できません。一時停止は次のNotebook移動・送信・Download・ローカル工程開始を止めます。開始済みの短い操作やFFmpegは安全checkpointまで進め、`授業動画作成開始`で同じ位置から再開します。独立した`再開`ボタンはありません。
+
+両GUIのジョブ一覧にある `保存リトライ` は、チェックした複数jobの既存Notebook・完成artifactを使い、Downloadから保存処理だけをやり直します。Notebook作成、Source upload、Preset送信、動画生成、Studio Retry/Deleteは行いません。押下時のEnding/Tail Cut/Encode/HLS・ZIP設定をsnapshotし、新RAWと完成成果物がすべて検証できた場合だけ旧成果物を置換します。
 
 優先順位は生成→Local→期限到達Artifact確認/Download→Error Recovery→10分待機です。固定phaseへ居続けず、各taskの安全な完了境界で再評価します。上限解除時刻＋5分後に現在UIでChat有効・実上限なしを確認したら、未生成jobを次Localより優先します。開始済みFFmpegはkillせず、Ending/HLS完了後に切り替えます。検証済みHLSは保存し、後で再エンコードせずZIP工程から再開します。生成待機は保存した次回確認時刻までNotebookを開かず、全jobの確認だけを先に行う事前巡回もしません。
 

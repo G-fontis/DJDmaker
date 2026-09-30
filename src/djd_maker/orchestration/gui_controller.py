@@ -393,6 +393,42 @@ class GuiPipelineController:
         self._jobs_callback(self.jobs.list())
         return result
 
+    def manual_save_retry(self, job_ids: list[str]) -> list[str]:
+        if not job_ids:
+            raise ValueError('保存リトライするjobを選択してください。')
+        current = self.settings_provider() if self.settings_provider else self.settings
+        config = (current.ending_enabled, current.tail_cut_enabled,
+                  current.encode_enabled, current.hls_zip_enabled)
+        with self._guard:
+            active = self._worker is not None and self._worker.is_alive()
+            pipeline = self.pipeline
+        if active:
+            if pipeline is None:
+                raise RuntimeError('pipeline is not ready')
+            pipeline.enqueue_manual_save_retry(
+                job_ids, ending_enabled=config[0], tail_cut_enabled=config[1],
+                encode_enabled=config[2], hls_zip_enabled=config[3])
+            self._runtime_update({'stage': 'manual.download.queued',
+                                  'message': f'保存リトライを予約しました: {len(job_ids)}件'})
+            return job_ids
+        factory = self.recovery_pipeline_factory
+        if factory is None:
+            raise RuntimeError('manual retry pipeline is not configured')
+        self.cancellation.reset()
+        with cancellation_scope(self.cancellation):
+            pipeline = factory()
+            pipeline.runtime_callback = self._runtime_update
+            pipeline.job_callback = self._job_update
+            pipeline.begin_run()
+            try:
+                result = pipeline.run_manual_save_retry(job_ids, config)
+            finally:
+                with cancellation_scope(None):
+                    self.cleanup()
+        self._jobs_callback(self.jobs.list())
+        self._publish_status(self.jobs.list())
+        return result
+
     def _run_loop(self) -> None:
         with cancellation_scope(self.cancellation):
             self._run_loop_cancellable()

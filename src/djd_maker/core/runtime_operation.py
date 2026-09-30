@@ -19,6 +19,13 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'download.quality.wait': 'ダウンロード完了後の品質判定待ち',
+    'download.quality.pass': 'ダウンロード品質判定PASS',
+    'download.quality.retry': '品質不足のため動画を再ダウンロード',
+    'manual.download.queued': '保存リトライを予約',
+    'manual.download.start': '選択Jobの保存リトライ開始',
+    'manual.download.complete': '保存リトライ完了',
+    'manual.download.failed': '保存リトライ失敗・他Jobを続行',
     'download.small.retry': '小容量動画を再ダウンロード',
     'download.small.accept': '3回の小容量Download後に動画正常性を確認',
     'local.start': 'ローカル動画処理を開始',

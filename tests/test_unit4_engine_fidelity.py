@@ -135,7 +135,7 @@ def test_job_state_log_carries_both_stable_id_and_human_stem(tmp_path):
     )
 
     controller.start()
-    worker = controller._worker
+    worker = controller._worker or controller._retiring_worker
     assert worker is not None
     worker.join(timeout=2)
 

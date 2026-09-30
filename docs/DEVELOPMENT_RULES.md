@@ -44,6 +44,16 @@
 - ローカル処理順はRAW validation→末尾カット→Ending付与→Encode。内部で安全に1 commandへ統合してよいが、設定上の意味と結果状態は独立させる。Encode OFFはstream copy/remuxを使用し、互換性不足を理由に黙って全面再Encodeしない。
 - Ver2.0 settings migrationは旧挙動を保持する。旧設定にEnding pathがあれば3項目すべてON、なければ3項目すべてOFFとして補完する。推測で全利用者を一律値へ変更しない。
 - Ver2.1のsource/live Gate完了前はversion変更・build・commit・pushを行わない。Notebook作成live Gateが失敗した場合はreleaseをBLOCKEDとする。
+
+## Ver2.2 Download品質・手動保存リトライ契約
+
+- `DJD-CHAPPY-V22-SCHEDULER-DOWNLOAD-QUALITY-MANUAL-RETRY-FULL-002`を優先する。全source/live/EXE/package Gate PASS後にだけVer2.2をreleaseする。
+- 品質profileはユーザー指定の実RAWのうち10 MiB以上、ffprobe成功、duration正、video streamありだけから算出する。判定量はMiB/sec、標準偏差はsample `n-1`、下限は平均−3σ。個別filenameや実MP4をGit/packageへ入れない。
+- 全Downloadでbrowser完了、一時拡張子消失、final file存在、size stableを確認し、その後 `N + 30*(attempt-1)` 秒を経てffprobe・video stream・duration・MiB/secを判定する。現行Nは既存size-stable判定の1秒。`.crdownload`を安定しただけで完成へ昇格しない。
+- 10 MiB未満のattempt 1/2は再取得する。attempt 3以降は統計下限以上なら正常小容量として許可し、下限未満またはffprobe不正なら継続する。初回＋最大5 retry、合計6 attemptを永続化し、7回目は禁止する。NG候補は正式RAWにせず、PASS後だけatomic publishする。
+- Phase1/Phase2の共通Command `CMD_SAVE_RETRY` はチェックされた複数jobを対象に既存READY artifactのDownloadから開始する。Notebook作成、Source upload、Preset送信、Generation request、Studio Retry/Deleteは0。READYでなければ再生成せず明示エラーにする。
+- 手動retryは押下時のEnding/Tail Cut/Encode/HLS・ZIPをsnapshotし、新しいmanual sessionとして最大6 attemptを持つ。新RAW・Local処理・完成MP4またはHLS/ZIPをworkで全検証してからtransactionalに置換し、失敗時は既存正常成果物を保持する。remote artifactも保持する。
+- Schedulerは生成→Local→Artifact/Download→Recovery/Retry→Wait。generation/local/download/retry/manual/activeがすべて0のときだけWaitし、Local候補0で`COLLECT_LOCAL`を保持しない。除外理由と統計詳細はdebug/job詳細へ出し、通常GUIには候補件数だけを表示する。
 - 出力所有権は現在のjob identityと実際の出力pathから全体照合してから保存する。同一sourceの重複読込は排他し、旧重複レコードは元IDを保持した非実行参照として統合する。正常成果物を上書きしない。真の競合のみ対象jobをblockedとし、他jobを継続する。
 - 自動終了直前に全jobを再走査する。未完了・将来待機・再試行可能・状態不明・保存保留は完了ではない。全有効jobがCOMPLETEDまたは再試行枯渇TERMINAL_FAILEDの場合のみ全行程終了。単なるFATAL_FAILEDという旧分類だけで完了扱いしない。
 - 全exit pathに停止理由codeと日本語messageを持ち、両GUIへ共通表示する。Pause/待機は停止と区別する。

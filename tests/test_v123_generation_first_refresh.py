@@ -33,7 +33,7 @@ def test_100_jobs_generation_dispatch_before_any_download_or_local(tmp_path):
     original_download=remote.download_artifact
     def download(job,destination):
         assert len([x for x in events if x[0]=='submit'])==80
-        assert pipeline.phase=='COLLECT_LOCAL'
+        assert pipeline.phase=='SCHEDULER'
         return original_download(job,destination)
     remote.download_artifact=download
     pipeline.run_cycle()
@@ -64,7 +64,7 @@ def test_fatal_does_not_block_cloud_phase_and_retryable_processed(tmp_path):
     assert ('check',fatal.id) in events
     assert events.index(('submit',retry.id)) < events.index(('check',fatal.id))
     assert ('submit',fatal.id) not in events  # P3 diagnosis does not blindly resend.
-    assert pipeline.phase=='COLLECT_LOCAL'
+    assert pipeline.phase=='SCHEDULER'
 
 
 @pytest.mark.parametrize('phase',['GENERATION_DISPATCH','COLLECT_LOCAL'])

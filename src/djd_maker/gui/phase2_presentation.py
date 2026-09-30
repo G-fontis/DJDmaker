@@ -116,11 +116,13 @@ class Phase2Presentation:
         self.job_table.setSortingEnabled(True)
         self.job_table.itemChanged.connect(self._check_changed)
         deletes = QHBoxLayout()
+        self.save_retry_button = QPushButton('保存リトライ')
         self.delete_selected_button = QPushButton('選択したものを削除')
         self.delete_completed_button = QPushButton('完成したジョブを削除')
         deletes.addWidget(self.delete_selected_button)
         deletes.addWidget(self.delete_completed_button)
         jobs_panel.body.addWidget(self.job_table, 1)
+        deletes.insertWidget(0, self.save_retry_button)
         jobs_panel.body.addLayout(deletes)
         layout.addWidget(jobs_panel, 5)
 

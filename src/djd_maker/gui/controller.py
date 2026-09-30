@@ -27,6 +27,8 @@ class GuiControllerPort(Protocol):
 
     def retry(self, job_id: str, stage: str) -> Any: ...
 
+    def manual_save_retry(self, job_ids: list[str]) -> Any: ...
+
     def shutdown(self) -> Any: ...
 
 
@@ -174,6 +176,9 @@ class AsyncControllerBridge(QObject):
 
     def retry(self, job_id: str, stage: str) -> bool:
         return self._invoke(f"retry:{stage}", lambda: self.controller.retry(job_id, stage))
+
+    def manual_save_retry(self, job_ids: list[str]) -> bool:
+        return self._invoke('save_retry', lambda: self.controller.manual_save_retry(job_ids))
 
     @Slot(object)
     def publish_job(self, job: object) -> None:

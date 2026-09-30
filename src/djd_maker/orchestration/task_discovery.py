@@ -51,6 +51,7 @@ def remote_reconcile_candidate(job):
 
 def terminal(job):
     return bool(job.duplicate_of_job_id) or job.state is JobState.COMPLETED or (
+        job.error_code == 'DOWNLOAD_RETRY_EXHAUSTED' and job.failure_class == 'TERMINAL_FAILED') or (
         not remote_reconcile_candidate(job) and job.state in {JobState.FAILED,JobState.DOWNLOAD_VERIFY_FAILED} and job.failure_class == 'TERMINAL_FAILED' and
         any(job.attempt_by_stage.get(key,0) >= MAX_ERROR_ATTEMPTS
             for key in ('scheduler.recovery','source.reupload','generation.failed_retry')))

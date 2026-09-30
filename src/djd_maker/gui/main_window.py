@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.1"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.2"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -263,10 +263,12 @@ class MainWindow(Phase2Presentation, QMainWindow):
         header.setSortIndicatorShown(True)
         self.job_table.itemChanged.connect(self._check_changed)
         deletes = QHBoxLayout()
+        self.save_retry_button = QPushButton("保存リトライ")
         self.delete_selected_button = QPushButton("選択したものを削除")
         self.delete_completed_button = QPushButton("完成したジョブを削除")
         deletes.addWidget(self.delete_selected_button)
         deletes.addWidget(self.delete_completed_button)
+        deletes.insertWidget(0, self.save_retry_button)
         root.addLayout(deletes)
 
         self.completion_group = QGroupBox("授業作成 完了")
@@ -316,6 +318,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
             CommandId.JOB_DETAIL_OPEN: lambda _: self.show_selected_job(),
             CommandId.DELETE_SELECTED: lambda p: self._delete_jobs(False, p['job_ids']),
             CommandId.DELETE_COMPLETED: lambda p: self._delete_jobs(True, p['job_ids']),
+            CommandId.SAVE_RETRY: lambda p: self._manual_save_retry(p['job_ids']),
             CommandId.GUI_SWITCH_PHASE1: lambda p: self.switch_gui(p['gui_type']),
             CommandId.GUI_SWITCH_PHASE2: lambda p: self.switch_gui(p['gui_type']),
             CommandId.INPUT_OPEN: lambda _: self._open_directory(self.input_path_edit.text()),
@@ -356,8 +359,10 @@ class MainWindow(Phase2Presentation, QMainWindow):
     def dispatch_command(self, command, payload=None):
         if self._dispatch_disabled:
             return False
-        if payload is None and command in {CommandId.DELETE_SELECTED, CommandId.DELETE_COMPLETED}:
-            payload = {'job_ids': sorted(self._checked_job_ids) if command == CommandId.DELETE_SELECTED else [j.id for j in self.jobs if j.state is JobState.COMPLETED]}
+        if payload is None and command in {CommandId.DELETE_SELECTED, CommandId.DELETE_COMPLETED, CommandId.SAVE_RETRY}:
+            payload = {'job_ids': (sorted(self._checked_job_ids)
+                                   if command in {CommandId.DELETE_SELECTED, CommandId.SAVE_RETRY}
+                                   else [j.id for j in self.jobs if j.state is JobState.COMPLETED])}
         try:
             result = self.command_router.dispatch(command, payload)
             self.last_command = command
@@ -614,7 +619,11 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.total_label.setText(f"全Job: {summary.total}")
         self.active_label.setText(f"処理中: {summary.active}")
         self.notebook_complete_label.setText(f"Notebook完了: {summary.notebook_complete}/{summary.total}")
-        self.zip_complete_label.setText(f"ZIP完了: {summary.zip_complete}/{summary.total}" + (f" / MP4完了: {summary.mp4_complete}" if summary.mp4_complete else ''))
+        self.zip_complete_label.setText(
+            (f"ZIP完了: {summary.zip_complete}/{summary.total}"
+             if self.settings.hls_zip_enabled else "HLS/ZIP: 設定によりスキップ（対象0件）")
+            + (f" / MP4完了: {summary.mp4_complete}" if summary.mp4_complete else '')
+        )
         self.error_label.setText(f"Error: {summary.errors}")
         runtime_id = getattr(self, '_runtime_record', {}).get('job_id')
         current = next((job for job in self.jobs if job.id == runtime_id), None)
@@ -675,6 +684,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
             self._checked_job_ids.add(job_id)
         else:
             self._checked_job_ids.discard(job_id)
+        self._update_action_state()
 
     def _delete_jobs(self, all_completed: bool, job_ids=None) -> None:
         selected = [job for job in self.jobs if (job.id in job_ids if job_ids is not None else (job.state is JobState.COMPLETED if all_completed else job.id in self._checked_job_ids))]
@@ -686,6 +696,13 @@ class MainWindow(Phase2Presentation, QMainWindow):
         if QMessageBox.question(self, "完成ジョブ削除", f"{len(selected)}件の一覧記録を削除します。RAW・TXT・ZIP・Notebookは保持します。よろしいですか？") != QMessageBox.StandardButton.Yes:
             return
         self.controller.delete_completed([job.id for job in selected])
+
+    def _manual_save_retry(self, job_ids) -> bool:
+        if not job_ids:
+            QMessageBox.information(self, '保存リトライ', '保存リトライするjobを選択してください。')
+            return False
+        self.statusBar().showMessage(f'保存リトライ開始: {len(job_ids)}件')
+        return self.controller.manual_save_retry(list(job_ids))
 
     def show_selected_job(self) -> None:
         job = self._selected_job()
@@ -821,12 +838,15 @@ class MainWindow(Phase2Presentation, QMainWindow):
             record = status.get('runtime')
             view = status.get('scheduler') or (record.get('scheduler') if isinstance(record, dict) else None)
             if view:
-                self.scheduler_label.setText(f"優先度: {view['priority']} / {view['task']} / Capability: {view['capabilities']} / 次回巡回: {view.get('next_scan_at') or '－'} / 再試行: {view.get('retry_attempts', {})} / terminal: {view['terminal_failed']}")
                 discovery = view.get('discovery')
                 if discovery:
-                    self.scheduler_label.setText(self.scheduler_label.text() +
-                        f" / Generation候補: {discovery['generation_candidates']} / Local候補: {discovery['local_candidates']}"
-                        f" / Download候補: {discovery['download_candidates']} / Retry候補: {discovery['retry_candidates']}")
+                    self.scheduler_label.setText(
+                        f"現在: {view['task']} / 候補: 生成{discovery['generation_candidates']} "
+                        f"Local{discovery['local_candidates']} Download{discovery['download_candidates']} "
+                        f"復旧{discovery['retry_candidates']} / Terminal {view['terminal_failed']}"
+                    )
+                else:
+                    self.scheduler_label.setText(f"現在: {view['task']}")
             if isinstance(record, dict) and str(record.get('stage', '')).startswith('save.'):
                 job_id = record.get('job_id')
                 if job_id:
@@ -947,6 +967,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.stop_button.setEnabled((self._running or self._paused or self._active_run) and not self._stopping)
         self.login_button.setEnabled(not self._running)
         self.details_button.setEnabled(self._selected_job() is not None)
+        self.save_retry_button.setEnabled(bool(self._checked_job_ids) and not self.controller.busy)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._closing:

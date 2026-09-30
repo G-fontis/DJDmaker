@@ -1,0 +1,13 @@
+{
+  "sample_count": 19,
+  "mean_mib_per_sec": 0.084634408639,
+  "stddev_mib_per_sec": 0.015480616842,
+  "lower_3sigma_mib_per_sec": 0.038192558112,
+  "generated_at": "2026-09-30T20:58:00+09:00",
+  "sample_min_mib_per_sec": 0.025949201110,
+  "sample_max_mib_per_sec": 0.098746173417,
+  "duration_min_seconds": 370.474376,
+  "duration_max_seconds": 598.796190,
+  "size_min_bytes": 14680064,
+  "size_max_bytes": 58868323
+}

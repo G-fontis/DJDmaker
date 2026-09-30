@@ -177,7 +177,12 @@ class PlaywrightArtifactDownload:
             artifact_card.get_by_role("button", name="その他", exact=True).click()
             item = page.get_by_role("menuitem", name="ダウンロード", exact=True)
             item.wait_for(state="visible", timeout=self.timeout_ms)
-            if not self._download_with_chrome(page, item, temporary):
+            # Prefer Playwright's completed Download promise. Live evidence on
+            # 2026-09-30 showed the legacy CDP path could leave a stable
+            # .crdownload forever without a completed progress event. The
+            # standard Download object remains valid while the keeper page
+            # holds the context and save_as waits for browser completion.
+            if hasattr(page, 'expect_download'):
                 with page.expect_download(timeout=self.timeout_ms) as info:
                     item.click()
                 download = info.value
@@ -185,11 +190,18 @@ class PlaywrightArtifactDownload:
                 if failure:
                     raise NotebookAdapterError(f"artifact download failed: {failure}")
                 download.save_as(str(temporary))
+            elif not self._download_with_chrome(page, item, temporary):
+                raise NotebookAdapterError('browser download completion mechanism is unavailable')
+            # Completion and media quality are separate gates. Publish only a
+            # browser-complete, size-stable, ffprobe-valid payload. The
+            # pipeline repeats validation and owns the statistical retry
+            # decision; this adapter gate prevents invalid media from ever
+            # becoming the canonical work download.
+            self._wait_stable_size(temporary)
             self.validator.validate(temporary, reject_temporary=False)
-            try:
-                os.link(temporary, destination)
-            except FileExistsError:
-                raise FileExistsError(f"download先を上書きしません: {destination}") from None
+            if destination.exists():
+                raise FileExistsError(f"download先を上書きしません: {destination}")
+            os.replace(temporary, destination)
             self.validator.validate(destination)
             return destination
         finally:
@@ -237,6 +249,9 @@ class PlaywrightArtifactDownload:
                 if progress.get("state") == "canceled":
                     raise NotebookAdapterError("Chrome download was canceled")
                 if completed:
+                    self._wait_stable_size(completed[0])
+                    if progress.get("state") not in {None, "completed"}:
+                        continue
                     completed[0].replace(temporary)
                     return True
                 partials = [
@@ -249,14 +264,8 @@ class PlaywrightArtifactDownload:
                     if current_size != stable_size:
                         stable_size = current_size
                         stable_since = active_monotonic()
-                    if (
-                        getattr(page, "is_closed", lambda: False)()
-                        and current_size > 0
-                        and stable_since is not None
-                        and active_monotonic() - stable_since >= 1
-                    ):
-                        partials[0].replace(temporary)
-                        return True
+                    # A stable .crdownload is still incomplete. The previous
+                    # page-close fallback promoted it and caused truncated MP4s.
                 try:
                     page.wait_for_timeout(100)
                 except Exception:
@@ -277,6 +286,26 @@ class PlaywrightArtifactDownload:
             except OSError:
                 # Preserve a partial download for diagnosis.
                 pass
+
+    @staticmethod
+    def _wait_stable_size(path: Path, *, stable_seconds: float = 1.0) -> int:
+        deadline = active_monotonic() + 30.0
+        previous = None
+        stable_since = None
+        while active_monotonic() < deadline:
+            if path.name.casefold().endswith('.crdownload'):
+                raise NotebookAdapterError('temporary Chrome download is not complete')
+            size = path.stat().st_size
+            now = active_monotonic()
+            if size > 0 and size == previous:
+                stable_since = stable_since or now
+                if now - stable_since >= stable_seconds:
+                    return size
+            else:
+                previous = size
+                stable_since = None
+            time.sleep(0.1)
+        raise NotebookAdapterError('download file did not become size-stable')
 
 
 CREATE_NOTEBOOK = (
@@ -1769,6 +1798,15 @@ class NotebookEngineAdapter:
 
     def download_artifact(self, job: Job, destination: Path) -> Path:
         self._open_job(job)
+        if (job.download_attempt_count > 1
+                and job.last_quality_result == 'DOWNLOAD_BROWSER_INCOMPLETE'):
+            # A timed-out/canceled Chrome transfer can leave Notebook's menu
+            # overlay or initiating tab in an indeterminate state. Re-mount
+            # the same persisted Notebook before the next bounded attempt;
+            # this is navigation only and never submits or regenerates.
+            checkpoint('download.retry.reload')
+            self.dom.page.reload(wait_until='domcontentloaded')
+            self.dom.ensure_interactable()
         return self.dom.download_artifact(job.script_name, destination)
 
     def delete_video_artifact(self, job: Job, gate: DownloadSafetyGate) -> None:

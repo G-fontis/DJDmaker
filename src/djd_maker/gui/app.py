@@ -15,6 +15,7 @@ from djd_maker.adapters.notebook import (
     PlaywrightArtifactDownload,
 )
 from djd_maker.core.repositories import JobRepository, PresetRepository, SettingsRepository
+from djd_maker.core.download_quality import PRODUCTION_QUALITY_PROFILE
 from djd_maker.media.raw_store import RawSafeStore
 from djd_maker.media.validator import VideoValidator
 from djd_maker.orchestration.gui_controller import GuiPipelineController
@@ -117,6 +118,7 @@ def build_desktop(
             ending_enabled=current.ending_enabled,
             tail_cut_enabled=current.tail_cut_enabled,
             encode_enabled=current.encode_enabled,
+            download_quality_profile=PRODUCTION_QUALITY_PROFILE,
         )
 
     def pipeline_factory() -> PipelineCoordinator:

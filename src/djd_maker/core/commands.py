@@ -26,6 +26,7 @@ class CommandId(StrEnum):
     ENDING_CHANGE = 'CMD_ENDING_CHANGE'
     ENDING_PREVIEW = 'CMD_ENDING_PREVIEW'
     PRESET_SELECT = 'CMD_PRESET_SELECT'
+    SAVE_RETRY = 'CMD_SAVE_RETRY'
 
 
 REQUIRED_COMMANDS = frozenset(CommandId)
@@ -41,6 +42,7 @@ BUTTON_COMMANDS = {
     'details_button': CommandId.JOB_DETAIL_OPEN,
     'delete_selected_button': CommandId.DELETE_SELECTED,
     'delete_completed_button': CommandId.DELETE_COMPLETED,
+    'save_retry_button': CommandId.SAVE_RETRY,
     'open_input_button': CommandId.INPUT_OPEN,
     'open_raw_folder_button': CommandId.RAW_OPEN,
     'open_output_button': CommandId.OUTPUT_OPEN,
@@ -59,7 +61,7 @@ class InterfaceError(ValueError):
 def validate_payload(command, payload):
     if not isinstance(payload, dict):
         raise InterfaceError('INTERFACE_ERROR: payload must be an object')
-    if command in {CommandId.DELETE_SELECTED, CommandId.DELETE_COMPLETED}:
+    if command in {CommandId.DELETE_SELECTED, CommandId.DELETE_COMPLETED, CommandId.SAVE_RETRY}:
         if set(payload) != {'job_ids'} or not isinstance(payload['job_ids'], list) or any(not isinstance(i, str) or not i for i in payload['job_ids']):
             raise InterfaceError('INTERFACE_ERROR: job_ids must be a list of IDs')
     elif command in {CommandId.GUI_SWITCH_PHASE1, CommandId.GUI_SWITCH_PHASE2}:

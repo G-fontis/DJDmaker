@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import time
 import threading
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Protocol
 from zipfile import BadZipFile, ZipFile
@@ -26,6 +27,11 @@ from djd_maker.adapters.notebook import SourceRetryExhausted, GenerationRetryExh
 from djd_maker.core.runtime_operation import operation_scope, report_operation, local_task_scope, LocalTaskComplete
 from djd_maker.core.download_policy import (
     MAX_DOWNLOAD_ATTEMPTS, decide_download_size,
+)
+from djd_maker.core.download_quality import (
+    BASE_QUALITY_DELAY_SECONDS, MAX_DOWNLOAD_ATTEMPTS as MAX_QUALITY_DOWNLOAD_ATTEMPTS,
+    DownloadQualityProfile, evaluate_download,
+    quality_check_delay,
 )
 
 
@@ -133,6 +139,8 @@ class PipelineCoordinator(DeferredRecovery):
         ending_enabled: bool | None = None,
         tail_cut_enabled: bool | None = None,
         encode_enabled: bool | None = None,
+        download_quality_profile: DownloadQualityProfile | None = None,
+        quality_delay_baseline_seconds: float = BASE_QUALITY_DELAY_SECONDS,
     ) -> None:
         if ffmpeg_concurrency not in {1, 2}:
             raise ValueError("ffmpeg_concurrency must be 1 or 2")
@@ -158,6 +166,11 @@ class PipelineCoordinator(DeferredRecovery):
         self.generation_preset = generation_preset
         self._run_hls_zip_enabled = hls_zip_enabled
         self._run_local_options = (ending_enabled, tail_cut_enabled, encode_enabled)
+        self.download_quality_profile = download_quality_profile
+        self.quality_delay_baseline_seconds = quality_delay_baseline_seconds
+        self._manual_retry_lock = threading.RLock()
+        self._manual_retry_requests: dict[str, tuple[bool, bool, bool, bool]] = {}
+        self._manual_retry_failures: dict[str, str] = {}
         if all(value is None for value in self._run_local_options) and paths.ending_video is None:
             # Compatibility for pre-Ver2.1 callers: an absent Ending path meant
             # that the whole combined local stage was skipped.
@@ -168,6 +181,7 @@ class PipelineCoordinator(DeferredRecovery):
         self.runtime_callback = lambda _record: None
         self.job_callback = lambda _job: None
         self.phase = 'GENERATION_DISPATCH'
+        self._last_announced_phase: str | None = None
         self._dispatch_only = False
         self._progress_jobs = {}
         self._resume_attempted: set[str] = set()
@@ -189,6 +203,7 @@ class PipelineCoordinator(DeferredRecovery):
         self._snapshot_output_modes()
         self._no_op_count = 0
         self._idle_announced.clear()
+        self._last_announced_phase = None
         self._deferred_attempts.clear()
         for entry in self.deferred.entries.values():
             self._deferred_notice(entry, 'save.deferred', '保存保留journalを検出しました。再実行前に成果物を照合します。')
@@ -393,6 +408,9 @@ class PipelineCoordinator(DeferredRecovery):
 
     def _phase_event(self, phase: str) -> None:
         self.phase = phase
+        if self._last_announced_phase == phase:
+            return
+        self._last_announced_phase = phase
         jobs = self.jobs.list()
         generated = sum(j.state in {JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} or j.raw_path is not None or j.state is JobState.COMPLETED for j in jobs)
         reserved = sum(j.state is JobState.RESERVED_WAITING_CREDIT_RESET for j in jobs)
@@ -426,6 +444,8 @@ class PipelineCoordinator(DeferredRecovery):
         self._reject_output_name_collisions()
         self._reconcile_unprocessed()
         self._progress_jobs = {j.id:j for j in self.jobs.list()}
+        if self._drain_manual_retry_requests():
+            return
         if not self.cloud_limit.blocked and any(self._needs_dispatch(j) for j in self.jobs.list()):
             self.wait_seconds = 0
             self._scheduler_status(1, '生成投入')
@@ -510,17 +530,20 @@ class PipelineCoordinator(DeferredRecovery):
     def _scheduler_status(self, priority, task):
         from dataclasses import asdict
         now = self.cloud_limit.clock().astimezone(UTC)
+        # Repository reads may parse hundreds of durable JSON records. Use one
+        # consistent snapshot for the whole status view instead of reloading it
+        # once per counter.
+        jobs = self.jobs.list()
         next_scan = None
         if self.wait_seconds:
             previous_scan = self._parse_utc(self.scheduler_view.get('next_scan_at'))
             next_scan = (previous_scan if previous_scan and previous_scan > now else now+timedelta(seconds=self.wait_seconds)).isoformat()
         view = dict(priority=priority, capabilities=asdict(self.capabilities),
             task=task, next_scan_at=next_scan,
-            completed=sum(j.state is JobState.COMPLETED for j in self.jobs.list()),
-            retry_attempts={j.id: j.attempt_by_stage.get('scheduler.recovery', 0) for j in self.jobs.list()
+            completed=sum(j.state is JobState.COMPLETED for j in jobs),
+            retry_attempts={j.id: j.attempt_by_stage.get('scheduler.recovery', 0) for j in jobs
                             if j.attempt_by_stage.get('scheduler.recovery', 0)},
-            terminal_failed=sum(terminal(j) and j.state is not JobState.COMPLETED and not j.duplicate_of_job_id for j in self.jobs.list()))
-        jobs = self.jobs.list()
+            terminal_failed=sum(terminal(j) and j.state is not JobState.COMPLETED and not j.duplicate_of_job_id for j in jobs))
         view['discovery'] = dict(total_jobs=len(jobs),
             generation_candidates=sum(self._needs_dispatch(j) for j in jobs),
             local_candidates=sum(j.state in self.MEDIA_STATES and j.id not in self.deferred_ids for j in jobs),
@@ -531,12 +554,33 @@ class PipelineCoordinator(DeferredRecovery):
             output_blocked=sum(j.failure_class == 'OUTPUT_BLOCKED' for j in jobs),
             terminal_failed=view['terminal_failed'], cloud_capability=self.cloud_limit.status()['reconciliation'],
             limit_source=self.cloud_limit.state.get('message'), resume_at=self.cloud_limit.state.get('cloud_resume_at'))
+        exclusions = ((j.id, self._candidate_exclusion_reason(j, now)) for j in jobs)
+        view['exclusion_reasons'] = {job_id: reason for job_id, reason in exclusions if reason is not None}
         if view == self.scheduler_view:
             return
         self.scheduler_view = view
         self.runtime_callback(dict(stage='scheduler.wait' if priority == 5 else 'scheduler.task',
             scheduler=dict(self.scheduler_view), phase=self.phase, cloud_limit=self.cloud_limit.status(),
             message=f'優先度{priority}: {task} / discovery={view["discovery"]}'))
+
+    def _quality_check_due(self, job: Job, now: datetime) -> bool:
+        if not job.next_quality_check_at:
+            return True
+        deadline = self._parse_utc(job.next_quality_check_at)
+        return deadline is None or deadline <= now
+
+    def _candidate_exclusion_reason(self, job: Job, now: datetime) -> str | None:
+        if job.id in self.deferred_ids:
+            return 'SAVE_DEFERRED'
+        if terminal(job):
+            return 'TERMINAL'
+        if job.failure_class == 'OUTPUT_BLOCKED':
+            return 'OUTPUT_BLOCKED'
+        if job.state is JobState.DOWNLOADING and not self._quality_check_due(job, now):
+            return 'QUALITY_CHECK_NOT_DUE'
+        if job.next_poll_at and not due(job, now):
+            return 'REMOTE_CHECK_NOT_DUE'
+        return None
 
     def _discover_remaining_tasks(self):
         self.wait_seconds = 0
@@ -555,8 +599,11 @@ class PipelineCoordinator(DeferredRecovery):
         # independently; the adapter remains responsible for current DOM readiness.
         now = self.cloud_limit.clock()
         remote = [j for j in self.jobs.list() if j.id not in self.deferred_ids and
-            (due(j, now) or j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
-             and j.runtime_reason != 'WAITING_REMOTE_ACCESS')
+            ((j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
+              and j.runtime_reason != 'WAITING_REMOTE_ACCESS'
+              and self._quality_check_due(j, now))
+             or (j.state not in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
+                 and due(j, now)))
             and (j.state in {JobState.GENERATING, JobState.WAITING_VIDEO, JobState.DOWNLOAD_PENDING,
                 JobState.DOWNLOADING, JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING}
                 or remote_reconcile_candidate(j)
@@ -578,8 +625,13 @@ class PipelineCoordinator(DeferredRecovery):
         runnable = any(j.id not in self.deferred_ids and not terminal(j) and
             (j.state in self.MEDIA_STATES or
              (self._needs_dispatch(j) and not self.cloud_limit.blocked) or
-             (j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} and due(j, now)))
+             (j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
+              and self._quality_check_due(j, now)) or
+             (j.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
+              and j.failure_class != 'OUTPUT_BLOCKED' and due(j, now)))
             for j in self.jobs.list())
+        with self._manual_retry_lock:
+            runnable = runnable or bool(self._manual_retry_requests)
         if not self.all_tasks_completed() and not runnable:
             self.wait_seconds = RESCAN_SECONDS
             if self.cloud_limit.blocked and self.cloud_limit.recheck_delay < RESCAN_SECONDS:
@@ -644,7 +696,7 @@ class PipelineCoordinator(DeferredRecovery):
                 with operation_scope(update):
                     self._run_notebook_job(job)
         local = [j for j in self.jobs.list() if j.state in self.MEDIA_STATES and j.id not in self.deferred_ids]
-        self.phase = ('LIMIT_LOCAL_DRAIN' if local else 'LIMIT_WAIT') if self.cloud_limit.blocked else 'COLLECT_LOCAL'
+        self.phase = ('LIMIT_LOCAL_DRAIN' if local else 'LIMIT_WAIT') if self.cloud_limit.blocked else ('COLLECT_LOCAL' if local else 'SCHEDULER')
         if local:
             self.runtime_callback(dict(stage='limit.local', phase=self.phase, cloud_limit=self.cloud_limit.status(),
                 message='ローカル処理を実行しています。'))
@@ -1103,8 +1155,146 @@ class PipelineCoordinator(DeferredRecovery):
                 job.failure_class = 'TERMINAL_FAILED'
             self._save(job)
 
-    def _download_with_size_gate(self, job: Job, destination: Path) -> Path:
+    def _download_with_quality_gate(self, job: Job, destination: Path) -> Path | None:
+        """Persisted six-attempt gate; candidates remain private until valid."""
+        profile = self.download_quality_profile
+        assert profile is not None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if job.download_validation_status == 'DOWNLOAD_VALIDATED' and destination.is_file():
+            return destination
+
+        while True:
+            checkpoint('download.quality_gate')
+            candidate = Path(job.download_candidate_path) if job.download_candidate_path else None
+            if candidate is not None and candidate.is_file():
+                due_at = self._parse_utc(job.next_quality_check_at)
+                now = self.cloud_limit.clock()
+                if due_at is not None and now < due_at:
+                    job.download_status = 'WAITING_QUALITY_CHECK'
+                    self._save(job)
+                    return None
+                try:
+                    result = evaluate_download(candidate, self.validator, profile)
+                    job.last_download_size = result.size_bytes
+                    job.last_duration = result.duration_seconds
+                    job.last_mib_per_sec = result.mib_per_sec
+                    job.quality_threshold = result.threshold
+                    job.last_quality_result = result.result
+                    small = result.size_bytes < 10 * 1024 * 1024
+                    if small:
+                        job.small_download_attempts = max(
+                            job.small_download_attempts, job.download_attempt_count)
+                    # Attempts 1 and 2 retain Ver2.1's mandatory small retry.
+                    passed = result.passed and (not small or job.download_attempt_count >= 3)
+                    job.download_size_gate_status = (
+                        'ACCEPTED_AFTER_3_SMALL_DOWNLOADS' if passed and small
+                        else 'PASSED_MIN_SIZE' if passed else
+                        'RETRY_SMALL_DOWNLOAD' if small else 'DOWNLOAD_QUALITY_OUTLIER'
+                    )
+                except Exception as exc:
+                    passed = False
+                    job.last_quality_result = 'DOWNLOAD_MEDIA_INVALID'
+                    job.error_message = str(exc)
+                    try:
+                        job.last_download_size = candidate.stat().st_size
+                    except OSError:
+                        job.last_download_size = None
+                    job.last_duration = None
+                    job.last_mib_per_sec = None
+                    job.quality_threshold = profile.lower_3sigma_mib_per_sec
+
+                job.next_quality_check_at = None
+                if passed:
+                    if destination.exists():
+                        destination.unlink()
+                    os.replace(candidate, destination)
+                    job.download_candidate_path = None
+                    job.download_status = 'DOWNLOADED_QUALITY_ACCEPTED'
+                    job.error_message = None
+                    self._save(job)
+                    report_operation(
+                        'download.quality.pass',
+                        decision=f'{job.last_mib_per_sec:.6f} MiB/s >= {job.quality_threshold:.6f}',
+                        attempt=f'{job.download_retry_count}/5',
+                    )
+                    return destination
+
+                self._save(job)
+                candidate.unlink(missing_ok=True)
+                job.download_candidate_path = None
+                if job.download_attempt_count >= MAX_QUALITY_DOWNLOAD_ATTEMPTS:
+                    job.download_status = 'DOWNLOAD_RETRY_EXHAUSTED'
+                    job.last_quality_result = 'DOWNLOAD_RETRY_EXHAUSTED'
+                    self._save(job)
+                    raise RuntimeError('DOWNLOAD_RETRY_EXHAUSTED')
+                job.download_status = 'REDOWNLOAD_REQUIRED'
+                self._save(job)
+                report_operation(
+                    'download.quality.retry',
+                    decision=job.last_quality_result or 'DOWNLOAD_QUALITY_OUTLIER',
+                    attempt=f'{job.download_retry_count}/5',
+                    next_action='Notebook動画を再ダウンロード',
+                )
+
+            if job.download_attempt_count >= MAX_QUALITY_DOWNLOAD_ATTEMPTS:
+                raise RuntimeError('DOWNLOAD_RETRY_EXHAUSTED')
+            job.download_attempt_count += 1
+            job.download_retry_count = max(0, job.download_attempt_count - 1)
+            job.download_status = f'DOWNLOADING_ATTEMPT_{job.download_attempt_count}'
+            job.download_size_gate_status = 'PENDING'
+            job.download_validation_status = 'PENDING'
+            target = destination.with_name(
+                f'.{destination.stem}.attempt-{job.download_attempt_count}{destination.suffix}'
+            )
+            target.unlink(missing_ok=True)
+            job.download_candidate_path = str(target)
+            self._save(job)  # claim attempt before remote I/O
+            try:
+                self.notebook.download_artifact(job, target)
+                if not target.is_file() or target.name.casefold().endswith('.crdownload'):
+                    raise RuntimeError('DOWNLOAD_DID_NOT_PUBLISH_COMPLETE_FILE')
+            except (RunCancelled, BlockingModalError, JobStateSaveError):
+                raise
+            except Exception as exc:
+                # Browser completion failures consume the same bounded attempt
+                # budget as media/ratio failures. They never become generic
+                # scheduler recovery and never leave a manual request spinning.
+                target.unlink(missing_ok=True)
+                job.download_candidate_path = None
+                job.download_completed_at = None
+                job.next_quality_check_at = None
+                job.last_quality_result = 'DOWNLOAD_BROWSER_INCOMPLETE'
+                job.error_message = str(exc)
+                job.download_status = 'REDOWNLOAD_REQUIRED'
+                self._save(job)
+                if job.download_attempt_count >= MAX_QUALITY_DOWNLOAD_ATTEMPTS:
+                    job.download_status = 'DOWNLOAD_RETRY_EXHAUSTED'
+                    job.last_quality_result = 'DOWNLOAD_RETRY_EXHAUSTED'
+                    self._save(job)
+                    raise RuntimeError('DOWNLOAD_RETRY_EXHAUSTED: ' + str(exc)) from exc
+                report_operation(
+                    'download.quality.retry', decision='DOWNLOAD_BROWSER_INCOMPLETE',
+                    attempt=f'{job.download_retry_count}/5',
+                    next_action='Notebook動画を再ダウンロード',
+                )
+                continue
+            completed = self.cloud_limit.clock()
+            job.download_completed_at = completed.isoformat()
+            delay = quality_check_delay(
+                job.download_attempt_count, self.quality_delay_baseline_seconds)
+            job.next_quality_check_at = (completed + timedelta(seconds=delay)).isoformat()
+            job.download_status = 'WAITING_QUALITY_CHECK'
+            self._save(job)
+            report_operation(
+                'download.quality.wait', decision=f'{delay:.0f}秒後に品質判定',
+                attempt=f'{job.download_retry_count}/5', next_action='品質確認待ち',
+            )
+            return None
+
+    def _download_with_size_gate(self, job: Job, destination: Path) -> Path | None:
         """Download at most three times and persist every decision boundary."""
+        if self.download_quality_profile is not None:
+            return self._download_with_quality_gate(job, destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if job.download_validation_status == 'DOWNLOAD_VALIDATED' and destination.is_file():
             return destination
@@ -1367,6 +1557,11 @@ class PipelineCoordinator(DeferredRecovery):
                     / f"{job.script_name}.mp4"
                 )
                 download = self._download_with_size_gate(job, download)
+                if download is None:
+                    return
+                if job.manual_retry_requested:
+                    self._commit_manual_retry(job, download)
+                    return
                 job.download_status = "DOWNLOADED"
                 raw_validation_started = True
                 report_operation('download.complete')
@@ -1427,7 +1622,8 @@ class PipelineCoordinator(DeferredRecovery):
             raise
         except Exception as exc:
             if ((job.state is JobState.WAITING_VIDEO and status != 'FAILED') or
-                (job.state is JobState.DOWNLOADING and not raw_validation_started)):
+                (job.state is JobState.DOWNLOADING and not raw_validation_started
+                 and not str(exc).startswith('DOWNLOAD_RETRY_EXHAUSTED'))):
                 # Current artifact access can fail independently of Chat.
                 # Preserve identity, back off only this job, and continue peers.
                 key = 'scheduler.recovery'
@@ -1447,8 +1643,14 @@ class PipelineCoordinator(DeferredRecovery):
             job.error_message = str(exc)
             job.resume_checkpoint = job.state.value
             if job.state is JobState.DOWNLOADING:
-                job.error_code = "DOWNLOAD_VERIFY_FAILED"
+                job.error_code = (
+                    'DOWNLOAD_RETRY_EXHAUSTED'
+                    if str(exc).startswith('DOWNLOAD_RETRY_EXHAUSTED')
+                    else "DOWNLOAD_VERIFY_FAILED"
+                )
                 job.download_validation_status = 'FAIL'
+                if job.error_code == 'DOWNLOAD_RETRY_EXHAUSTED':
+                    job.failure_class = 'TERMINAL_FAILED'
                 self._transition(job, JobState.DOWNLOAD_VERIFY_FAILED)
             elif job.state not in {JobState.FAILED, JobState.COMPLETED}:
                 failure_code = str(exc).split(":", 1)[0]
@@ -1688,6 +1890,196 @@ class PipelineCoordinator(DeferredRecovery):
                 return bool(archive.namelist()) and archive.testzip() is None
         except (OSError, BadZipFile):
             return False
+
+    def enqueue_manual_save_retry(
+        self, job_ids: list[str], *, ending_enabled: bool, tail_cut_enabled: bool,
+        encode_enabled: bool, hls_zip_enabled: bool,
+    ) -> None:
+        config = (ending_enabled, tail_cut_enabled, encode_enabled, hls_zip_enabled)
+        with self._manual_retry_lock:
+            for job_id in job_ids:
+                if self.jobs.get(job_id) is None:
+                    raise KeyError(job_id)
+                self._manual_retry_requests[job_id] = config
+
+    def _prepare_manual_save_retry(self, job: Job, config: tuple[bool, bool, bool, bool]) -> None:
+        if not job.notebook_id or not job.notebook_url:
+            raise ValueError('NotebookにDownload可能な動画がありません')
+        status = self.notebook.inspect_status(job)
+        if status != 'READY':
+            raise ValueError('NotebookにDownload可能な動画がありません')
+        job.ending_enabled, job.tail_cut_enabled, job.encode_enabled, job.hls_zip_enabled = config
+        job.manual_download_session += 1
+        job.manual_retry_requested = True
+        job.download_attempt_count = job.download_retry_count = job.small_download_attempts = 0
+        job.download_size_gate_status = job.download_validation_status = 'PENDING'
+        job.download_candidate_path = job.download_completed_at = job.next_quality_check_at = None
+        job.attempt_by_stage['scheduler.recovery'] = 0
+        job.last_download_size = job.last_duration = job.last_mib_per_sec = None
+        job.quality_threshold = None
+        job.last_quality_result = 'MANUAL_SAVE_RETRY_REQUESTED'
+        job.error_code = job.error_message = job.failure_class = None
+        job.artifact_status = 'READY'
+        job.state = JobState.DOWNLOAD_PENDING
+        job.resume_checkpoint = 'MANUAL_SAVE_RETRY'
+        self._save(job)
+        report_operation('manual.download.start', decision=job.script_name,
+                         next_action='Notebook動画を再ダウンロード')
+
+    def _drain_manual_retry_requests(self) -> bool:
+        with self._manual_retry_lock:
+            pending = list(self._manual_retry_requests.items())
+        if not pending:
+            return False
+        job_id, config = pending[0]
+        job = self.jobs.get(job_id)
+        if job is None:
+            with self._manual_retry_lock:
+                self._manual_retry_requests.pop(job_id, None)
+            return True
+        def update(stage, fields):
+            self.runtime_callback(dict(
+                fields, stage=stage, job=job.script_name, job_id=job.id,
+                phase='MANUAL_SAVE_RETRY', notebook=job.notebook_url or '－'))
+        with operation_scope(update):
+            with self._job_boundary(job):
+                if not job.manual_retry_requested:
+                    self._prepare_manual_save_retry(job, config)
+                if job.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}:
+                    self._run_notebook_job(job)
+        latest = self.jobs.get(job_id)
+        if latest is not None and latest.manual_retry_requested and latest.state not in {
+            JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING
+        }:
+            message = latest.error_message or latest.error_code or latest.state.value
+            latest.manual_retry_requested = False
+            latest.last_quality_result = 'MANUAL_SAVE_RETRY_FAILED'
+            self._save(latest)
+            self._manual_retry_failures[job_id] = message
+            with operation_scope(update):
+                report_operation('manual.download.failed', decision=message,
+                                 next_action='他の選択jobを続行')
+        if latest is None or not latest.manual_retry_requested:
+            with self._manual_retry_lock:
+                self._manual_retry_requests.pop(job_id, None)
+        return True
+
+    def run_manual_save_retry(self, job_ids: list[str], config: tuple[bool, bool, bool, bool]) -> list[str]:
+        """Run only explicitly selected jobs; never enters generation discovery."""
+        self._manual_retry_failures = {}
+        self.enqueue_manual_save_retry(
+            job_ids, ending_enabled=config[0], tail_cut_enabled=config[1],
+            encode_enabled=config[2], hls_zip_enabled=config[3])
+        while True:
+            with self._manual_retry_lock:
+                pending = list(self._manual_retry_requests)
+            if not pending:
+                break
+            self._drain_manual_retry_requests()
+            deadlines = [self._parse_utc(j.next_quality_check_at) for j in self.jobs.list()
+                         if j.id in pending and j.next_quality_check_at]
+            deadlines = [value for value in deadlines if value is not None]
+            if deadlines:
+                from djd_maker.core.cancellation import interruptible_sleep
+                seconds = max(0.0, min(deadlines).timestamp() - self.cloud_limit.clock().timestamp())
+                if seconds:
+                    interruptible_sleep(seconds)
+        if self._manual_retry_failures:
+            detail = '; '.join(
+                f'{job_id}: {message}' for job_id, message in self._manual_retry_failures.items())
+            raise RuntimeError('保存リトライ失敗: ' + detail)
+        return job_ids
+
+    def _commit_manual_retry(self, job: Job, download: Path) -> None:
+        """Build every replacement in work, then commit or roll back as a set."""
+        from djd_maker.core.artifact_ownership import _digest
+        tx = self.paths.work_directory / job.id / f'manual-{job.manual_download_session}'
+        tx.mkdir(parents=True, exist_ok=True)
+        staged_raw = tx / 'raw.mp4'
+        staged_raw.unlink(missing_ok=True)
+        stored = self.raw_store.save(download, staged_raw)
+        final_source = staged_raw
+        if job.ending_enabled or job.tail_cut_enabled or job.encode_enabled:
+            staged_edited = tx / 'edited.mp4'
+            staged_edited.unlink(missing_ok=True)
+            result = self.ending.process_options(
+                staged_raw, self.paths.ending_video, staged_edited,
+                ending_enabled=job.ending_enabled, tail_cut_enabled=job.tail_cut_enabled,
+                encode_enabled=job.encode_enabled, padding_seconds=0.5)
+            final_source = Path(result.path)
+        self.validator.validate(final_source)
+        if job.hls_zip_enabled:
+            staged_output = tx / 'result.zip'
+            staged_output.unlink(missing_ok=True)
+            self.hls.convert_validate_and_zip(final_source, staged_output)
+            if not self._valid_zip(staged_output):
+                raise RuntimeError('MANUAL_RETRY_ZIP_INVALID')
+            final_output = self.paths.output_directory / f'{job.script_name}.zip'
+        else:
+            staged_output = tx / 'result.mp4'
+            staged_output.unlink(missing_ok=True)
+            shutil.copy2(final_source, staged_output)
+            self.validator.validate(staged_output)
+            final_output = self.paths.output_directory / 'completed_mp4' / f'{job.script_name}.mp4'
+        formal_raw = self.paths.raw_directory / f'{job.script_name}.mp4'
+        formal_raw.parent.mkdir(parents=True, exist_ok=True)
+        final_output.parent.mkdir(parents=True, exist_ok=True)
+        backups: list[tuple[Path, Path | None]] = []
+        committed: list[Path] = []
+        try:
+            for index, (source, target) in enumerate(
+                ((staged_raw, formal_raw), (staged_output, final_output)), start=1
+            ):
+                # RAW and completed MP4 normally share a filename. Keep their
+                # rollback copies distinct so restoring the second target can
+                # never consume the first target's backup.
+                backup = tx / f'backup-{index}-{target.name}'
+                backup.unlink(missing_ok=True)
+                if target.exists():
+                    shutil.copy2(target, backup)
+                    backups.append((target, backup))
+                else:
+                    backups.append((target, None))
+                os.replace(source, target)
+                committed.append(target)
+        except Exception:
+            for target, backup in reversed(backups):
+                if target in committed:
+                    if backup is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup, target)
+            raise
+        media = getattr(stored, 'media', stored)
+        job.raw_path = str(formal_raw)
+        job.raw_size_bytes = formal_raw.stat().st_size
+        job.duration_seconds = getattr(media, 'duration_seconds', None)
+        job.safety_gate = stored.safety_gate
+        job.raw_status = 'READY'
+        job.download_validation_status = 'DOWNLOAD_VALIDATED'
+        job.artifact_status = 'RETAINED'
+        job.ending_result = 'PASS' if job.ending_enabled else 'SKIPPED_BY_SETTING'
+        job.tail_cut_result = 'PASS' if job.tail_cut_enabled else 'SKIPPED_BY_SETTING'
+        job.encode_result = 'PASS' if job.encode_enabled else 'SKIPPED_BY_SETTING'
+        if job.hls_zip_enabled:
+            job.zip_path = str(final_output)
+            job.output_zip_sha256 = _digest(final_output)
+            job.hls_result = job.zip_result = 'PASS'
+            job.final_mp4_path = job.final_mp4_sha256 = None
+        else:
+            job.final_mp4_path = str(final_output)
+            job.final_mp4_sha256 = _digest(final_output)
+            job.hls_result = job.zip_result = 'SKIPPED_BY_SETTING'
+            job.zip_path = job.output_zip_sha256 = None
+        job.state = JobState.COMPLETED
+        job.progress_percent = 100.0
+        job.manual_retry_requested = False
+        job.last_quality_result = 'MANUAL_SAVE_RETRY_COMPLETED'
+        job.error_code = job.error_message = None
+        self._save(job)
+        self.reconcile_completed_txt()
+        report_operation('manual.download.complete', decision=job.script_name,
+                         next_action='保存リトライ完了')
 
     def retry_download(self, job_id: str) -> Job:
         job = self.jobs.get(job_id)
