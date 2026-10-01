@@ -58,7 +58,7 @@ def test_restore_identical_is_noop_and_conflict_fails_before_any_write(tmp_path)
     assert destination.read_bytes() == b"different"
 
 
-def test_restore_rejects_tamper_traversal_and_sensitive_entry(tmp_path):
+def test_restore_rejects_tamper_and_traversal(tmp_path):
     migration, repository = package(tmp_path)
     source = migration / "settings/settings.json"
     source.write_bytes(b"tampered")
@@ -73,10 +73,30 @@ def test_restore_rejects_tamper_traversal_and_sensitive_entry(tmp_path):
     with pytest.raises(RestoreError, match="root外"):
         load_plan(migration, repository)
 
-    migration, repository = package(tmp_path / "sensitive")
-    manifest_path = migration / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["copied_files"][0]["sensitive"] = True
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(RestoreError, match="秘密情報"):
-        load_plan(migration, repository)
+
+
+def test_v23_manifest_accepts_declared_secret_and_defaults_to_dry_run(tmp_path):
+    migration = tmp_path / "Dropbox" / "VSCode_local" / "DJDmaker"
+    repository = tmp_path / "clone"
+    source = migration / "browser_profile" / "Default" / "Cookies"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"encrypted browser value")
+    manifest = {
+        "project_name": "DJDmaker",
+        "files": [{
+            "relative_backup_path": "browser_profile/Default/Cookies",
+            "restore_destination": "browser/chrome-profile/Default/Cookies",
+            "size": source.stat().st_size,
+            "sha256": digest(source),
+            "restore_required": True,
+            "machine_specific": True,
+            "contains_secret": True,
+        }],
+    }
+    (migration / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    _, plan = load_plan(migration, repository)
+    assert plan[0]["contains_secret"] is True
+    assert plan[0]["status"] == "CREATE"
+    restore(plan, apply=False)
+    assert not (repository / "browser/chrome-profile/Default/Cookies").exists()

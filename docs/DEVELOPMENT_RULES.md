@@ -1,5 +1,10 @@
 # 開発ルール
 
+## 別PCからの開発再開
+
+- GitHub `main`取得後、Dropboxの論理path `DELLノートPC(2019～)\VSCode_local\DJDmaker` にある`README_RESUME.md`と`MANIFEST.json`を確認し、`tools/restore_pc_migration.py`の既定dry-runでlocal-only環境を検証・復元してから作業を開始する。
+- handoff内のChrome profile・認証情報をChat、ログ、Gitへ出さない。既存destinationとhashが違う場合はCONFLICTとして自動上書きせず、別PCで認証を再利用できない場合は通常AUTH Chromeから再ログインする。
+
 ## Ver2.3 Download完了・Deferred Queue契約
 
 - `DJD-CHAPPY-V23-DOWNLOAD-COMPLETION-DEFERRED-QUEUE-FULL-002`を正本とする。Notebook標準の通常locator clickとPlaywright Download objectを使用し、アプリ側でDownload用`about:blank` keeperを作らない。
