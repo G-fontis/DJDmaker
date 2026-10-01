@@ -193,6 +193,19 @@ def _config_check(path: Path) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _quality_profile_check(path: Path) -> tuple[bool, str]:
+    try:
+        from djd_maker.core.download_quality import load_quality_profile
+
+        profile = load_quality_profile(path)
+        return True, (
+            f"{path.resolve()} (n={profile.sample_count}, "
+            f"lower_3sigma={profile.lower_3sigma_mib_per_sec})"
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return False, str(exc)
+
+
 def _qt_checks() -> tuple[PreflightCheck, ...]:
     try:
         from PySide6 import __version__
@@ -229,6 +242,7 @@ def release_tree_violations(root: Path) -> list[str]:
         root / "DJDmaker.exe",
         root / "_internal",
         root / "config" / "default-settings.json",
+        root / "config" / "download-quality-profile.json",
         root / "runtime" / "ffmpeg" / "ffmpeg.exe",
         root / "runtime" / "ffmpeg" / "ffprobe.exe",
         root / "licenses" / "FFmpeg-LICENSE.txt",
@@ -290,6 +304,9 @@ def inspect_packaging(
     config = root / "config" / "default-settings.json"
     passed, detail = _config_check(config)
     checks.append(PreflightCheck("default-config", passed, detail))
+    quality_profile = root / "config" / "download-quality-profile.json"
+    passed, detail = _quality_profile_check(quality_profile)
+    checks.append(PreflightCheck("download-quality-profile", passed, detail))
 
     for relative in WRITABLE_DIRECTORIES:
         passed, detail = _probe_writable(root / relative)

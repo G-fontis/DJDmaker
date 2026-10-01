@@ -54,7 +54,8 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
         {JobState.RAW_READY, JobState.DOWNLOAD_VERIFY_FAILED, JobState.FAILED}
     ),
     JobState.DOWNLOAD_VERIFY_FAILED: frozenset(
-        {JobState.DOWNLOADING, JobState.FAILED}
+        {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING, JobState.WAITING_VIDEO,
+         JobState.WAITING, JobState.RECOVERY_PENDING, JobState.FAILED}
     ),
     JobState.RAW_READY: frozenset({JobState.ENDING, JobState.FAILED}),
     JobState.ENDING: frozenset({JobState.HLS_ENCODING, JobState.FAILED}),
@@ -158,6 +159,7 @@ class Job:
     last_mib_per_sec: float | None = None
     quality_threshold: float | None = None
     last_quality_result: str | None = None
+    download_failure_reason: str | None = None
     manual_download_session: int = 0
     manual_retry_requested: bool = False
     raw_status: str = "PENDING"

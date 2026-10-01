@@ -401,6 +401,15 @@ def test_artifact_delete_requires_one_playable_target():
     assert diagnostics == ["DOM_MISMATCH:delete_artifact_not_unique"]
 
 
+def test_playable_artifact_returns_stable_card_not_text_filter():
+    page = ArtifactDeletePage(("remote generated title",))
+    target, title_scoped = NotebookDomAdapter(page)._stable_playable_artifact(
+        "local script title"
+    )
+    assert target is page.cards[0]
+    assert not title_scoped
+
+
 def test_artifact_delete_can_confirm_by_explicitly_configured_toast():
     page = ArtifactDeletePage(toast=False)
     # Simulate a stale card locator despite a successful server-side action.
@@ -511,39 +520,40 @@ def test_playwright_download_validates_before_atomic_publish(tmp_path):
     assert calls[-1] == (destination.resolve(), {})
 
 
-def test_chrome_cdp_download_survives_initiating_page_close(tmp_path):
-    class Client:
-        def __init__(self):
-            self.detached = False
+def test_download_uses_trusted_playwright_click_not_js(tmp_path):
+    events = []
 
-        def on(self, _event, _callback):
-            pass
+    class Node(Locator):
+        def click(self, **kwargs):
+            events.append(("click", kwargs))
 
-        def send(self, _method, params):
-            Path(params["downloadPath"], "video.mp4").write_bytes(b"mp4")
+        def evaluate(self, *_args):
+            raise AssertionError("synthetic JavaScript click must not be used")
 
-        def detach(self):
-            self.detached = True
+    class Download:
+        def failure(self): return None
+        def save_as(self, path): Path(path).write_bytes(b"complete-video")
 
-    client = Client()
+    class Event:
+        value = Download()
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
 
-    class Context:
-        def new_cdp_session(self, _page):
-            return client
+    class Page:
+        context = None
+        def get_by_role(self, *_args, **_kwargs): return Node()
+        def expect_download(self, **_kwargs): return Event()
+        def once(self, event_name, callback):
+            events.append(("once", event_name))
+            callback(object())
 
-    class ClosedPage:
-        context = Context()
-
-        def is_closed(self):
-            return True
-
-    temporary = tmp_path / "download.mp4"
-    used = PlaywrightArtifactDownload(object())._download_with_chrome(
-        ClosedPage(), Locator(), temporary
+    destination = tmp_path / "download.mp4"
+    PlaywrightArtifactDownload(type("V", (), {"validate": lambda *_a, **_k: None})())(
+        Page(), Node(), destination
     )
-    assert used is True
-    assert temporary.read_bytes() == b"mp4"
-    assert client.detached is True
+    assert destination.read_bytes() == b"complete-video"
+    assert events
+    assert ("once", "popup") in events
 
 
 def test_engine_submit_renames_before_source_and_generation(tmp_path):

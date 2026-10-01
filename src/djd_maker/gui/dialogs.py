@@ -373,6 +373,11 @@ class JobDetailDialog(QDialog):
         form.addRow("MiB/sec", QLabel(str(job.last_mib_per_sec) if job.last_mib_per_sec is not None else "－"))
         form.addRow("品質threshold", QLabel(str(job.quality_threshold) if job.quality_threshold is not None else "－"))
         form.addRow("品質判定", QLabel(job.last_quality_result or "－"))
+        recoverable = (job.state is JobState.DOWNLOAD_VERIFY_FAILED
+                       and bool(job.notebook_id or job.notebook_url))
+        form.addRow("回収状態", QLabel("再試行可能" if recoverable else "－"))
+        form.addRow("回収失敗理由", QLabel(job.download_failure_reason or "－"))
+        form.addRow("手動保存リトライ", QLabel("可能" if recoverable else "不可"))
         form.addRow("video codec", QLabel(job.video_codec or "－"))
         form.addRow("audio codec", QLabel(job.audio_codec or "－"))
         form.addRow("最終音声位置", QLabel(str(job.last_audio_position_seconds) if job.last_audio_position_seconds is not None else "－"))

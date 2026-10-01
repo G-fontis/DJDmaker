@@ -15,7 +15,7 @@ from djd_maker.adapters.notebook import (
     PlaywrightArtifactDownload,
 )
 from djd_maker.core.repositories import JobRepository, PresetRepository, SettingsRepository
-from djd_maker.core.download_quality import PRODUCTION_QUALITY_PROFILE
+from djd_maker.core.download_quality import load_quality_profile
 from djd_maker.media.raw_store import RawSafeStore
 from djd_maker.media.validator import VideoValidator
 from djd_maker.orchestration.gui_controller import GuiPipelineController
@@ -51,18 +51,25 @@ def build_desktop(
     settings = settings_repository.load()
     from djd_maker.core.cloud_limit import CloudLimitGate
     cloud_limit = CloudLimitGate(root / 'system' / 'cloud-limit.json')
+    from djd_maker.core.download_guard import DownloadLifecycleGuard
+    download_lifecycle = DownloadLifecycleGuard(
+        root / 'system' / 'deferred-download-tasks.json'
+    )
     from djd_maker.core.output_ownership import reconcile_output_ownership
     reconcile_output_ownership(job_repository, _resolved(root, settings.output_directory))
     reconcile_completed_txt(job_repository, _resolved(root, settings.raw_directory))
     browser = browser_manager or BrowserManager(
         root / "browser" / "chrome-profile",
         selector_probe=NotebookDomAdapter.preflight_home_page,
+        lifecycle_guard=download_lifecycle,
     )
+    browser.lifecycle_guard = download_lifecycle
     scheduler = PersistentPollScheduler(
         job_repository,
         first_poll_seconds=settings.first_notebook_check_seconds,
         subsequent_poll_seconds=settings.notebook_poll_seconds,
     )
+    quality_profile = load_quality_profile(root / 'config' / 'download-quality-profile.json')
 
     def make_pipeline(*, require_preset: bool) -> PipelineCoordinator:
         from djd_maker.core.cloud_limit import CloudLimitGate
@@ -90,7 +97,9 @@ def build_desktop(
         notebook = NotebookEngineAdapter(
             NotebookDomAdapter(
                 page,
-                download_handoff=PlaywrightArtifactDownload(validator),
+                download_handoff=PlaywrightArtifactDownload(
+                    validator, lifecycle_guard=download_lifecycle
+                ),
                 interactable_guard=ensure_notebook_interactable,
             ),
             recover_page=browser.restart,
@@ -118,7 +127,7 @@ def build_desktop(
             ending_enabled=current.ending_enabled,
             tail_cut_enabled=current.tail_cut_enabled,
             encode_enabled=current.encode_enabled,
-            download_quality_profile=PRODUCTION_QUALITY_PROFILE,
+            download_quality_profile=quality_profile,
         )
 
     def pipeline_factory() -> PipelineCoordinator:
@@ -141,7 +150,22 @@ def build_desktop(
         scheduler=scheduler,
         manual_login=browser.open_login,
         browser_status_provider=browser.runtime_status,
+        download_lifecycle=download_lifecycle,
     )
+    def publish_download_lifecycle(record: dict[str, object]) -> None:
+        service._runtime_update({
+            **service._runtime,
+            'stage': 'download.transfer',
+            'lifecycle_state': download_lifecycle.state,
+            'active_download_count': download_lifecycle.active_download_count,
+            'message': str(record.get('event', 'download.transfer')),
+            'download_event': dict(record),
+        })
+        service._log_callback({
+            'level': 'INFO', 'stage': 'download.lifecycle',
+            'message': str(record),
+        })
+    download_lifecycle.logger = publish_download_lifecycle
     bridge = AsyncControllerBridge(service)
     service.cloud_limit = cloud_limit
     window = MainWindow(

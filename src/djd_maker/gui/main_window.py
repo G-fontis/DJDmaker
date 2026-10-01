@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.2"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.3"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -104,6 +104,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._current_runtime_status = {}
         self._stopping = False
         self._closing = False
+        self._close_after_download = False
         self._log_dialog = LogDialog(self)
         self._preview_player = EndingPreviewPlayer(
             lambda path: open_local_path(path, parent=self), self
@@ -624,7 +625,11 @@ class MainWindow(Phase2Presentation, QMainWindow):
              if self.settings.hls_zip_enabled else "HLS/ZIP: 設定によりスキップ（対象0件）")
             + (f" / MP4完了: {summary.mp4_complete}" if summary.mp4_complete else '')
         )
-        self.error_label.setText(f"Error: {summary.errors}")
+        self.error_label.setText(
+            f"動画回収済み: {summary.download_complete}/{summary.total} / "
+            f"回収失敗: {summary.errors} / 再回収可能: {summary.recoverable_errors} / "
+            f"Terminal: {summary.terminal_errors}"
+        )
         runtime_id = getattr(self, '_runtime_record', {}).get('job_id')
         current = next((job for job in self.jobs if job.id == runtime_id), None)
         if current is None:
@@ -638,10 +643,8 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.progress_label.setText(
             f"進捗率: {max(0.0, min(100.0, current.progress_percent if current else 0.0)):.0f}%"
         )
-        all_finished = bool(self.jobs) and all(
-            job.state in {JobState.COMPLETED, JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
-            for job in self.jobs
-        )
+        from djd_maker.orchestration.task_discovery import terminal
+        all_finished = bool(self.jobs) and all(terminal(job) for job in self.jobs)
         raw_count = sum(bool(job.raw_path) for job in self.jobs)
         self.completion_label.setText(
             f"全 {summary.total}授業 / 完成 {summary.zip_complete + summary.mp4_complete} / "
@@ -800,7 +803,15 @@ class MainWindow(Phase2Presentation, QMainWindow):
             if not self._runtime_record:
                 self.statusBar().showMessage("認証・プロファイル・Notebookホーム画面を確認しています")
         elif operation == "recover":
-            self.statusBar().showMessage("未回収動画の確認が完了しました")
+            queued = isinstance(_result, dict) and _result.get('queued')
+            self.statusBar().showMessage(
+                "未回収動画の再確認を予約しました" if queued
+                else "未回収動画の確認が完了しました"
+            )
+        elif operation == 'save_retry' and isinstance(_result, dict):
+            self.statusBar().showMessage(
+                f"保存リトライを{len(_result.get('queued', []))}件登録しました。"
+            )
         elif operation == "stop" and self._running:
             self.statusBar().showMessage("停止要求済み。処理の安全な終了を待っています")
         else:
@@ -859,6 +870,8 @@ class MainWindow(Phase2Presentation, QMainWindow):
                         self._deferred_overlays.add(job_id)
                 self._refresh_summary()
             if isinstance(record, dict) and record:
+                if record.get('feedback'):
+                    self.statusBar().showMessage(str(record.get('message', record['feedback'])))
                 if record.get('phase_counts'):
                     self.phase_counts_label.setText(str(record['phase_counts']))
                 if record.get('stage') in {'stop.requested','stop.wait','stop.complete','pause','resume'}:
@@ -900,6 +913,10 @@ class MainWindow(Phase2Presentation, QMainWindow):
             self._update_action_state()
             if status.get('stop_reason'):
                 self.statusBar().showMessage(status['stop_reason']['message'])
+                if (self._close_after_download
+                        and status['stop_reason'].get('code') == 'APP_CLOSE'):
+                    self._close_after_download = False
+                    QTimer.singleShot(0, self.close)
 
     def _render_deferred_overlays(self):
         # Presentation only: never modify Job or paint a failed save as success.
@@ -951,15 +968,16 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.gui_type_switch.setEnabled(not (self._active_run or self._running or self._paused))
         self.start_button.setEnabled(not self._running)
         self.recover_button.setEnabled(
-            not self._running
-            and any(
+            any(
                 job.state
                 in {
                     JobState.RESERVED_WAITING_CREDIT_RESET,
                     JobState.WAITING_VIDEO,
                     JobState.DOWNLOAD_PENDING,
                     JobState.RECOVERY_PENDING,
+                    JobState.DOWNLOAD_VERIFY_FAILED,
                 }
+                or (job.state is JobState.FAILED and bool(job.notebook_id or job.notebook_url))
                 for job in self.jobs
             )
         )
@@ -967,7 +985,14 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.stop_button.setEnabled((self._running or self._paused or self._active_run) and not self._stopping)
         self.login_button.setEnabled(not self._running)
         self.details_button.setEnabled(self._selected_job() is not None)
-        self.save_retry_button.setEnabled(bool(self._checked_job_ids) and not self.controller.busy)
+        checked = [job for job in self.jobs if job.id in self._checked_job_ids]
+        retryable = [job for job in checked if bool(job.notebook_id or job.notebook_url)]
+        self.save_retry_button.setEnabled(bool(retryable) and not self.controller.busy)
+        self.save_retry_button.setToolTip(
+            '選択した既存Notebook動画をDownloadから再保存します。'
+            if retryable else
+            'Notebook動画を確認できるjobを選択してください。'
+        )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._closing:
@@ -980,6 +1005,13 @@ class MainWindow(Phase2Presentation, QMainWindow):
             event.accept()
         else:
             self._closing = False
+            lifecycle = self._current_runtime_status.get('download_lifecycle', {})
+            service = getattr(self.controller, 'controller', None)
+            live_guard = getattr(service, 'download_lifecycle', None)
+            self._close_after_download = bool(
+                lifecycle.get('active_download_count')
+                or (live_guard is not None and live_guard.active_download_count)
+            )
             self.setEnabled(True)
             QMessageBox.warning(
                 self,

@@ -79,7 +79,11 @@ def state_display(job: Job) -> str:
         return '出力競合・要確認（他job継続）'
     if job.state is JobState.COMPLETED:
         return "○ 完成"
-    if job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}:
+    if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
+        if job.error_code == 'DOWNLOAD_RETRY_EXHAUSTED':
+            return '× 自動回収失敗・手動リトライ可能'
+        return '× 回収失敗・再試行可能'
+    if job.state is JobState.FAILED:
         return "× エラー"
     from djd_maker.core.runtime_operation import operation_text
     if job.presentation_stage in {'stop.requested','stop.complete','pause','resume'}:
@@ -126,10 +130,14 @@ class JobSummary:
     zip_complete: int
     errors: int
     mp4_complete: int = 0
+    download_complete: int = 0
+    recoverable_errors: int = 0
+    terminal_errors: int = 0
 
 
 def summarize_jobs(jobs: Iterable[Job]) -> JobSummary:
     values = tuple(jobs)
+    from djd_maker.orchestration.task_discovery import manual_download_recovery_available, terminal
     return JobSummary(
         total=len(values),
         active=sum(job.state in ACTIVE_STATES for job in values),
@@ -137,6 +145,10 @@ def summarize_jobs(jobs: Iterable[Job]) -> JobSummary:
         zip_complete=sum(job.hls_zip_enabled and job.state is JobState.COMPLETED and bool(job.zip_path) for job in values),
         errors=sum(job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED} for job in values),
         mp4_complete=sum(job.state is JobState.COMPLETED and not job.hls_zip_enabled and bool(job.final_mp4_path) for job in values),
+        download_complete=sum(bool(job.raw_path) for job in values),
+        recoverable_errors=sum(manual_download_recovery_available(job) for job in values),
+        terminal_errors=sum(terminal(job) and job.state is not JobState.COMPLETED
+                            and not job.duplicate_of_job_id for job in values),
     )
 
 

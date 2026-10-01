@@ -34,6 +34,7 @@ a = Analysis(
     datas=[
         *playwright_datas,
         (str(PROJECT_ROOT / "config" / "default-settings.json"), "config"),
+        (str(PROJECT_ROOT / "config" / "download-quality-profile.json"), "config"),
         (str(ffmpeg_license), "licenses"),
     ],
     hiddenimports=[
@@ -82,5 +83,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="DJDmaker_Ver2.2",
+    name="DJDmaker_Ver2.3",
 )

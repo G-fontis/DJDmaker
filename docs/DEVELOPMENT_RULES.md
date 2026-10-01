@@ -1,5 +1,11 @@
 # 開発ルール
 
+## Ver2.3 Download完了・Deferred Queue契約
+
+- `DJD-CHAPPY-V23-DOWNLOAD-COMPLETION-DEFERRED-QUEUE-FULL-002`を正本とする。Notebook標準の通常locator clickとPlaywright Download objectを使用し、アプリ側でDownload用`about:blank` keeperを作らない。
+- Download転送中はpage/context/browser close、navigation、次Notebook・次job、phase transition、Stop、App Closeを即実行せず、Error加算なしでDeferred Task Queueへ登録する。`save_as`、失敗確認、サイズ安定、動画検証が終わってactive countが0になった後にpriorityを再計算して解放する。
+- `DOWNLOAD_VERIFY_FAILED`と`DOWNLOAD_RETRY_EXHAUSTED`は回収可能状態であり、正常完了またはterminal failureとして扱わない。既存Notebookを使う保存リトライと未回収チェックを維持し、Notebook再作成・source upload・Preset再送・動画再生成・remote artifact削除を行わない。
+
 ## 別PCでの開発再開
 
 - GitHub `main`をclone/pullした後、Dropboxの`VSCode_local\DJDmaker\manifest.json`と`README_PC_MIGRATION.txt`を確認し、local-onlyデータを安全に復元してから作業を開始する。

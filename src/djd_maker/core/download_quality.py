@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 from statistics import mean, stdev
 from typing import Iterable, Protocol
@@ -48,6 +49,15 @@ class DownloadQualityResult:
     threshold: float
 
 
+def load_quality_profile(path: Path) -> DownloadQualityProfile:
+    """Load the single aggregate production source of truth."""
+    value = json.loads(path.read_text(encoding='utf-8'))
+    profile = DownloadQualityProfile(**value)
+    if profile.sample_count < 2 or profile.lower_3sigma_mib_per_sec <= 0:
+        raise ValueError('download quality profile is invalid')
+    return profile
+
+
 def mib_per_sec(size_bytes: int, duration_seconds: float) -> float:
     if size_bytes < 0 or duration_seconds <= 0:
         raise ValueError('size and duration must be positive')
@@ -89,7 +99,6 @@ def build_quality_profile(paths: Iterable[Path], validator: Validator, *, genera
         size_min_bytes=min(row[0] for row in rows), size_max_bytes=max(row[0] for row in rows),
     )
 
-
 def evaluate_download(path: Path, validator: Validator, profile: DownloadQualityProfile) -> DownloadQualityResult:
     checked = validator.validate(path)
     duration = float(checked.metadata.duration_seconds)
@@ -101,20 +110,3 @@ def evaluate_download(path: Path, validator: Validator, profile: DownloadQuality
         size_bytes=int(checked.size_bytes), duration_seconds=duration,
         mib_per_sec=ratio, threshold=profile.lower_3sigma_mib_per_sec,
     )
-
-
-# Aggregate-only profile measured from 19 validated files in the user-approved
-# Raw_Files directory on 2026-09-30. No filename or media is stored here.
-PRODUCTION_QUALITY_PROFILE = DownloadQualityProfile(
-    sample_count=19,
-    mean_mib_per_sec=0.084634408639,
-    stddev_mib_per_sec=0.015480616842,
-    lower_3sigma_mib_per_sec=0.038192558112,
-    generated_at='2026-09-30T20:58:00+09:00',
-    sample_min_mib_per_sec=0.025949201110,
-    sample_max_mib_per_sec=0.098746173417,
-    duration_min_seconds=370.474376,
-    duration_max_seconds=598.796190,
-    size_min_bytes=14680064,
-    size_max_bytes=58868323,
-)

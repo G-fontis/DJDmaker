@@ -13,6 +13,7 @@ MESSAGES = {
     'CONFIG_FATAL':'設定エラーのため停止しました。',
     'STORAGE_FATAL':'保存領域の致命的なエラーのため停止しました。',
     'RECOVERY_CHECK_FINISHED':'今回の未回収確認を終了しました。未完了jobは保持しています。',
+    'ATTENTION_REQUIRED':'自動処理を終了しましたが、再回収可能なjobがあります。',
 }
 
 @dataclass(frozen=True)

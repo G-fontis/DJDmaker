@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from djd_maker.core.models import JobState
+from djd_maker.core.download_quality import MAX_DOWNLOAD_ATTEMPTS as MAX_QUALITY_DOWNLOAD_ATTEMPTS
 
 RESCAN_SECONDS = 600
 MAX_ERROR_ATTEMPTS = 3
@@ -42,7 +43,24 @@ class Capabilities:
         return cls(not blocked, not blocked, not blocked)
 
 
+def manual_download_recovery_available(job):
+    """A completed remote video can still be recovered after auto exhaustion."""
+    return (job.state is JobState.DOWNLOAD_VERIFY_FAILED
+            and bool(job.notebook_id or job.notebook_url)
+            and not job.duplicate_of_job_id
+            and job.failure_class != 'OUTPUT_BLOCKED'
+            and job.error_code != 'OUTPUT_NAME_COLLISION')
+
+
+def automatic_download_recovery_candidate(job):
+    return (manual_download_recovery_available(job)
+            and job.error_code != 'DOWNLOAD_RETRY_EXHAUSTED'
+            and job.download_attempt_count < MAX_QUALITY_DOWNLOAD_ATTEMPTS)
+
+
 def remote_reconcile_candidate(job):
+    if automatic_download_recovery_candidate(job):
+        return True
     return (job.state is JobState.FAILED and bool(job.notebook_id or job.notebook_url
             or job.error_code == 'NOTEBOOK_STAGE_FAILED')
             and not job.duplicate_of_job_id and job.failure_class != 'OUTPUT_BLOCKED' and job.error_code != 'OUTPUT_NAME_COLLISION'
@@ -50,9 +68,11 @@ def remote_reconcile_candidate(job):
 
 
 def terminal(job):
+    # Download exhaustion is not a normal terminal result: a human can start a
+    # fresh bounded manual session against the same READY artifact.
     return bool(job.duplicate_of_job_id) or job.state is JobState.COMPLETED or (
-        job.error_code == 'DOWNLOAD_RETRY_EXHAUSTED' and job.failure_class == 'TERMINAL_FAILED') or (
         not remote_reconcile_candidate(job) and job.state in {JobState.FAILED,JobState.DOWNLOAD_VERIFY_FAILED} and job.failure_class == 'TERMINAL_FAILED' and
+        not manual_download_recovery_available(job) and
         any(job.attempt_by_stage.get(key,0) >= MAX_ERROR_ATTEMPTS
             for key in ('scheduler.recovery','source.reupload','generation.failed_retry')))
 
@@ -61,12 +81,16 @@ def final_discovery(jobs, now, blocked=False, deferred=()):
     """Conservative complete gate: unknown/blocked/future states are unfinished."""
     values=list(jobs)
     owners={j.id:j for j in values}
-    outstanding=[]; runnable=[]; waiting=[]
+    outstanding=[]; runnable=[]; waiting=[]; attention=[]
     for job in values:
         owner=owners.get(job.duplicate_of_job_id)
         if terminal(job) and (not job.duplicate_of_job_id or owner and not owner.duplicate_of_job_id):
             continue
         outstanding.append(job.id)
+        if manual_download_recovery_available(job) and not automatic_download_recovery_candidate(job):
+            attention.append(job.id)
+            waiting.append(job.id)
+            continue
         local=job.state in {JobState.RAW_READY,JobState.ENDING,JobState.HLS_ENCODING,JobState.ZIPPING}
         remote=job.state in {JobState.GENERATING,JobState.WAITING_VIDEO,JobState.DOWNLOAD_PENDING,
                             JobState.DOWNLOADING,JobState.RECOVERY_PENDING,JobState.RESERVED_WAITING_CREDIT_RESET}
@@ -77,7 +101,8 @@ def final_discovery(jobs, now, blocked=False, deferred=()):
         else:
             waiting.append(job.id)
     return dict(complete=not outstanding and not deferred, unfinished=outstanding,
-                runnable=runnable, waiting=waiting, deferred=list(deferred))
+                runnable=runnable, waiting=waiting, deferred=list(deferred),
+                attention_required=attention)
 
 
 def due(job, now):

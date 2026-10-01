@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import os
+import socket
 import time
 from djd_maker.core.cancellation import checkpoint, current_token, interruptible_sleep
 from .cancellable_browser import wrap
@@ -10,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
 
 NOTEBOOK_HOME_URL = "https://notebook.google.com/"
 PREFLIGHT_CHECKS = (
@@ -78,6 +80,7 @@ class BrowserManager:
         selector_probe: Callable[[Any], bool] | None = None,
         profile_lock_probe: Callable[[Path], bool] | None = None,
         lock_retry_delays: tuple[float, ...] = (0.1, 0.2, 0.4, 0.8),
+        lifecycle_guard: Any | None = None,
     ) -> None:
         self.user_data_dir = user_data_dir.resolve()
         self.headless = headless
@@ -90,8 +93,10 @@ class BrowserManager:
         self._selector_probe = selector_probe
         self._profile_lock_probe = profile_lock_probe or self._default_profile_lock_probe
         self.lock_retry_delays = lock_retry_delays
+        self.lifecycle_guard = lifecycle_guard
         self._guard = threading.RLock()
         self._auth_process: Any = None
+        self._automation_process: Any = None
         self._playwright: Any = None
         self.context: Any = None
         self.browser: Any = None
@@ -273,18 +278,19 @@ class BrowserManager:
             try:
                 self._playwright = self._factory().start()
                 self._automation_owner = threading.get_ident()
-                if os.name == 'nt' and type(self._playwright).__module__.startswith('playwright.sync_api'):
-                    from .owned_process_job import OwnedProcessJob
-                    # PipeTransport owns the driver Process. Capture once before
-                    # Chromium exists; the Job Object then owns all descendants.
-                    driver = self._playwright._impl_obj._connection._transport._proc
-                    self._owned_process_job = OwnedProcessJob(driver.pid)
-                self.context = self._playwright.chromium.launch_persistent_context(
-                    str(self.user_data_dir),
-                    executable_path=str(self.chrome_executable),
-                    headless=self.headless,
-                    accept_downloads=True,
-                )
+                real_playwright = type(self._playwright).__module__.startswith('playwright.sync_api')
+                if real_playwright:
+                    self.context = self._connect_normal_chrome_over_cdp()
+                else:
+                    # Test/injected factories keep the small established
+                    # launch contract; production uses the normal-Chrome CDP
+                    # handoff above.
+                    self.context = self._playwright.chromium.launch_persistent_context(
+                        str(self.user_data_dir),
+                        executable_path=str(self.chrome_executable),
+                        headless=self.headless,
+                        accept_downloads=True,
+                    )
                 if current_token() is not None:
                     self.context = wrap(self.context)
                 self.context.set_default_timeout(self.timeout_ms)
@@ -300,6 +306,51 @@ class BrowserManager:
         if last_error is not None and self._profile_lock_failure(last_error):
             raise BrowserProfileLocked("専用profileが別のChromeで使用中です") from last_error
         raise BrowserConnectionError("automation Chromeの起動に失敗しました") from last_error
+
+    def _connect_normal_chrome_over_cdp(self) -> Any:
+        """Launch ordinary dedicated-profile Chrome, then attach Playwright.
+
+        Chrome 153/154 crashes in its native download popup when launched via
+        Playwright's remote-debugging pipe. The same native popup and Download
+        object complete normally when an ordinary Chrome process is attached
+        over CDP, matching GNBCreator's proven browser handoff.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        command = [
+            str(self.chrome_executable),
+            f"--user-data-dir={self.user_data_dir}",
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--no-first-run",
+            NOTEBOOK_HOME_URL,
+        ]
+        if self.headless:
+            command.insert(-1, "--headless=new")
+        self._automation_process = subprocess.Popen(command, shell=False)
+        if os.name == 'nt':
+            from .owned_process_job import OwnedProcessJob
+            # Assign immediately, before Chrome has time to create its renderer
+            # descendants. Human AUTH Chrome is never assigned to this job.
+            self._owned_process_job = OwnedProcessJob(self._automation_process.pid)
+        endpoint = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + max(10.0, self.timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if self._automation_process.poll() is not None:
+                raise BrowserConnectionError("automation Chrome exited before CDP attach")
+            try:
+                with urlopen(endpoint + "/json/version", timeout=1):
+                    break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise BrowserConnectionError("automation Chrome CDP endpoint timed out")
+        self.browser = self._playwright.chromium.connect_over_cdp(endpoint)
+        contexts = list(self.browser.contexts)
+        if not contexts:
+            raise BrowserConnectionError("automation Chrome context was not found")
+        return contexts[0]
 
     @staticmethod
     def _context_alive(context: Any) -> bool:
@@ -434,9 +485,31 @@ class BrowserManager:
             "preflight_checks": dict(self._preflight_checks),
         }
 
-    def _stop_automation(self) -> None:
+    def _stop_automation(
+        self,
+        *,
+        reason_code: str = "AUTOMATION_CLEANUP",
+        caller: str = "BrowserManager._stop_automation",
+        _released: bool = False,
+    ) -> bool:
+        lifecycle = self.lifecycle_guard
+        if lifecycle is not None and lifecycle.active_download_count and not _released:
+            from djd_maker.core.download_guard import DeferredTaskType
+            lifecycle.defer(
+                DeferredTaskType.AUTOMATION_CLEANUP,
+                command_id=f"{reason_code}:{caller}",
+                callback=lambda: self._stop_automation(
+                    reason_code=reason_code, caller=caller, _released=True
+                ),
+            )
+            lifecycle.record(
+                "CLOSE_DEFERRED", reason_code=reason_code, caller=caller,
+                job_id=None,
+            )
+            return False
         context = self.context
         playwright = self._playwright
+        automation_process = self._automation_process
         if (context is not None or playwright is not None) and self._automation_owner not in {None, threading.get_ident()}:
             raise BrowserStartError('BROWSER_THREAD_OWNERSHIP: cleanup must run on the owning worker')
         owned = self._owned_process_job
@@ -448,6 +521,7 @@ class BrowserManager:
         self.browser = None
         self._managed_page = None
         self._playwright = None
+        self._automation_process = None
         self._automation_owner = None
         if context is not None:
             try:
@@ -459,6 +533,15 @@ class BrowserManager:
                 playwright.stop()
             except Exception:
                 pass
+        if automation_process is not None and automation_process.poll() is None:
+            try:
+                automation_process.terminate()
+                automation_process.wait(timeout=5)
+            except Exception:
+                try:
+                    automation_process.kill()
+                except Exception:
+                    pass
         if watchdog:
             watchdog.cancel()
             watchdog.join()
@@ -474,6 +557,12 @@ class BrowserManager:
             finally:
                 owned.close()
                 self._owned_process_job = None
+        if lifecycle is not None:
+            lifecycle.record(
+                "BROWSER_CLOSED", reason_code=reason_code, caller=caller,
+                job_id=None,
+            )
+        return True
 
     def abort_owned_automation(self) -> None:
         """OS-only timeout fallback; safe from a non-Playwright thread."""
@@ -487,11 +576,27 @@ class BrowserManager:
                 'owned_driver_pid': owned.pid if owned else None,
                 'owned_processes': owned.active_processes() if owned else self._last_owned_process_count}
 
-    def stop(self) -> None:
+    def stop(self, *, _released: bool = False) -> None:
         with self._guard:
+            lifecycle = self.lifecycle_guard
+            if lifecycle is not None and lifecycle.active_download_count and not _released:
+                from djd_maker.core.download_guard import DeferredTaskType
+                lifecycle.defer(
+                    DeferredTaskType.BROWSER_CLOSE,
+                    command_id="BrowserManager.stop",
+                    callback=lambda: self.stop(_released=True),
+                )
+                lifecycle.record(
+                    "CLOSE_DEFERRED", reason_code="BROWSER_CLOSE",
+                    caller="BrowserManager.stop", job_id=None,
+                )
+                return
             auth_process = self._auth_process
             self._auth_process = None
-            self._stop_automation()
+            self._stop_automation(
+                reason_code="BROWSER_CLOSE", caller="BrowserManager.stop",
+                _released=_released,
+            )
             if auth_process is not None and auth_process.poll() is None:
                 try:
                     auth_process.terminate()

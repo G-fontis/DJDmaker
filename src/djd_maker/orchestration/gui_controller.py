@@ -35,6 +35,7 @@ class GuiPipelineController:
         settings_provider: Callable[[], AppSettings] | None = None,
         manual_login: Callable[[], Any] | None = None,
         browser_status_provider: Callable[[], dict[str, object]] | None = None,
+        download_lifecycle: Any | None = None,
         cycle_interval_seconds: float = 0.25,
     ) -> None:
         if cycle_interval_seconds <= 0:
@@ -53,12 +54,14 @@ class GuiPipelineController:
         self.settings_provider = settings_provider
         self.manual_login = manual_login
         self.browser_status_provider = browser_status_provider
+        self.download_lifecycle = download_lifecycle
         self.scheduler = scheduler
         if self.pipeline is not None:
             self.pipeline.scheduler = scheduler
         self.cycle_interval_seconds = cycle_interval_seconds
         self.cancellation = CancellationToken()
         self._stop_event = self.cancellation.event
+        self._command_wake = threading.Event()
         self._guard = threading.RLock()
         self._worker: threading.Thread | None = None
         self._retiring_worker: threading.Thread | None = None
@@ -80,6 +83,16 @@ class GuiPipelineController:
         self._job_callback = lambda _job: None
         self._job_updates_bound = False
         self._job_snapshots = {job.id:job for job in self.jobs.list()}
+        if self.download_lifecycle is not None:
+            from djd_maker.core.download_guard import DeferredTaskType
+            self.download_lifecycle.register_handler(
+                DeferredTaskType.MANUAL_SAVE_RETRY,
+                lambda task: self.manual_save_retry([task.job_id] if task.job_id else []),
+            )
+            self.download_lifecycle.register_handler(
+                DeferredTaskType.UNRECOVERED_SCAN,
+                lambda _task: self.recover_pending(),
+            )
 
     def bind_job(self, callback) -> None:
         self._job_callback = callback
@@ -215,6 +228,7 @@ class GuiPipelineController:
                 self.pipeline = None
             self._paused = False
             self.cancellation.reset()
+            self._command_wake.clear()
             self._stop_reason = None
             self._stop_request_reason = None
             self._phase = "preflight" if self.pipeline_factory is not None else "processing"
@@ -227,6 +241,31 @@ class GuiPipelineController:
         return self.status()
 
     def recover_pending(self) -> dict[str, object]:
+        lifecycle = self.download_lifecycle
+        if lifecycle is not None and lifecycle.active_download_count:
+            from djd_maker.core.download_guard import DeferredTaskType
+            lifecycle.defer(
+                DeferredTaskType.UNRECOVERED_SCAN,
+                command_id='unrecovered-scan',
+            )
+            self._runtime_update({
+                'stage': 'unrecovered.scan.queued',
+                'message': '動画保存完了後に未回収動画を再確認します。',
+            })
+            return {'queued': True, 'feedback': 'UNRECOVERED_SCAN_DEFERRED'}
+        with self._guard:
+            active = self._worker is not None and self._worker.is_alive()
+            pipeline = self.pipeline
+        if active:
+            if pipeline is None:
+                raise RuntimeError('pipeline is not ready')
+            pipeline.request_unrecovered_scan()
+            self._command_wake.set()
+            self._runtime_update({
+                'stage': 'unrecovered.scan.queued',
+                'message': '未回収動画の再確認を予約しました。',
+            })
+            return {'queued': True, 'feedback': 'UNRECOVERED_SCAN_STARTED'}
         with cancellation_scope(self.cancellation):
             return self._recover_pending_cancellable()
 
@@ -306,20 +345,61 @@ class GuiPipelineController:
 
     def request_pause(self) -> None:
         self.cancellation.request_pause()
+        self._command_wake.set()
 
     def resume(self) -> dict[str, object]:
         return self.start()
 
-    def request_stop(self) -> None:
-        if self._stop_request_reason is None:
-            self._stop_request_reason = 'USER_STOP'
+    def _release_lifecycle_stop(self, reason: str) -> None:
+        # shutdown() establishes APP_CLOSE before delegating to stop(); the
+        # latter's default USER_STOP must never erase that distinct reason.
+        if self._stop_request_reason != 'APP_CLOSE':
+            self._stop_request_reason = reason
+        reason = self._stop_request_reason or reason
         self.scheduler.stop()
         self.cancellation.request()
+        self._command_wake.set()
         self._phase = 'STOP_REQUESTED'
-        self._runtime_update({**self._runtime, 'stage': 'stop.requested'})
+        self._runtime_update({
+            **self._runtime,
+            'stage': 'stop.requested',
+            'lifecycle_state': reason,
+            'message': '動画保存完了後の安全な停止を開始します。',
+        })
+
+    def request_stop(self, reason: str = 'USER_STOP') -> bool:
+        lifecycle = self.download_lifecycle
+        if lifecycle is not None and lifecycle.active_download_count:
+            from djd_maker.core.download_guard import DeferredTaskType
+            task_type = (
+                DeferredTaskType.APP_CLOSE if reason == 'APP_CLOSE'
+                else DeferredTaskType.USER_STOP
+            )
+            lifecycle.defer(
+                task_type,
+                command_id=reason,
+                callback=lambda: self._release_lifecycle_stop(reason),
+            )
+            self._stop_request_reason = reason
+            self._phase = f'{reason}_WAITING_DOWNLOAD'
+            self._runtime_update({
+                **self._runtime,
+                'stage': 'download.lifecycle.wait',
+                'lifecycle_state': self._phase,
+                'message': '動画保存中です。ダウンロード完了後に停止します。',
+                'active_download_count': lifecycle.active_download_count,
+            })
+            self._publish_status()
+            return False
+        if self._stop_request_reason is None:
+            self._stop_request_reason = reason
+        self._release_lifecycle_stop(reason)
+        return True
 
     def stop(self) -> dict[str, object]:
-        self.request_stop()
+        immediate = self.request_stop()
+        if not immediate:
+            return self.status()
         self._runtime_update({**self._runtime, 'stage': 'stop.wait'})
         with self._guard:
             worker = self._worker or self._retiring_worker
@@ -349,6 +429,10 @@ class GuiPipelineController:
 
     def shutdown(self) -> None:
         self._stop_request_reason = 'APP_CLOSE'
+        lifecycle = self.download_lifecycle
+        if lifecycle is not None and lifecycle.active_download_count:
+            self.request_stop('APP_CLOSE')
+            raise RuntimeError('動画保存中です。ダウンロード完了後にアプリを終了します。')
         result = self.stop()
         if result["running"]:
             self._log_callback({'level':'ERROR', 'stage':'shutdown-timeout', 'message':json.dumps(self.cancellation.diagnostic())})
@@ -396,6 +480,21 @@ class GuiPipelineController:
     def manual_save_retry(self, job_ids: list[str]) -> list[str]:
         if not job_ids:
             raise ValueError('保存リトライするjobを選択してください。')
+        lifecycle = self.download_lifecycle
+        if lifecycle is not None and lifecycle.active_download_count:
+            from djd_maker.core.download_guard import DeferredTaskType
+            for job_id in job_ids:
+                lifecycle.defer(
+                    DeferredTaskType.MANUAL_SAVE_RETRY,
+                    job_id=job_id,
+                    command_id=f'manual-save-retry:{job_id}',
+                )
+            self._runtime_update({
+                'stage': 'manual.download.queued',
+                'message': f'動画保存完了後に保存リトライを{len(job_ids)}件実行します。',
+                'feedback': 'SAVE_RETRY_DEFERRED',
+            })
+            return {'queued': list(job_ids), 'rejected': {}}
         current = self.settings_provider() if self.settings_provider else self.settings
         config = (current.ending_enabled, current.tail_cut_enabled,
                   current.encode_enabled, current.hls_zip_enabled)
@@ -405,12 +504,17 @@ class GuiPipelineController:
         if active:
             if pipeline is None:
                 raise RuntimeError('pipeline is not ready')
-            pipeline.enqueue_manual_save_retry(
+            outcome = pipeline.enqueue_manual_save_retry(
                 job_ids, ending_enabled=config[0], tail_cut_enabled=config[1],
                 encode_enabled=config[2], hls_zip_enabled=config[3])
+            self._command_wake.set()
+            queued = len(outcome['queued'])
+            rejected = len(outcome['rejected'])
             self._runtime_update({'stage': 'manual.download.queued',
-                                  'message': f'保存リトライを予約しました: {len(job_ids)}件'})
-            return job_ids
+                                  'message': f'保存リトライを{queued}件登録しました。'
+                                             + (f' 登録不可: {rejected}件' if rejected else ''),
+                                  'feedback': 'SAVE_RETRY_QUEUED' if queued else 'SAVE_RETRY_REJECTED'})
+            return outcome
         factory = self.recovery_pipeline_factory
         if factory is None:
             raise RuntimeError('manual retry pipeline is not configured')
@@ -421,6 +525,9 @@ class GuiPipelineController:
             pipeline.job_callback = self._job_update
             pipeline.begin_run()
             try:
+                self._runtime_update({'stage': 'manual.download.queued',
+                    'message': f'保存リトライを{len(job_ids)}件登録しました。',
+                    'feedback': 'SAVE_RETRY_QUEUED'})
                 result = pipeline.run_manual_save_retry(job_ids, config)
             finally:
                 with cancellation_scope(None):
@@ -516,16 +623,31 @@ class GuiPipelineController:
                     discover = getattr(self.pipeline,'final_discovery',None)
                     scan = discover() if callable(discover) else final_discovery(
                         self.jobs.list(),datetime.now(UTC),False,getattr(self.pipeline,'deferred_ids',set()))
+                    lifecycle = self.download_lifecycle
+                    if lifecycle is not None and (
+                        lifecycle.active_download_count or lifecycle.pending
+                    ):
+                        scan = dict(scan)
+                        scan['complete'] = False
+                        scan['runnable'] = True
+                        scan['download_lifecycle_pending'] = len(lifecycle.pending)
                     self.final_discovery_result = scan
                     if scan['complete']:
                         self._set_stop_reason('ALL_TASKS_COMPLETED')
+                        break
+                    if not scan['runnable'] and scan.get('attention_required'):
+                        self._set_stop_reason(
+                            'ATTENTION_REQUIRED',
+                            f"{len(scan['attention_required'])}件の動画回収に失敗しています。保存リトライを実行できます。",
+                        )
                         break
                     if not scan['runnable']:
                         self._runtime_update({**self._runtime,'stage':'scheduler.wait',
                             'message':'現在実行可能なjobがないため、次回確認まで待機しています。',
                             'wait_reason':'NO_RUNNABLE_TASK_WAIT'})
                 interval = getattr(self.pipeline, 'wait_seconds', 0) or self.cycle_interval_seconds
-                self.cancellation.wait(interval)
+                self._command_wake.wait(interval)
+                self._command_wake.clear()
         except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError) as exc:
             from djd_maker.core.stop_reason import exception_reason
             self._set_stop_reason(exception_reason(exc),str(exc))
@@ -592,6 +714,15 @@ class GuiPipelineController:
             "scheduler": dict(getattr(self.pipeline, 'scheduler_view', {})),
             "next_check": "－" if remaining is None else f"{max(0, int(remaining))}秒",
             "phase": self._phase,
+            "download_lifecycle": {
+                "state": self.download_lifecycle.state,
+                "active_download_count": self.download_lifecycle.active_download_count,
+                "deferred_task_count": len(self.download_lifecycle.pending),
+                "deferred_tasks": [task.task_type for task in self.download_lifecycle.pending],
+            } if self.download_lifecycle is not None else {
+                "state": "IDLE", "active_download_count": 0,
+                "deferred_task_count": 0, "deferred_tasks": [],
+            },
             "runtime": dict(self._runtime),
             "stop_reason": self._stop_reason.to_dict() if self._stop_reason else None,
             "last_task": self._last_task,

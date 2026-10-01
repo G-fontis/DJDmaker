@@ -157,11 +157,24 @@ class DownloadHandoff(Protocol):
 class PlaywrightArtifactDownload:
     """Download one already-scoped artifact and publish only after validation."""
 
-    def __init__(self, validator: VideoValidator, timeout_ms: int = 120_000) -> None:
+    def __init__(
+        self,
+        validator: VideoValidator,
+        timeout_ms: int = 120_000,
+        *,
+        lifecycle_guard: Any | None = None,
+    ) -> None:
         self.validator = validator
         self.timeout_ms = timeout_ms
+        self.lifecycle_guard = lifecycle_guard
 
-    def __call__(self, page: Any, artifact_card: Any, destination: Path) -> Path:
+    def __call__(self, page: Any, artifact_card: Any, destination: Path, *, job_id: str | None = None) -> Path:
+        if self.lifecycle_guard is not None:
+            with self.lifecycle_guard.transfer(job_id):
+                return self._transfer(page, artifact_card, destination)
+        return self._transfer(page, artifact_card, destination)
+
+    def _transfer(self, page: Any, artifact_card: Any, destination: Path) -> Path:
         destination = destination.resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
@@ -169,29 +182,34 @@ class PlaywrightArtifactDownload:
         temporary = destination.with_name(
             f".{destination.name}.{uuid4().hex}.download.mp4"
         )
-        keeper = None
-        context = getattr(page, "context", None)
         try:
-            if context is not None and len(getattr(context, "pages", ())) == 1:
-                keeper = context.new_page()
-            artifact_card.get_by_role("button", name="その他", exact=True).click()
+            more_button = artifact_card.get_by_role(
+                "button", name="その他", exact=True
+            )
+            more_button.wait_for(state="visible", timeout=self.timeout_ms)
+            # Use the same trusted, actionability-checked click as a person.
+            more_button.click()
             item = page.get_by_role("menuitem", name="ダウンロード", exact=True)
             item.wait_for(state="visible", timeout=self.timeout_ms)
-            # Prefer Playwright's completed Download promise. Live evidence on
-            # 2026-09-30 showed the legacy CDP path could leave a stable
-            # .crdownload forever without a completed progress event. The
-            # standard Download object remains valid while the keeper page
-            # holds the context and save_as waits for browser completion.
-            if hasattr(page, 'expect_download'):
-                with page.expect_download(timeout=self.timeout_ms) as info:
-                    item.click()
-                download = info.value
-                failure = download.failure()
-                if failure:
-                    raise NotebookAdapterError(f"artifact download failed: {failure}")
-                download.save_as(str(temporary))
-            elif not self._download_with_chrome(page, item, temporary):
+            if not hasattr(page, 'expect_download'):
                 raise NotebookAdapterError('browser download completion mechanism is unavailable')
+            # Capture Notebook's native popup and Playwright Download object.
+            # Do not close any page/context/browser until failure(), save_as(),
+            # and the stable-file gate have all completed.
+            popup: list[Any] = []
+            if hasattr(page, 'once'):
+                page.once('popup', lambda value: popup.append(value))
+            with page.expect_download(timeout=self.timeout_ms) as info:
+                item.click()
+            download = info.value
+            # Claim the destination immediately. save_as() is explicitly safe
+            # while transfer is in progress and blocks until the browser has
+            # completed the copy. Waiting on failure() first left Chrome's
+            # short-lived native popup with no retained save operation.
+            download.save_as(str(temporary))
+            failure = download.failure()
+            if failure:
+                raise NotebookAdapterError(f"artifact download failed: {failure}")
             # Completion and media quality are separate gates. Publish only a
             # browser-complete, size-stable, ffprobe-valid payload. The
             # pipeline repeats validation and owns the statistical retry
@@ -206,86 +224,6 @@ class PlaywrightArtifactDownload:
             return destination
         finally:
             temporary.unlink(missing_ok=True)
-            if keeper is not None and not getattr(page, "is_closed", lambda: False)():
-                try:
-                    keeper.close()
-                except Exception:
-                    pass
-
-    def _download_with_chrome(self, page: Any, item: Any, temporary: Path) -> bool:
-        """Use GNBCreator's CDP download path when Notebook closes its tab."""
-
-        context = getattr(page, "context", None)
-        if context is None or not hasattr(context, "new_cdp_session"):
-            return False
-        download_dir = temporary.parent / f".gnb-download-{uuid4().hex}"
-        download_dir.mkdir()
-        client = None
-        clicked = False
-        progress: dict[str, object] = {}
-        stable_size: int | None = None
-        stable_since: float | None = None
-        try:
-            client = context.new_cdp_session(page)
-            client.on("Browser.downloadProgress", lambda event: progress.update(event))
-            client.send(
-                "Browser.setDownloadBehavior",
-                {
-                    "behavior": "allow",
-                    "downloadPath": str(download_dir),
-                    "eventsEnabled": True,
-                },
-            )
-            item.click()
-            clicked = True
-            deadline = active_monotonic() + self.timeout_ms / 1000
-            while active_monotonic() < deadline:
-                files = [candidate for candidate in download_dir.iterdir() if candidate.is_file()]
-                completed = [
-                    candidate
-                    for candidate in files
-                    if not candidate.name.endswith(".crdownload")
-                ]
-                if progress.get("state") == "canceled":
-                    raise NotebookAdapterError("Chrome download was canceled")
-                if completed:
-                    self._wait_stable_size(completed[0])
-                    if progress.get("state") not in {None, "completed"}:
-                        continue
-                    completed[0].replace(temporary)
-                    return True
-                partials = [
-                    candidate
-                    for candidate in files
-                    if candidate.name.endswith(".crdownload")
-                ]
-                if partials:
-                    current_size = partials[0].stat().st_size
-                    if current_size != stable_size:
-                        stable_size = current_size
-                        stable_since = active_monotonic()
-                    # A stable .crdownload is still incomplete. The previous
-                    # page-close fallback promoted it and caused truncated MP4s.
-                try:
-                    page.wait_for_timeout(100)
-                except Exception:
-                    time.sleep(0.1)
-            raise NotebookAdapterError("Chrome download timed out")
-        except Exception:
-            if not clicked:
-                return False
-            raise
-        finally:
-            if client is not None:
-                try:
-                    client.detach()
-                except Exception:
-                    pass
-            try:
-                download_dir.rmdir()
-            except OSError:
-                # Preserve a partial download for diagnosis.
-                pass
 
     @staticmethod
     def _wait_stable_size(path: Path, *, stable_seconds: float = 1.0) -> int:
@@ -1233,7 +1171,9 @@ class NotebookDomAdapter:
             return RemoteVideoStatus.NOT_STARTED
         return RemoteVideoStatus.NOT_STARTED if not text else RemoteVideoStatus.UNKNOWN
 
-    def download_artifact(self, artifact_title: str, destination: Path) -> Path:
+    def download_artifact(
+        self, artifact_title: str, destination: Path, *, job_id: str | None = None
+    ) -> Path:
         self.ensure_interactable()
         if self.download_handoff is None:
             raise NotebookAdapterError("download handoffが設定されていません")
@@ -1250,21 +1190,26 @@ class NotebookDomAdapter:
             except Exception:
                 time.sleep(2)
             all_cards = self.page.locator("artifact-library-item")
-        cards = all_cards.filter(has_text=artifact_title)
-        if cards.count() == 1:
-            target = cards.first
-        else:
-            # GNBCreator's proven fallback: generated artifact titles do not
-            # necessarily equal the Notebook title, so accept only the sole
-            # card with a verified Play control.
-            try:
-                target, _title_scoped = self._playable_artifact(artifact_title)
-            except DomMismatchError:
-                self.diagnostic("DOM_MISMATCH:download_artifact_not_unique")
-                raise DomMismatchError(
-                    "download対象動画artifactを一意に特定できません"
-                ) from None
-        return self.download_handoff(self.page, target, destination)
+        # Do not carry a live ``filter(has_text=...)`` locator into the click.
+        # Notebook can normalize/update the generated title after the count,
+        # causing that locator to become empty between selection and click.
+        # Resolve a stable card index and require a visible Play control.
+        try:
+            target, _title_scoped = self._stable_playable_artifact(artifact_title)
+        except DomMismatchError:
+            self.diagnostic("DOM_MISMATCH:download_artifact_not_unique")
+            raise DomMismatchError(
+                "download対象動画artifactを一意に特定できません"
+            ) from None
+        try:
+            return self.download_handoff(
+                self.page, target, destination, job_id=job_id
+            )
+        except TypeError as exc:
+            # Preserve third-party/test handoffs using the original protocol.
+            if "job_id" not in str(exc):
+                raise
+            return self.download_handoff(self.page, target, destination)
 
     @staticmethod
     def _visible(locator: Any, timeout: int = 300) -> bool:
@@ -1311,6 +1256,34 @@ class NotebookDomAdapter:
             raise DomMismatchError("video artifact scope could not be inspected") from exc
         self.diagnostic("DOM_MISMATCH:delete_artifact_not_unique")
         raise DomMismatchError("delete target is not exactly one playable video artifact")
+
+    def _stable_playable_artifact(self, artifact_title: str) -> tuple[Any, bool]:
+        """Resolve a card by index so a later Angular title update cannot unmatch it."""
+        cards = self.page.locator("artifact-library-item")
+        try:
+            playable: list[tuple[Any, bool]] = []
+            expected = self._normalize_text(artifact_title)
+            for index in range(cards.count()):
+                card = cards.nth(index)
+                if any(
+                    self._visible(card.get_by_role("button", name=name, exact=True))
+                    for name in ("再生", "Play")
+                ):
+                    try:
+                        title_scoped = expected in self._normalize_text(card.inner_text())
+                    except Exception:
+                        title_scoped = False
+                    playable.append((card, title_scoped))
+            title_matches = [item for item in playable if item[1]]
+            if len(title_matches) == 1:
+                return title_matches[0]
+            if len(playable) == 1:
+                return playable[0]
+        except Exception as exc:
+            self.diagnostic("DOM_MISMATCH:artifact_scope_inspection")
+            raise DomMismatchError("video artifact scope could not be inspected") from exc
+        self.diagnostic("DOM_MISMATCH:download_artifact_not_unique")
+        raise DomMismatchError("download target is not exactly one playable video artifact")
 
     def _wait_for_artifact_cards(self) -> None:
         """Wait for GNBCreator's delayed Studio artifact mount after navigation."""
@@ -1807,7 +1780,14 @@ class NotebookEngineAdapter:
             checkpoint('download.retry.reload')
             self.dom.page.reload(wait_until='domcontentloaded')
             self.dom.ensure_interactable()
-        return self.dom.download_artifact(job.script_name, destination)
+        try:
+            return self.dom.download_artifact(
+                job.script_name, destination, job_id=job.id
+            )
+        except TypeError as exc:
+            if "job_id" not in str(exc):
+                raise
+            return self.dom.download_artifact(job.script_name, destination)
 
     def delete_video_artifact(self, job: Job, gate: DownloadSafetyGate) -> None:
         self._open_job(job)

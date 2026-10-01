@@ -185,7 +185,7 @@ def test_invalid_deadline_is_diagnosed_not_waited_forever(tmp_path):
     assert repo.get(job.id).state is JobState.WAITING_VIDEO
 
 
-def test_failed_raw_validation_has_bounded_automatic_retry(tmp_path):
+def test_failed_raw_validation_remains_recoverable_not_generic_terminal(tmp_path):
     from test_pipeline import RejectingRawStore
     job = Job('invalid-raw.txt', state=JobState.DOWNLOAD_VERIFY_FAILED,
         notebook_id='old', notebook_url='https://notebook.google.com/notebook/old')
@@ -194,12 +194,14 @@ def test_failed_raw_validation_has_bounded_automatic_retry(tmp_path):
     pipe.raw_store = RejectingRawStore()
     clock = [NOW]
     pipe.cloud_limit.clock = lambda: clock[0]
-    for attempt in range(1, 4):
+    for _attempt in range(1, 4):
         pipe.run_cycle()
-        assert repo.get(job.id).attempt_by_stage['scheduler.recovery'] == attempt
-        assert not repo.get(job.id).raw_path
+        saved = repo.get(job.id)
+        assert saved.attempt_by_stage.get('scheduler.recovery', 0) == 0
+        assert saved.failure_class != 'TERMINAL_FAILED'
+        assert not saved.raw_path
         clock[0] += timedelta(seconds=601)
-    assert repo.get(job.id).failure_class == 'TERMINAL_FAILED'
+    assert repo.get(job.id).state in {JobState.DOWNLOAD_VERIFY_FAILED, JobState.WAITING_VIDEO}
 
 
 def test_explicit_collection_command_also_works_during_chat_limit(tmp_path):

@@ -13,6 +13,15 @@ from djd_maker.core.repositories import SettingsRepository
 from djd_maker.core.settings import AppSettings
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _install_quality_profile(root: Path) -> None:
+    target = root / "config" / "download-quality-profile.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes((PROJECT_ROOT / "config" / target.name).read_bytes())
+
+
 class BrowserMustStayLazy:
     def __init__(self) -> None:
         self.started = False
@@ -36,13 +45,14 @@ class BrowserMustStayLazy:
 
 
 def test_real_composition_opens_gui_before_browser_or_ending_configuration(tmp_path: Path) -> None:
+    _install_quality_profile(tmp_path)
     application = QApplication.instance() or QApplication([])
     browser = BrowserMustStayLazy()
     _app, window, service = build_desktop(
         tmp_path, qt_app=application, browser_manager=browser  # type: ignore[arg-type]
     )
 
-    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver2.2"
+    assert window.windowTitle() == "台本から授業動画つくるマシーン Ver2.3"
     assert not browser.started
     assert window.start_button.isEnabled()
     window.close()
@@ -51,6 +61,7 @@ def test_real_composition_opens_gui_before_browser_or_ending_configuration(tmp_p
 
 
 def test_missing_preset_preflight_stops_before_browser_and_notebook(tmp_path: Path) -> None:
+    _install_quality_profile(tmp_path)
     application = QApplication.instance() or QApplication([])
     ending = tmp_path / "ending.mp4"
     ending.write_bytes(b"ending")
