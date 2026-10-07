@@ -37,18 +37,22 @@ def _browser_smoke(report_path: Path) -> int:
     if os.environ.get("DJD_PACKAGING_SMOKE") != "1":
         return 3
     from djd_maker.adapters.browser import BrowserManager
+    from djd_maker.adapters import browser as browser_module
     from djd_maker.packaging.preflight import application_root
 
     manager = BrowserManager(
         application_root() / "browser" / "chrome-profile",
         headless=True,
     )
+    original_home = browser_module.NOTEBOOK_HOME_URL
+    browser_module.NOTEBOOK_HOME_URL = 'data:text/html,<title>Portable browser fixture</title>'
     try:
         page = manager.start()
         page.set_content("<title>DJD portable browser smoke</title><p>ok</p>")
         passed = page.title() == "DJD portable browser smoke"
     finally:
         manager.stop()
+        browser_module.NOTEBOOK_HOME_URL = original_home
     report_path.write_text(
         json.dumps({"passed": passed, "title": "DJD portable browser smoke"}),
         encoding="utf-8",
@@ -89,6 +93,12 @@ def _preset_smoke(report_path: Path) -> int:
 
 
 def _dispatch() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-download-completion-smoke':
+        from djd_maker.packaging.download_completion_smoke import run_download_completion_smoke
+        return run_download_completion_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-human-modal-smoke':
+        from djd_maker.packaging.human_modal_smoke import run_human_modal_smoke
+        return run_human_modal_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) == 4 and sys.argv[1] == '--packaging-hls-optional-smoke':
         from djd_maker.packaging.hls_optional_smoke import run_hls_optional_smoke
         return run_hls_optional_smoke(Path(sys.argv[2]), Path(sys.argv[3]))

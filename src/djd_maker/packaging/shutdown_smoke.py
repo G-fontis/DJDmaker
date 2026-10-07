@@ -12,13 +12,18 @@ def run_shutdown_smoke(root: Path, report: Path) -> int:
     from PySide6.QtCore import QTimer
     from djd_maker.gui.app import build_desktop
     from djd_maker.adapters.browser import BrowserManager
+    from djd_maker.adapters import browser as browser_module
     from djd_maker.adapters.notebook_modal import ensure_notebook_interactable
     from djd_maker.core.cancellation import interruptible_sleep
     from djd_maker.core.models import Job
 
     root=root.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    from .acceptance_assets import initialize_fixture_assets
+    initialize_fixture_assets(root)
     browser=BrowserManager(root/'browser'/'chrome-profile',headless=True)
+    original_home=browser_module.NOTEBOOK_HOME_URL
+    browser_module.NOTEBOOK_HOME_URL='data:text/html,<title>Shutdown fixture</title>'
     app,window,service=build_desktop(root,browser_manager=browser)
     app.setQuitOnLastWindowClosed(False)
     ending=root/'ending-fixture.mp4'
@@ -72,6 +77,7 @@ def run_shutdown_smoke(root: Path, report: Path) -> int:
     QTimer.singleShot(200,window.start_processing)
     app.exec();timer.stop()
     service.shutdown()
+    browser_module.NOTEBOOK_HOME_URL=original_home
     passed=(len(results)==2 and all(r['seconds']<10 and r['owned_job_closed'] and r['owned_processes']==0
             and r['cancellation']['navigation_count_before']==r['cancellation']['navigation_count_after'] for r in results)
             and not errors and len([e for e in events if e.startswith('MODAL_DISMISSED')])==2)

@@ -25,6 +25,7 @@ class CancellationToken:
         self.paused = threading.Event()
         self._pause_started = None
         self._pause_duration = 0.0
+        self._human_wait_duration = 0.0
 
     def request_pause(self):
         with self._condition:
@@ -64,6 +65,7 @@ class CancellationToken:
             self.paused.clear()
             self._pause_started = None
             self._pause_duration = 0.0
+            self._human_wait_duration = 0.0
             self._condition.notify_all()
 
     def check(self, operation=None):
@@ -111,7 +113,24 @@ def active_monotonic():
     if token is None:
         return now
     with token._lock:
-        return now - token._pause_duration - (now-token._pause_started if token._pause_started is not None else 0)
+        return now - token._pause_duration - token._human_wait_duration - (now-token._pause_started if token._pause_started is not None else 0)
+
+
+@contextmanager
+def human_wait_scope():
+    """Exclude human delay from browser observation/reply retry deadlines."""
+    token = current_token()
+    started = time.monotonic()
+    pause_before = (token._pause_duration +
+                    (started-token._pause_started if token._pause_started is not None else 0)) if token else 0
+    try:
+        yield
+    finally:
+        if token:
+            ended = time.monotonic()
+            with token._lock:
+                pause_after = token._pause_duration + (ended-token._pause_started if token._pause_started is not None else 0)
+                token._human_wait_duration += max(0, ended-started-(pause_after-pause_before))
 
 
 def checkpoint(operation=None, job_id=None):

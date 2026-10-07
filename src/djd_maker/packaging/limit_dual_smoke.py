@@ -17,6 +17,8 @@ def run_gui_mode_smoke(root, report, target):
     from djd_maker.core.repositories import SettingsRepository
     root, report = Path(root).resolve(), Path(report).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    from .acceptance_assets import initialize_fixture_assets
+    initialize_fixture_assets(root)
     app, window, service = build_desktop(root)
     initial = window.gui_type_switch.currentText()
     window.show()
@@ -54,12 +56,15 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
     from djd_maker.packaging.preflight import application_root
     from djd_maker.packaging.portable_e2e import _make_fixture
     from djd_maker.adapters.browser import BrowserManager
+    from djd_maker.adapters import browser as browser_module
     from djd_maker.adapters.usage_limit import UsageLimitDetector
 
     root, report = Path(root).resolve(), Path(report).resolve()
     if root.exists():
         raise FileExistsError('Fresh smoke directory required')
     root.mkdir(parents=True)
+    from .acceptance_assets import initialize_fixture_assets
+    initialize_fixture_assets(root)
     tools=application_root()/'runtime/ffmpeg'
     ffmpeg=resolve_executable('ffmpeg', tools/'ffmpeg.exe' if (tools/'ffmpeg.exe').is_file() else None)
     ffprobe=resolve_executable('ffprobe', tools/'ffprobe.exe' if (tools/'ffprobe.exe').is_file() else None)
@@ -75,11 +80,19 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
     source=root/'input/limit-local.txt'
     source.parent.mkdir(parents=True,exist_ok=True)
     source.write_text('isolated acceptance only',encoding='utf-8')
-    local=Job(str(source),id='limit-local',state=JobState.DOWNLOADING)
-    service.jobs.save(local)
+    local=Job(str(source),id='limit-local',state=JobState.RAW_READY)
     downloaded=root/'work'/local.id/'download'/f'{local.script_name}.mp4'
     downloaded.parent.mkdir(parents=True)
     shutil.copyfile(fixture,downloaded)
+    validator=VideoValidator(ffprobe)
+    saved=RawSafeStore(validator,root/'raw_files').save(downloaded,root/'raw_files'/f'{local.script_name}.mp4')
+    local.raw_path=str(saved.path)
+    local.raw_size_bytes=saved.media.size_bytes
+    local.duration_seconds=saved.media.duration_seconds
+    local.safety_gate=saved.safety_gate
+    local.raw_status='VALIDATED'
+    local.download_status='DOWNLOADED'
+    service.jobs.save(local)
     for index in range(100):
         service.jobs.save(Job(str(root/'input'/f'waiting-{index}.txt'),id=f'waiting-{index}'))
     gate=CloudLimitGate(root/'system/cloud-limit.json')
@@ -92,6 +105,8 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
         clock = lambda: datetime.now().astimezone()
         release = (clock()+timedelta(hours=1)).strftime('%H:%M')
         browser = BrowserManager(root/'limit-fixture-profile', headless=True)
+        original_home = browser_module.NOTEBOOK_HOME_URL
+        browser_module.NOTEBOOK_HOME_URL = 'data:text/html,<title>Limit fixture</title>'
         try:
             page = browser.start()
             page.set_content(f'<div role="alert">AI の使用量上限に達しました。{release}以降にすべての機能が利用可能になります。</div>'
@@ -103,16 +118,19 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
             gate.block(observation)
         finally:
             browser.stop()
+            browser_module.NOTEBOOK_HOME_URL = original_home
     if gate.due:
         raise RuntimeError('Live deadline already passed; do not fabricate a live block')
     collection_source=root/'input/limit-collection.txt'
     collection_source.write_text('isolated collection fixture',encoding='utf-8')
+    identity='00000000-0000-4000-8000-000000000124'
     collection=Job(str(collection_source),id='limit-collection',state=JobState.WAITING_VIDEO,
-        notebook_id='fixture',notebook_url='https://notebook.google.com/notebook/fixture',
+        notebook_id=identity,notebook_url='https://notebook.google.com/notebook/'+identity,
         next_poll_at='2020-01-01T00:00:00+00:00')
     service.jobs.save(collection)
     collection_calls=[]
     class NoCloud:
+        download_during_limit_verified=True  # Local fixture has a verified download handoff.
         def inspect_status(self,job):
             assert job.id==collection.id
             assert service.jobs.get(local.id).state is JobState.COMPLETED
@@ -187,7 +205,10 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
                 and item.ending_result.startswith('SKIPPED') and item.hls_result=='PASS' and item.txt_move_status=='MOVED'
                 and all(j.state is JobState.WAITING for j in service.jobs.list() if j.id not in {local.id,collection.id})
                 and service.jobs.get(collection.id).state is JobState.COMPLETED
-                and collection_calls==[['check',collection.id],['download',collection.id]]
+                and any(action=='check' for action,job_id in collection_calls)
+                and all(action in {'check','download'} and job_id==collection.id for action,job_id in collection_calls)
+                and sum(action=='download' for action,job_id in collection_calls)==service.jobs.get(collection.id).download_attempt_count
+                and 1<=service.jobs.get(collection.id).download_attempt_count<=6
                 and (not long_wait or len(wait_times)>=2 and wait_times[-1]-wait_times[0]>=600)
                 and gate.blocked and not gate.due and stage==3 and paused_at is not None)
             result=dict(passed=passed,modes=modes,commands=commands,cloud_calls=calls,errors=errors,events=events,

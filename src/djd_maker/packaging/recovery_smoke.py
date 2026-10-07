@@ -47,6 +47,7 @@ def run_recovery_smoke(root, report):
     if os.environ.get('DJD_PACKAGING_SMOKE') != '1':
         return 3
     from djd_maker.adapters.browser import BrowserManager
+    from djd_maker.adapters import browser as browser_module
     from djd_maker.adapters.notebook import NotebookDomAdapter, NotebookEngineAdapter, SourceState
     from djd_maker.adapters.hls import HlsAdapter
     from djd_maker.adapters.ending import EndingEngineAdapter
@@ -64,6 +65,8 @@ def run_recovery_smoke(root, report):
                 execution='FROZEN_EXE' if getattr(sys, 'frozen', False) else 'SOURCE',
                 passed=False, events=[])
     browser = BrowserManager(root/'fixture-profile', headless=True)
+    original_home = browser_module.NOTEBOOK_HOME_URL
+    browser_module.NOTEBOOK_HOME_URL = 'data:text/html,<title>Recovery fixture</title>'
     try:
         page = browser.start()
         page.set_content(FIXTURE)
@@ -161,6 +164,7 @@ def run_recovery_smoke(root, report):
         data['traceback'] = traceback.format_exc()
     finally:
         browser.stop()
+        browser_module.NOTEBOOK_HOME_URL = original_home
         report.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     return 0 if data['passed'] else 9
 
@@ -239,8 +243,10 @@ def _ready_failed_retention_smoke(root, media_fixture, ffmpeg, ffprobe):
     assert observations.get('after_download') == 'READY'
     observations['after_completed'] = notebook.inspect_status(result)
     assert observations['after_completed'] == 'READY'
-    assert 'ending.skip' in stages
-    assert notebook.download_calls == [job.id]
+    assert result.ending_result == 'SKIPPED_BY_SETTING'
+    assert 'local.skip' in stages
+    assert 1 <= result.download_attempt_count <= 6
+    assert notebook.download_calls == [job.id] * result.download_attempt_count
     assert not any(action in calls for action in ('submit', 'upload', 'delete'))
     before_repeat = list(calls)
     pipeline.begin_run()

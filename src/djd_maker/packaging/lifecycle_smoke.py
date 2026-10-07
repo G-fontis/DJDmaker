@@ -63,6 +63,8 @@ def run_lifecycle_smoke(root:Path,report:Path):
     root=root.resolve()
     if root.exists():raise ValueError('Fresh isolated acceptance directory required')
     root.mkdir(parents=True)
+    from .acceptance_assets import initialize_fixture_assets
+    initialize_fixture_assets(root)
     result=dict(passed=False,assertions_enabled=__debug__,execution='FROZEN_EXE' if getattr(__import__('sys'),'frozen',False) else 'SOURCE',
                 google_operations=0)
     try:

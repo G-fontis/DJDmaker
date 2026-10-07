@@ -312,6 +312,18 @@ class PipelineCoordinator(DeferredRecovery):
         return f'回収済: {sum(bool(j.raw_path) for j in jobs)}/{len(jobs)} / HLS完了: {sum(j.hls_result == "PASS" for j in jobs)} / ZIP完了: {sum(j.state is JobState.COMPLETED and j.hls_zip_enabled for j in jobs)} / MP4完了: {sum(j.state is JobState.COMPLETED and not j.hls_zip_enabled for j in jobs)}'
 
     def _stage_event(self, job: Job, stage: str) -> None:
+        if stage == 'PIPELINE_RESUMED_AFTER_MODAL':
+            # Refresh durable discovery without replaying the suspended side
+            # effect. The adapter continues its existing source/reply/artifact
+            # readback, then the scheduler recomputes priority at its boundary.
+            self._progress_jobs = {j.id: j for j in self.jobs.list()}
+            self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
+            self.wait_seconds = 0
+            self.final_discovery()
+        if stage in {'UNKNOWN_MODAL_DETECTED', 'WAITING_FOR_HUMAN_MODAL_DISMISSAL',
+                     'MODAL_STILL_VISIBLE', 'MODAL_DISMISSED_BY_USER',
+                     'NOTEBOOK_UI_RESTORED', 'PIPELINE_RESUMED_AFTER_MODAL'}:
+            return  # Human wait is runtime-only; leave durable checkpoints intact.
         if stage in {'state.saved', 'job.start', 'job.result', 'job.next', 'limit.warning'} or job.state is JobState.COMPLETED:
             return
         if job.presentation_stage != stage or job.presentation_phase != self.phase:

@@ -56,19 +56,26 @@ def test_sequential_smoke_acceptance_requires_retention_not_delete():
     def evaluate(expression, namespace):
         return eval(compile(ast.Expression(expression), '<smoke-contract>', 'eval'),
                     namespace)
-    expected, = expressions('expected')
     calls = [['submit', f'release{i}'] for i in range(2)] + [
         ['download', f'release{i}'] for i in range(2)]
-    assert evaluate(expected, {}) == calls
-    isolation, = [node for node in expressions('actions_ok')
-                  if isinstance(node, ast.BoolOp)]
+    bounded, isolation = expressions('actions_ok')
     context = dict(calls=calls,
+                   jobs=[SimpleNamespace(id=f'release{i}', download_attempt_count=1) for i in range(2)],
                    fault={'isolation': True, 'overlay': True, 'attempts': 7},
                    stages={'save.deferred', 'save.summary', 'save.recovered'},
                    pipeline=SimpleNamespace(deferred_ids=set()))
-    assert evaluate(isolation, context)
-    assert not evaluate(isolation, dict(context, calls=calls + [['delete', 'release0']]))
-    assert not evaluate(isolation, dict(context, calls=calls + [['submit', 'release0']]))
+    def accepted(values):
+        actions_ok = evaluate(bounded, values)
+        return evaluate(isolation, dict(values, actions_ok=actions_ok))
+    assert accepted(context)
+    assert not accepted(dict(context, calls=calls + [['delete', 'release0']]))
+    assert not accepted(dict(context, calls=calls + [['submit', 'release0']]))
+    retries = dict(context, calls=calls + [['download', 'release0']] * 2,
+                   jobs=[SimpleNamespace(id='release0', download_attempt_count=3),
+                         SimpleNamespace(id='release1', download_attempt_count=1)])
+    assert accepted(retries)
+    assert not accepted(dict(retries, jobs=[SimpleNamespace(id='release0', download_attempt_count=7),
+                                           SimpleNamespace(id='release1', download_attempt_count=1)]))
     passed, = expressions('passed')
     predicates = [node for node in ast.walk(passed) if isinstance(node, ast.Compare)
                   and isinstance(node.left, ast.Attribute)

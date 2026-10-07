@@ -100,7 +100,7 @@ def build_desktop(
                 download_handoff=PlaywrightArtifactDownload(
                     validator, lifecycle_guard=download_lifecycle
                 ),
-                interactable_guard=ensure_notebook_interactable,
+                interactable_guard=browser.ensure_notebook_ready,
             ),
             recover_page=browser.restart,
             persist_identity=job_repository.save,

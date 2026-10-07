@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 import re
 
-from .replies import ReplyKind, classify_reply
+from .replies import ReplyKind, ReplyResult, classify_reply
 from djd_maker.core.cancellation import checkpoint, active_monotonic
 
 
@@ -32,6 +32,7 @@ class ChatFlow:
         ensure = getattr(self.dom, 'ensure_interactable', None)
         if callable(ensure):
             ensure()
+            self.page = self.dom.page
         roots = self.page.locator(CHAT_ROOT)
         visible = [roots.nth(i) for i in range(roots.count()) if roots.nth(i).is_visible()]
         if len(visible) != 1:
@@ -119,7 +120,13 @@ class ChatFlow:
                 result = classify_reply(reply, now=self.dom.clock())
                 if found and result.kind in {ReplyKind.GENERATION_ACCEPTED, ReplyKind.QUOTA_EXHAUSTED}:
                     return result
-                if self.dom.inspect_status().value in {"READY", "GENERATING", "WAITING"}:
+                remote = self.dom.inspect_status().value
+                if remote in {"READY", "GENERATING"}:
+                    # The current Notebook's artifact is stronger evidence than
+                    # reply wording after human review. Never send a second prompt.
+                    return ReplyResult(ReplyKind.GENERATION_ACCEPTED,
+                                       matched_terms=('verified_current_artifact',))
+                if remote == "WAITING":
                     raise ChatFlowError("GENERATION_STATE_UNCERTAIN: artifactあり。追加送信を停止")
             self.dom.diagnostic(f"PRESET_ATTEMPT:{attempt}/3")
             try:

@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.3"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.4"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -130,6 +130,15 @@ class MainWindow(Phase2Presentation, QMainWindow):
         else:
             self.setStyleSheet('QWidget { background-color: #ffffff; color: #202020; }')
             self._build_phase1()
+        self.human_modal_banner = QLabel()
+        self.human_modal_banner.setObjectName('humanModalBanner')
+        self.human_modal_banner.setWordWrap(True)
+        self.human_modal_banner.setStyleSheet(
+            'QLabel { background: #fff3cd; color: #402f00; padding: 14px; '
+            'font-size: 16px; font-weight: bold; border: 2px solid #b8860b; }')
+        self.human_modal_banner.hide()
+        # Keep the established command/summary layout stable in both GUIs.
+        self.lifecycle_label.parentWidget().layout().addWidget(self.human_modal_banner)
 
     def _build_phase1(self) -> None:
         central = QWidget()
@@ -847,6 +856,12 @@ class MainWindow(Phase2Presentation, QMainWindow):
             limit = status.get('cloud_limit', {})
             self._display_limit(limit)
             record = status.get('runtime')
+            waiting_for_modal = isinstance(record, dict) and bool(record.get('human_modal_wait'))
+            self.human_modal_banner.setVisible(waiting_for_modal)
+            if waiting_for_modal:
+                from djd_maker.adapters.notebook_modal import HUMAN_MODAL_MESSAGE
+                self.human_modal_banner.setText('ユーザー確認待ち\n' + str(record.get('message') or HUMAN_MODAL_MESSAGE))
+                self.current_stage_label.setText('現在工程: Notebookのモーダル確認待ち')
             view = status.get('scheduler') or (record.get('scheduler') if isinstance(record, dict) else None)
             if view:
                 discovery = view.get('discovery')

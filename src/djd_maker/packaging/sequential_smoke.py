@@ -27,6 +27,8 @@ def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) 
     if root.exists():
         raise FileExistsError('Smoke runtime must be fresh')
     root.mkdir(parents=True)
+    from .acceptance_assets import initialize_fixture_assets
+    initialize_fixture_assets(root)
     tools = application_root() / 'runtime/ffmpeg'
     ffmpeg, ffprobe = tools/'ffmpeg.exe', tools/'ffprobe.exe'
     fixture = root/'fixture.mp4'
@@ -149,14 +151,15 @@ def run_sequential_smoke(root: Path, report: Path, *, save_fault: bool = False) 
                 pipeline.deferred = service.jobs._deferred_state
                 window.start_processing()
                 return
-            expected=[['submit',f'release{i}'] for i in range(2)]+[['download',f'release{i}'] for i in range(2)]
             stages={r.get('stage') for r in runtime}
-            required={'artifact.ready','download.start','raw.saved','ending.skip','hls.start','zip.start','job.next'}
+            required={'artifact.ready','download.start','raw.saved','local.skip','hls.start','zip.start','job.next'}
             refreshed={entry['stage'] for entry in table_updates if entry['stage']==entry['display']}
-            actions_ok = calls==expected
+            actions_ok = (all(calls.count(['submit',j.id]) == 1
+                and calls.count(['download',j.id]) == j.download_attempt_count
+                and 1 <= j.download_attempt_count <= 6 for j in jobs)
+                and all(action in {'submit','check','download'} for action,job_id in calls))
             if save_fault:
-                actions_ok = (all(calls.count([action,f'release{i}']) == 1 for i in range(2)
-                                  for action in ('submit','download'))
+                actions_ok = (actions_ok
                     and not any(action[0] == 'delete' for action in calls)
                     and fault['isolation'] and fault['overlay'] and fault['attempts'] >= 7
                     and {'save.deferred','save.summary','save.recovered'} <= stages

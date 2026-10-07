@@ -123,7 +123,8 @@ class GuiPipelineController:
         from djd_maker.core.stop_reason import StopReason
         self._stop_reason = StopReason.make(code,detail)
         self._runtime_update({**self._runtime, 'stage':'lifecycle.'+code,
-            'message':self._stop_reason.message, 'stop_reason':self._stop_reason.to_dict()})
+            'message':self._stop_reason.message, 'stop_reason':self._stop_reason.to_dict(),
+            'human_modal_wait': False})
 
     def bind(
         self,
@@ -537,7 +538,12 @@ class GuiPipelineController:
         return result
 
     def _run_loop(self) -> None:
-        with cancellation_scope(self.cancellation):
+        from djd_maker.core.runtime_operation import operation_scope
+        # Preflight can itself wait for a human; publish progress before the
+        # pipeline exists, on the same cancellable worker thread.
+        with cancellation_scope(self.cancellation), operation_scope(
+            lambda stage, fields: self._runtime_update({'stage': stage, **fields})
+        ):
             self._run_loop_cancellable()
 
     def _run_loop_cancellable(self) -> None:

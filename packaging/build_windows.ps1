@@ -11,7 +11,7 @@ $ProjectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Pa
 $Spec = Join-Path $ProjectRoot "packaging\DJDMaker.spec"
 $DistRoot = Join-Path $ProjectRoot "dist"
 $WorkRoot = Join-Path $ProjectRoot "build\pyinstaller"
-$ReleaseRoot = Join-Path $DistRoot "DJDmaker_Ver2.3"
+$ReleaseRoot = Join-Path $DistRoot "DJDmaker_Ver2.4"
 $AssetRoot = Join-Path $ProjectRoot "build\packaging-assets"
 
 $env:DJD_FFMPEG_PATH = (Resolve-Path -LiteralPath $FFmpegPath).Path
@@ -42,6 +42,13 @@ foreach ($Asset in @("config", "licenses", "runtime")) {
     if (Test-Path -LiteralPath $Destination) {
         throw "Refusing to overwrite existing portable asset: $Destination"
     }
+    $ResolvedRelease = [System.IO.Path]::GetFullPath($ReleaseRoot).TrimEnd('\') + '\'
+    $ResolvedSource = (Resolve-Path -LiteralPath $Source).Path
+    $ResolvedDestination = [System.IO.Path]::GetFullPath($Destination)
+    if (-not $ResolvedSource.StartsWith($ResolvedRelease, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $ResolvedDestination.StartsWith($ResolvedRelease, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Portable asset move must remain within the reviewed release directory."
+    }
     Move-Item -LiteralPath $Source -Destination $Destination
 }
 
@@ -57,4 +64,5 @@ foreach ($Relative in $WritableDirectories) {
 if ($LASTEXITCODE -ne 0) { throw "Built portable tree failed validation." }
 
 Write-Host "Validated onedir build: $ReleaseRoot"
-Write-Host "No release ZIP was created. Perform release approval separately."
+Write-Host "No release ZIP was created. Complete EXE acceptance and package audit before creating the ZIP."
+exit 0

@@ -404,7 +404,9 @@ class NotebookDomAdapter:
     def ensure_interactable(self):
         checkpoint('notebook.interactable')
         if self.interactable_guard is not None:
-            self.interactable_guard(self.page, diagnostic=self.diagnostic)
+            selected = self.interactable_guard(self.page, diagnostic=self.diagnostic)
+            if selected is not None:
+                self.page = selected
 
     def inspect_credit(self) -> CreditSnapshot:
         detector = self._injected_credit_detector or CreditDetector(
@@ -521,6 +523,7 @@ class NotebookDomAdapter:
             self.page.wait_for_timeout(250)
 
     def create_notebook(self) -> ResumeMetadata:
+        self.ensure_interactable()
         self.check_usage_limit()
         self.page.goto(self.HOME_URL, wait_until="domcontentloaded")
         self.ensure_interactable()
@@ -1660,6 +1663,9 @@ class NotebookEngineAdapter:
 
     def recheck_cloud_limit(self, notebook_url=None):
         if notebook_url:
+            ensure = getattr(self.dom, 'ensure_interactable', None)
+            if callable(ensure):
+                ensure()
             parsed = urlparse(notebook_url)
             if parsed.scheme != 'https' or parsed.hostname != 'notebook.google.com':
                 raise NotebookAdapterError('Invalid limit recheck URL')
@@ -1720,6 +1726,9 @@ class NotebookEngineAdapter:
         except Exception:
             current = urlparse("")
         if current.hostname != parsed.hostname or current.path != parsed.path:
+            ensure = getattr(self.dom, 'ensure_interactable', None)
+            if callable(ensure):
+                ensure()
             checkpoint('notebook.goto')
             self.dom.page.goto(job.notebook_url, wait_until="domcontentloaded")
             checkpoint('notebook.goto.complete')
@@ -1777,6 +1786,7 @@ class NotebookEngineAdapter:
             # overlay or initiating tab in an indeterminate state. Re-mount
             # the same persisted Notebook before the next bounded attempt;
             # this is navigation only and never submits or regenerates.
+            self.dom.ensure_interactable()
             checkpoint('download.retry.reload')
             self.dom.page.reload(wait_until='domcontentloaded')
             self.dom.ensure_interactable()

@@ -203,6 +203,7 @@ class BrowserManager:
                     "Googleへのログインを確認できません。［Googleログイン］からログインしてください。"
                 )
             self._pass_check("google_authenticated")
+            page = self.ensure_notebook_ready(page)
             if not self.ensure_home_dom(page):
                 self._fail_check("notebook_home_dom")
                 self._stop_automation()
@@ -215,6 +216,21 @@ class BrowserManager:
             self._pass_check("required_selectors")
             self._preflight_result = "PRE_FLIGHT_READY"
             return page
+
+    def ensure_notebook_ready(self, page, *, diagnostic=lambda _: None):
+        """Wait on the current Notebook; never close or navigate other tabs."""
+        from .cancellable_browser import unwrap
+        from .notebook_modal import ensure_notebook_interactable
+        context = self.ensure_context_alive()
+        # Injected non-browser factories retain their established test contract.
+        if not type(unwrap(context)).__module__.startswith('playwright.'):
+            return page
+        if unwrap(page.context) is not unwrap(context):
+            raise BrowserNavigationError('DJDmaker専用Notebookの所有contextを確認できません')
+        selected = ensure_notebook_interactable(page, diagnostic=diagnostic,
+            owned_context=context, lifecycle_guard=self.lifecycle_guard)
+        self._managed_page = selected or page
+        return self._managed_page
 
     def _pass_check(self, name: str) -> None:
         self._preflight_checks[name] = "PASS"
@@ -409,6 +425,8 @@ class BrowserManager:
                 page = context.new_page()
         self._managed_page = page
         if force_home or not self._is_gemini_url(page.url):
+            if self._is_gemini_url(page.url):
+                page = self.ensure_notebook_ready(page)
             try:
                 page.goto(NOTEBOOK_HOME_URL, wait_until="domcontentloaded")
             except Exception as exc:

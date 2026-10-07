@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "djd-maker"
-version = "2.3.0"
+version = "2.4.0"
 description = "台本から授業動画つくるマシーン"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,7 +16,7 @@ dependencies = [
 djd-maker = "djd_maker.gui.app:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3,<9"]
+dev = ["pytest>=8.3,<9", "pytest-qt>=4.5,<5"]
 build = ["pyinstaller>=6,<7"]
 
 [tool.setuptools.packages.find]
