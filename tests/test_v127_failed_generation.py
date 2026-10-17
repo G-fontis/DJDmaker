@@ -28,7 +28,7 @@ def failed_engine(page, tmp_path):
     dom.ensure_source = lambda path: None
     dom._wait_for_generation_chat_ready = lambda: None
     repo = MemoryJobs(job)
-    engine = NotebookEngineAdapter(dom, persist_identity=repo.save)
+    engine = NotebookEngineAdapter(dom, persist_identity=repo.save, generation_method='LEGACY_CHAT_FLOW')
     engine._open_job = lambda job: None
     engine.inspect_status = lambda job: dom.inspect_status().value
     return engine, job, repo

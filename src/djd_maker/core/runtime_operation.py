@@ -19,6 +19,14 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'STUDIO_OPENING': 'Studioの動画解説を開いています',
+    'VIDEO_SETTINGS_OPEN': '動画設定',
+    'VIDEO_TYPE_SELECTED': '動画形式：説明動画',
+    'LANGUAGE_SELECTED': '言語：日本語',
+    'STYLE_SELECTED': '動画スタイルを設定しました',
+    'GENERATION_READY': '動画設定を確認しました',
+    'GENERATE_CLICKED': '動画生成の開始を確認しています',
+    'GENERATION_STARTED': '動画生成開始',
     'download.quality.wait': 'ダウンロード完了後の品質判定待ち',
     'download.quality.pass': 'ダウンロード品質判定PASS',
     'download.quality.retry': '品質不足のため動画を再ダウンロード',
@@ -103,7 +111,9 @@ LABELS = {
 }
 
 
-def operation_text(value):
+def operation_text(value, fields=None):
+    if value == 'STYLE_SELECTED' and fields and fields.get('visual_style'):
+        return 'スタイル：' + str(fields['visual_style'])
     return LABELS.get(str(value), str(value))
 
 

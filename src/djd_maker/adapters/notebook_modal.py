@@ -50,19 +50,28 @@ def classify_modal(text):
 
 
 def ensure_notebook_interactable(page, *, diagnostic=lambda _: None, target=None, timeout_seconds=5,
-                                 verify_ready=None, owned_context=None, lifecycle_guard=None, poll_seconds=2):
+                                 verify_ready=None, owned_context=None, lifecycle_guard=None, poll_seconds=2,
+                                 owned_dialog=None):
     deadline = time.monotonic()+timeout_seconds
     dismissed = False
     while True:
         checkpoint('modal.detect')
         dialogs = page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
         visible = [dialogs.nth(i) for i in range(dialogs.count()) if dialogs.nth(i).is_visible()]
+        owned = [dialog for dialog in visible if owned_dialog is not None and owned_dialog(dialog)]
+        visible = [dialog for dialog in visible if dialog not in owned]
+        if owned and not visible and not _extra_overlay(page):
+            return page
+        if owned and not visible:
+            return wait_for_human_modal(page, diagnostic=diagnostic, target=target,
+                verify_ready=verify_ready, owned_context=owned_context,
+                lifecycle_guard=lifecycle_guard, poll_seconds=poll_seconds, owned_dialog=owned_dialog)
         if not visible:
             if not dismissed:
                 if _visible(page, SCRIMS):
                     return wait_for_human_modal(page, diagnostic=diagnostic, target=target,
                         verify_ready=verify_ready, owned_context=owned_context,
-                        lifecycle_guard=lifecycle_guard, poll_seconds=poll_seconds)
+                        lifecycle_guard=lifecycle_guard, poll_seconds=poll_seconds, owned_dialog=owned_dialog)
                 return
             scrims = page.locator('.cdk-overlay-backdrop.cdk-overlay-backdrop-showing, [data-testid="modal-scrim"]')
             blocked = any(scrims.nth(i).is_visible() for i in range(scrims.count()))
@@ -94,7 +103,7 @@ def ensure_notebook_interactable(page, *, diagnostic=lambda _: None, target=None
             if len(visible) != 1 or classify_modal(visible[0].inner_text()) is ModalKind.UNKNOWN:
                 return wait_for_human_modal(page, diagnostic=diagnostic, target=target,
                     verify_ready=verify_ready, owned_context=owned_context,
-                    lifecycle_guard=lifecycle_guard, poll_seconds=poll_seconds)
+                    lifecycle_guard=lifecycle_guard, poll_seconds=poll_seconds, owned_dialog=owned_dialog)
             dialog = visible[0]
             kind = classify_modal(dialog.inner_text())
             report_operation('modal.found', decision=kind.value)
@@ -129,6 +138,13 @@ DIALOGS = '[role="dialog"], [aria-modal="true"], dialog[open]'
 def _visible(page, selector):
     controls = page.locator(selector)
     return [controls.nth(i) for i in range(controls.count()) if controls.nth(i).is_visible()]
+
+
+def _extra_overlay(page):
+    # One CDK backdrop belongs to the identified settings transaction. A
+    # second backdrop or any explicit unrelated blocker still needs a human.
+    return (bool(_visible(page, '[data-testid="modal-scrim"], [data-testid="blocking-overlay"], .modal-backdrop.show'))
+            or len(_visible(page, '.cdk-overlay-backdrop.cdk-overlay-backdrop-showing')) > 1)
 
 
 def _identity(page):
@@ -190,8 +206,8 @@ def _classified_error(kind, page):
 
 
 def wait_for_human_modal(page, *, diagnostic, target, verify_ready, owned_context,
-                         lifecycle_guard, poll_seconds):
-    identity = _identity(page)
+                         lifecycle_guard, poll_seconds, owned_dialog=None, expected_identity=None):
+    identity = expected_identity or _identity(page)
     if owned_context is not None and (identity is None or identity[:2] != ('https', 'notebook.google.com')):
         raise BlockingModalError('NOTEBOOK_IDENTITY_UNVERIFIED')
     domain = identity[1] if identity else None
@@ -211,6 +227,8 @@ def wait_for_human_modal(page, *, diagnostic, target, verify_ready, owned_contex
             else:
                 try:
                     dialogs = _visible(current, DIALOGS)
+                    owned = [dialog for dialog in dialogs if owned_dialog is not None and owned_dialog(dialog)]
+                    dialogs = [dialog for dialog in dialogs if dialog not in owned]
                     kinds = [classify_modal(dialog.inner_text()) for dialog in dialogs]
                     scrims = _visible(current, SCRIMS)
                 except PlaywrightError:
@@ -220,7 +238,7 @@ def wait_for_human_modal(page, *, diagnostic, target, verify_ready, owned_contex
                 for kind in kinds:
                     if kind not in {ModalKind.UNKNOWN, ModalKind.ANNOUNCEMENT, ModalKind.ONBOARDING, ModalKind.SAFE_INFO}:
                         _classified_error(kind, current)
-                if not dialogs and not scrims:
+                if not dialogs and ((owned and not _extra_overlay(current)) or not scrims):
                     if not reported_hidden:
                         diagnostic('MODAL_DISMISSED_BY_USER')
                         report_operation('MODAL_DISMISSED_BY_USER', human_modal_wait=True)

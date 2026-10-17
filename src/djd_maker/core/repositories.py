@@ -354,12 +354,20 @@ class PresetRepository:
     @staticmethod
     def _decode(value: Mapping[str, Any]) -> Preset:
         try:
+            generation = value.get('generation_settings')
+            if generation is None:
+                from .generation_settings import map_legacy_preset, UnsupportedGenerationPreset
+                try:
+                    generation = map_legacy_preset(str(value['prompt_text'])).to_dict()
+                except UnsupportedGenerationPreset:
+                    pass
             return Preset(
                 id=str(value["id"]),
                 name=str(value["name"]),
                 prompt_text=str(value["prompt_text"]),
                 created_at=str(value["created_at"]),
                 updated_at=str(value["updated_at"]),
+                generation_settings=generation,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise MalformedJsonError(f"invalid preset: {error}") from error
@@ -402,9 +410,13 @@ class PresetRepository:
             raise RuntimeError("動画生成プリセットを登録・選択してください。")
         return preset
 
-    def create(self, name: str, prompt_text: str) -> Preset:
+    def create(self, name: str, prompt_text: str, *, generation_settings=None) -> Preset:
         clean_name, prompt_text = self._validate(name, prompt_text)
-        created = Preset(uuid4().hex, clean_name, prompt_text, utc_now(), utc_now())
+        if generation_settings is not None:
+            from .generation_settings import GenerationSettings, map_legacy_preset
+            GenerationSettings.from_dict(generation_settings)
+            map_legacy_preset(prompt_text)
+        created = Preset(uuid4().hex, clean_name, prompt_text, utc_now(), utc_now(), generation_settings)
 
         def change(document: dict[str, Any]) -> dict[str, Any]:
             presets = self._presets(document)
@@ -419,8 +431,12 @@ class PresetRepository:
             self._selected_preset_id = created.id
         return created
 
-    def update(self, preset_id: str, name: str, prompt_text: str) -> Preset:
+    def update(self, preset_id: str, name: str, prompt_text: str, *, generation_settings=None) -> Preset:
         clean_name, prompt_text = self._validate(name, prompt_text)
+        if generation_settings is not None:
+            from .generation_settings import GenerationSettings, map_legacy_preset
+            GenerationSettings.from_dict(generation_settings)
+            map_legacy_preset(prompt_text)
         changed: Preset | None = None
 
         def change(document: dict[str, Any]) -> dict[str, Any]:
@@ -440,6 +456,8 @@ class PresetRepository:
                 prompt_text,
                 original.created_at,
                 utc_now(),
+                generation_settings if generation_settings is not None else (
+                    original.generation_settings if prompt_text == original.prompt_text else None),
             )
             document["presets"] = [
                 (changed if item.id == preset_id else item).to_dict() for item in presets
@@ -485,7 +503,7 @@ class PresetRepository:
         while name.casefold() in existing:
             name = f"{base} {counter}"
             counter += 1
-        return self.create(name, original.prompt_text)
+        return self.create(name, original.prompt_text, generation_settings=original.generation_settings)
 
 
 class JobRepository:

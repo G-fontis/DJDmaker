@@ -32,7 +32,18 @@ class DeferredRecovery:
         self.deferred = shared
         self._deferred_attempts = {}
         for job in self.jobs.list():
+            studio_pending = False
+            if (job.generation_method == 'STUDIO_DIRECT' and job.source_status == 'READY'
+                    and job.notebook_id and job.notebook_url and job.generation_settings_snapshot
+                    and not job.studio_generate_claimed_at):
+                try:
+                    job.require_generation_settings()
+                    studio_pending = True
+                except ValueError:
+                    pass
             if job.id not in self.deferred_ids and job.state is JobState.UPLOADING:
+                if studio_pending:
+                    continue  # Valid durable Source/settings checkpoint, no Generate intent yet.
                 # If both primary save and journal failed in a previous process,
                 # the durable pre-action checkpoint still forbids blind resend.
                 entry = self.deferred.record(job, 'RESTART_UNCERTAIN_SUBMISSION')

@@ -585,7 +585,7 @@ def test_engine_submit_renames_before_source_and_generation(tmp_path):
     from djd_maker.core.models import Job
 
     prompt = "選択したプリセット本文"
-    result = NotebookEngineAdapter(Dom()).submit(
+    result = NotebookEngineAdapter(Dom(), generation_method='LEGACY_CHAT_FLOW').submit(
         Job(
             str(source),
             preset_body_snapshot=prompt,
@@ -645,7 +645,8 @@ def test_engine_returns_structured_reservation_and_records_recovery_fields(tmp_p
         preset_body_sha256=preset_body_sha256(prompt),
     )
     result = NotebookEngineAdapter(
-        Dom(), persist_identity=lambda current: persisted.append(current.to_dict())
+        Dom(), persist_identity=lambda current: persisted.append(current.to_dict()),
+        generation_method='LEGACY_CHAT_FLOW',
     ).submit(job)
 
     assert tuple(result) == ("reserved-id", result.notebook_url)
@@ -747,7 +748,7 @@ def test_source_timeout_retries_same_notebook_without_reupload(tmp_path):
             events.append(("chat_generate", prompt))
 
     prompt = "selected snapshot"
-    result = NotebookEngineAdapter(Dom()).submit(
+    result = NotebookEngineAdapter(Dom(), generation_method='LEGACY_CHAT_FLOW').submit(
         Job(
             str(source),
             preset_body_snapshot=prompt,
@@ -805,7 +806,7 @@ def test_third_source_timeout_preserves_notebook_and_stops(tmp_path):
             raise AssertionError("generation must not start without a ready source")
 
     with pytest.raises(SourceReadyTimeoutError, match="timeout"):
-        NotebookEngineAdapter(Dom()).submit(
+        NotebookEngineAdapter(Dom(), generation_method='LEGACY_CHAT_FLOW').submit(
             Job(
                 str(source),
                 preset_body_snapshot="selected snapshot",

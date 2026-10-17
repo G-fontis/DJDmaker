@@ -95,7 +95,7 @@ def run_recovery_smoke(root, report):
                 assert job.notebook_id == 'fixture'
             def inspect_status(self, job):
                 return self.dom.inspect_status().value
-        engine = FixtureEngine(dom, persist_identity=repo.save)
+        engine = FixtureEngine(dom, persist_identity=repo.save, generation_method='LEGACY_CHAT_FLOW')
         outcome = engine.retry_failed_generation(job)
         assert outcome.remote_status.value == 'GENERATING'
         assert dom.inspect_status().value == 'GENERATING'

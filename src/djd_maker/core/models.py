@@ -111,6 +111,7 @@ class Preset:
     prompt_text: str
     created_at: str
     updated_at: str
+    generation_settings: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -133,6 +134,12 @@ class Job:
     generation_prompt: str | None = None
     generation_started_at: str | None = None
     generation_retry_turn_count: int | None = None
+    generation_settings_snapshot: dict[str, str] | None = None
+    generation_settings_sha256: str | None = None
+    generation_method: str = 'STUDIO_DIRECT'
+    studio_generation_stage: str | None = None
+    studio_generate_claimed_at: str | None = None
+    studio_generation_attempt: int = 0
     duplicate_of_job_id: str | None = None
     output_conflict_job_id: str | None = None
     output_resume_state: str | None = None
@@ -233,6 +240,36 @@ class Job:
         self.preset_body_snapshot = preset.prompt_text
         self.preset_body_sha256 = preset_body_sha256(preset.prompt_text)
         self.generation_prompt = preset.prompt_text
+        from .generation_settings import GenerationSettings, map_legacy_preset, UnsupportedGenerationPreset
+        if preset.generation_settings is not None:
+            map_legacy_preset(preset.prompt_text)
+            self.snapshot_generation_settings(GenerationSettings.from_dict(preset.generation_settings))
+            return
+        try:
+            settings = map_legacy_preset(preset.prompt_text)
+        except UnsupportedGenerationPreset:
+            # Retain unsupported bodies without silently assigning defaults.
+            self.generation_settings_snapshot = None
+            self.generation_settings_sha256 = None
+        else:
+            self.snapshot_generation_settings(settings)
+
+    def snapshot_generation_settings(self, settings) -> None:
+        import json
+        self.generation_settings_snapshot = settings.to_dict()
+        self.generation_settings_sha256 = preset_body_sha256(json.dumps(settings.to_dict(), sort_keys=True))
+
+    def require_generation_settings(self):
+        import json
+        from .generation_settings import GenerationSettings, map_legacy_preset
+        map_legacy_preset(self.require_preset_body_snapshot())
+        if self.generation_settings_snapshot is None:
+            settings = map_legacy_preset(self.require_preset_body_snapshot())
+            self.snapshot_generation_settings(settings)
+        expected = preset_body_sha256(json.dumps(self.generation_settings_snapshot, sort_keys=True))
+        if self.generation_settings_sha256 != expected:
+            raise ValueError('GENERATION_SETTINGS_HASH_MISMATCH')
+        return GenerationSettings.from_dict(self.generation_settings_snapshot)
 
     def require_preset_body_snapshot(self) -> str:
         snapshot = self.preset_body_snapshot

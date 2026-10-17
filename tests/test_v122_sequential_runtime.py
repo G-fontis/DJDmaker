@@ -269,7 +269,7 @@ def test_real_submit_adapter_source_and_preset_before_next(tmp_path, source_stat
                 assert jobs.get(values[0].id).state is JobState.WAITING_VIDEO
                 assert ('send_current', values[0].id) in events
             return dict(artifact='NOT_STARTED', source=source_state, preset='NOT_SENT', reply=old_reply)
-    pipeline = coordinator(tmp_path, jobs, Engine(dom, persist_identity=jobs.save))
+    pipeline = coordinator(tmp_path, jobs, Engine(dom, persist_identity=jobs.save, generation_method='LEGACY_CHAT_FLOW'))
     for job in values:
         source = tmp_path / job.source_path
         source.write_text('test source', encoding='utf-8')

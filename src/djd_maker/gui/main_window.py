@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.4"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.5"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -896,12 +896,12 @@ class MainWindow(Phase2Presentation, QMainWindow):
                 self._runtime_record = dict(record)
                 if record.get('job_id'):
                     self.current_job_label.setText(f"現在ジョブ: {record.get('job', '－')}")
-                    self.current_stage_label.setText(f"現在工程: {operation_text(record.get('stage', ''))}")
+                    self.current_stage_label.setText(f"現在工程: {operation_text(record.get('stage', ''), record)}")
                 for key, (caption, label) in self.runtime_labels.items():
                     value = record.get(key, '－')
                     if key == 'count':
                         value = f"{record.get('processed', 0)} / {record.get('total', 0)}"
-                    label.setText(f'{caption}: {operation_text(value)}')
+                    label.setText(f'{caption}: {operation_text(value, record if key == "stage" else None)}')
                 self._refresh_runtime_elapsed()
                 self.statusBar().showMessage(
                     f"{record.get('phase', '処理中')} {record.get('processed', 0)}/{record.get('total', 0)}: "

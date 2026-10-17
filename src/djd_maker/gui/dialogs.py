@@ -65,6 +65,7 @@ class PresetDialog(QDialog):
         *,
         name: str = "",
         prompt_text: str = "",
+        generation_settings=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("動画生成プリセット")
@@ -73,11 +74,25 @@ class PresetDialog(QDialog):
         self.name_edit.setPlaceholderText("例：福ゼミ通常講義")
         self.prompt_edit = QPlainTextEdit(prompt_text)
         self.prompt_edit.setPlaceholderText(
-            "NotebookLMのメインチャットへ送信する動画生成指示を入力してください"
+            "既存本文を保持します。追加指示は対応を確認できるまで自動生成しません。"
         )
+        from djd_maker.core.generation_settings import GenerationSettings, STYLE_LABELS, map_legacy_preset
+        self.style_combo = QComboBox()
+        self.style_combo.addItem('本文から変換（既存互換）', None)
+        for key, label in STYLE_LABELS.items():
+            self.style_combo.addItem(label, key)
+        if generation_settings is None and prompt_text:
+            try:
+                generation_settings = map_legacy_preset(prompt_text).to_dict()
+            except ValueError:
+                pass
+        if generation_settings:
+            self.style_combo.setCurrentIndex(self.style_combo.findData(GenerationSettings.from_dict(generation_settings).visual_style))
         form = QFormLayout()
         form.addRow("プリセット名", self.name_edit)
         form.addRow("本文", self.prompt_edit)
+        form.addRow('動画形式 / 言語', QLabel('説明動画 / 日本語（Studioから直接生成）'))
+        form.addRow('ビジュアル スタイル', self.style_combo)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -96,6 +111,11 @@ class PresetDialog(QDialog):
 
     def values(self) -> tuple[str, str]:
         return self.name_edit.text().strip(), self.prompt_edit.toPlainText().strip()
+
+    def structured_settings(self):
+        from djd_maker.core.generation_settings import GenerationSettings
+        value = self.style_combo.currentData()
+        return GenerationSettings(visual_style=value).to_dict() if value else None
 
 
 class SettingsDialog(QDialog):
@@ -228,7 +248,9 @@ class SettingsDialog(QDialog):
         if not dialog.exec():
             return
         try:
-            preset = self.preset_repository.create(*dialog.values())
+            settings = getattr(dialog, 'structured_settings', lambda: None)()
+            options = {'generation_settings': settings} if settings else {}
+            preset = self.preset_repository.create(*dialog.values(), **options)
             self.preset_repository.select(preset.id)
             self._reload_presets(preset.id)
         except ValueError as exc:
@@ -240,11 +262,14 @@ class SettingsDialog(QDialog):
         if preset is None:
             QMessageBox.information(self, "プリセット", "編集するプリセットを選択してください。")
             return
-        dialog = PresetDialog(self, name=preset.name, prompt_text=preset.prompt_text)
+        options = {'generation_settings': preset.generation_settings} if preset.generation_settings else {}
+        dialog = PresetDialog(self, name=preset.name, prompt_text=preset.prompt_text, **options)
         if not dialog.exec():
             return
         try:
-            self.preset_repository.update(preset.id, *dialog.values())
+            settings = getattr(dialog, 'structured_settings', lambda: None)()
+            options = {'generation_settings': settings} if settings else {}
+            self.preset_repository.update(preset.id, *dialog.values(), **options)
             self._reload_presets(preset.id)
         except ValueError as exc:
             QMessageBox.warning(self, "保存できません", str(exc))

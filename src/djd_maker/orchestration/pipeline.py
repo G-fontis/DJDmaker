@@ -21,6 +21,7 @@ from djd_maker.core.interfaces import (
 from djd_maker.core.models import Job, JobState, Preset
 from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.core.cancellation import RunCancelled, checkpoint
+from djd_maker.adapters.studio_generation import StudioOutcomePending
 from djd_maker.core.cloud_limit import CloudLimitGate, CloudLimitReached
 from djd_maker.adapters.notebook_modal import BlockingModalError
 from djd_maker.adapters.notebook import SourceRetryExhausted, GenerationRetryExhausted
@@ -405,6 +406,9 @@ class PipelineCoordinator(DeferredRecovery):
                             job.failure_class = "SOURCE_UPLOAD_FAILED"
                         elif diagnosis.get("reply") == "QUOTA_EXHAUSTED":
                             job.failure_class = "QUOTA_RECOVERY_PENDING"
+                        elif job.studio_generate_claimed_at:
+                            target = JobState.RECOVERY_PENDING
+                            job.resume_checkpoint = 'STUDIO_GENERATION_CLAIMED'
                         elif diagnosis.get("preset") == "NOT_SENT":
                             job.failure_class = "PRESET_SEND_FAILED"
                         elif diagnosis.get("reply") == "NO_RESPONSE":
@@ -1222,7 +1226,9 @@ class PipelineCoordinator(DeferredRecovery):
             elif status == 'WAITING':
                 target = JobState.RESERVED_WAITING_CREDIT_RESET
             elif status == 'NOT_STARTED':
-                target = JobState.WAITING
+                target = JobState.RECOVERY_PENDING if job.studio_generate_claimed_at else JobState.WAITING
+                if job.studio_generate_claimed_at:
+                    job.resume_checkpoint = 'STUDIO_GENERATION_CLAIMED'
                 job.remote_checkpoint = 'SOURCE_READY' if result.get('source') == 'READY' else 'ARTIFACT_ABSENT'
             if target is None:
                 raise ValueError('NOTEBOOK_STATE_UNKNOWN: remote checkpointを確定できません')
@@ -1540,6 +1546,13 @@ class PipelineCoordinator(DeferredRecovery):
             status = self.notebook.inspect_status(job)
             job.last_checked_at = checked_at.isoformat()
             job.artifact_status = status
+            if status == 'NOT_STARTED' and job.generation_method == 'STUDIO_DIRECT' and not job.studio_generate_claimed_at:
+                job.state = JobState.WAITING
+                job.resume_checkpoint = 'STUDIO_GENERATION_PENDING'
+                job.next_poll_at = None
+                self.wait_seconds = 0
+                self._save(job)
+                return
             if status == "READY":
                 report_operation('artifact.ready', decision='READY', next_action='Download開始')
                 if job.state is not JobState.DOWNLOAD_PENDING:
@@ -1758,6 +1771,14 @@ class PipelineCoordinator(DeferredRecovery):
             job.error_code = None
             job.runtime_reason = 'CLOUD_BLOCKED_UNTIL' if job.state is JobState.WAITING else 'WAITING_REMOTE_ACCESS'
             self._save(job)
+        except StudioOutcomePending as exc:
+            job.state = JobState.RECOVERY_PENDING
+            job.resume_checkpoint = 'STUDIO_GENERATION_CLAIMED' if job.studio_generate_claimed_at else 'STUDIO_GENERATION_PENDING'
+            job.runtime_reason = 'GENERATION_STATE_UNCERTAIN'
+            job.error_code = job.error_message = None
+            job.failure_class = None
+            job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=120)).isoformat()
+            self._save(job)
         except (RunCancelled, BlockingModalError):
             job.resume_checkpoint = 'STOPPED:' + job.state.value
             if job.state is JobState.UPLOADING:
@@ -1810,6 +1831,8 @@ class PipelineCoordinator(DeferredRecovery):
                     "SOURCE_IDENTITY_AMBIGUOUS", "GENERATION_STATE_UNCERTAIN",
                     "LOCAL_SOURCE_FILE_MISSING",
                     "PRESET_NOT_SELECTED",
+                    "CONFIGURATION_UI_FAILED", "GENERATION_PRESET_MAPPING_REQUIRED",
+                    "GENERATION_SETTINGS_HASH_MISMATCH", "SOURCE_NOT_READY",
                 }:
                     job.error_code = failure_code
                     if failure_code == 'LOCAL_SOURCE_FILE_MISSING':

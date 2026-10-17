@@ -403,6 +403,10 @@ class NotebookDomAdapter:
 
     def ensure_interactable(self):
         checkpoint('notebook.interactable')
+        if getattr(self, 'studio_settings_owned', False):
+            from .studio_generation import ensure_studio_interactable
+            ensure_studio_interactable(self)
+            return
         if self.interactable_guard is not None:
             selected = self.interactable_guard(self.page, diagnostic=self.diagnostic)
             if selected is not None:
@@ -652,7 +656,8 @@ class NotebookDomAdapter:
                 continue
         return False
 
-    def _source_processing(self) -> bool:
+    def _source_processing(self, *, source_only=False) -> bool:
+        root = self.page.locator('source-panel, sources-panel, .source-panel') if source_only else self.page
         for selector in (
             "[role='progressbar']",
             "[aria-busy='true']",
@@ -661,9 +666,13 @@ class NotebookDomAdapter:
             ".source-loading",
             ".source-processing",
         ):
-            if self._any_visible(selector):
+            if source_only:
+                items = root.locator(selector)
+                if any(items.nth(i).is_visible() for i in range(items.count())):
+                    return True
+            elif self._any_visible(selector):
                 return True
-        body = self._body_text().casefold()
+        body = (root.inner_text() if source_only and root.count() == 1 else self._body_text()).casefold()
         return any(
             marker in body
             for marker in ("ソースを処理中", "ソースを解析中", "processing source")
@@ -743,7 +752,11 @@ class NotebookDomAdapter:
                 'READY': SourceState.READY, 'ERROR': SourceState.FAILED}.get(
                     self.source_state(filename), SourceState.UNKNOWN)
 
-    def source_state(self, filename: str) -> str:
+    def source_state(self, filename: str, *, include_hidden=False) -> str:
+        if getattr(self, 'studio_settings_owned', False):
+            from .studio_generation import owned_video_dialog
+            dialogs = self.page.get_by_role('dialog')
+            include_hidden = include_hidden or any(owned_video_dialog(dialogs.nth(i)) for i in range(dialogs.count()))
         panels = self.page.locator("source-panel, sources-panel, .source-panel, [data-testid='source-panel']")
         errors = (*SOURCE_ERROR_MARKERS, "ソースのアップロード中にエラー", "アップロード中にエラー")
         for index in range(panels.count()):
@@ -752,7 +765,8 @@ class NotebookDomAdapter:
                 continue
             source_cards = panel.locator(".single-source-container")
             if source_cards.count():
-                matches = source_cards.filter(has=self.page.get_by_role("button", name=Path(filename).name, exact=True))
+                options = {'include_hidden': True} if include_hidden else {}
+                matches = source_cards.filter(has=self.page.get_by_role("button", name=Path(filename).name, exact=True, **options))
                 if matches.count() > 1:
                     raise SourceProcessingError("SOURCE_IDENTITY_AMBIGUOUS: 同名sourceが複数存在します")
                 if not matches.count():
@@ -781,9 +795,10 @@ class NotebookDomAdapter:
                     return "ERROR"
         if not self._source_registered(filename):
             return "MISSING"
-        if not self._source_processing() and self._chat_source_count_positive() and self._studio_video_card_active():
+        processing = self._source_processing(source_only=True) if include_hidden else self._source_processing()
+        if not processing and self._chat_source_count_positive() and self._studio_video_card_active():
             return "READY"
-        return "PROCESSING" if self._source_processing() else "UNKNOWN"
+        return "PROCESSING" if processing else "UNKNOWN"
 
     def remove_failed_source(self, filename: str) -> None:
         """Remove only the uniquely identified failed row, never all sources.
@@ -1463,10 +1478,14 @@ class NotebookEngineAdapter:
         dom: NotebookDomAdapter,
         recover_page: Callable[[], Any] | None = None,
         persist_identity: Callable[[Job], None] | None = None,
+        generation_method: str = 'STUDIO_DIRECT',
     ) -> None:
         self.dom = dom
         self.recover_page = recover_page
         self.persist_identity = persist_identity
+        if generation_method not in {'STUDIO_DIRECT', 'LEGACY_CHAT_FLOW'}:
+            raise ValueError('Unknown generation method')
+        self.generation_method = generation_method
 
     @staticmethod
     def _set_if_available(job: Job, name: str, value: Any) -> None:
@@ -1506,11 +1525,13 @@ class NotebookEngineAdapter:
 
     def submit(self, job: Job) -> NotebookSubmissionResult:
         from djd_maker.core.runtime_operation import report_operation
+        job.generation_method = self.generation_method
         try:
             prompt = job.require_preset_body_snapshot()
         except ValueError as exc:
             raise NotebookAdapterError(str(exc)) from exc
         source = Path(job.source_path)
+        self.dom.studio_settings_owned = self.generation_method == 'STUDIO_DIRECT'
         self.dom.source_recovery_job = job
         self.dom.source_recovery_persist = self.persist_identity
         if bool(job.notebook_id) != bool(job.notebook_url):
@@ -1540,6 +1561,8 @@ class NotebookEngineAdapter:
                 if status != 'NOT_STARTED':
                     raise NotebookAdapterError("REMOTE_DIAGNOSIS_UNCERTAIN: 既存artifact状態を確定できません")
         else:
+            if self.generation_method == 'STUDIO_DIRECT':
+                job.require_generation_settings()
             self._verify_local_source(job, source)
             report_operation('notebook.create')
             metadata = self.dom.create_notebook()
@@ -1552,21 +1575,27 @@ class NotebookEngineAdapter:
         from djd_maker.core.runtime_operation import report_operation
         report_operation('source.check')
         try:
-            self.dom.ensure_source(source)
+            if not (self.generation_method == 'STUDIO_DIRECT' and
+                    self.dom.source_state(source.name, include_hidden=True) == 'READY'):
+                self.dom.ensure_source(source)
         except (RunCancelled, JobStateSaveError):
             raise
         except Exception:
             report_operation('source.error')
             raise
         job.source_status = "READY"
-        report_operation('source.ready', decision='SOURCE_ALREADY_READY', next_action='中央ChatへPreset送信')
+        report_operation('source.ready', decision='SOURCE_ALREADY_READY', next_action='Studioで動画設定')
         # Persist/adopt the remote identity before the irreversible generation
         # action when the caller supplied a repository callback.
         job.notebook_id = metadata.notebook_id
         job.notebook_url = metadata.notebook_url
         if self.persist_identity is not None:
             self.persist_identity(job)
-        outcome = self.dom.start_video_generation_from_chat(prompt)
+        if self.generation_method == 'STUDIO_DIRECT':
+            from .studio_generation import StudioGeneration
+            outcome = StudioGeneration(self.dom, job, self.persist_identity).run()
+        else:
+            outcome = self.dom.start_video_generation_from_chat(prompt)
         if not isinstance(outcome, GenerationOutcome):
             outcome = GenerationOutcome(
                 RemoteVideoStatus.UNKNOWN,
@@ -1594,6 +1623,9 @@ class NotebookEngineAdapter:
 
     def retry_failed_generation(self, job: Job) -> NotebookSubmissionResult:
         """Bounded current-state retry via the original immutable chat snapshot."""
+        job.generation_method = self.generation_method
+        if self.generation_method == 'STUDIO_DIRECT':
+            return self._retry_failed_studio(job)
         from .chat_flow import ChatFlow
         from .replies import classify_reply, ReplyKind
         from djd_maker.core.runtime_operation import report_operation
@@ -1660,6 +1692,34 @@ class NotebookEngineAdapter:
         job.generation_retry_turn_count = None
         self._record_submission(job, metadata, outcome)
         return NotebookSubmissionResult(metadata.notebook_id, metadata.notebook_url, outcome)
+
+    def _retry_failed_studio(self, job):
+        from .studio_generation import StudioGeneration, StudioOutcomePending
+        self.dom.studio_settings_owned = True
+        self._open_job(job)
+        status = self.inspect_status(job)
+        if status in {'GENERATING','READY','WAITING'}:
+            return NotebookSubmissionResult(job.notebook_id, job.notebook_url,
+                GenerationOutcome(RemoteVideoStatus(status), status == 'WAITING', CreditSnapshot()))
+        if status != 'FAILED':
+            raise StudioOutcomePending('GENERATION_STATE_UNCERTAIN: failed artifactの再確認が必要です')
+        if job.studio_generate_claimed_at and job.studio_generation_stage != 'GENERATION_STARTED':
+            raise StudioOutcomePending('GENERATION_STATE_UNCERTAIN: 前回Generateの結果を確認します')
+        job.require_generation_settings()
+        self.dom.check_usage_limit()
+        if self.dom.source_state(Path(job.source_path).name, include_hidden=True) != 'READY':
+            self.dom.ensure_source(Path(job.source_path))
+        used = job.attempt_by_stage.get('generation.failed_retry', 0)
+        if used >= 3:
+            raise GenerationRetryExhausted('GENERATION_RETRY_EXHAUSTED: Studio再生成は最大3回です')
+        job.attempt_by_stage['generation.failed_retry'] = used + 1
+        job.studio_generate_claimed_at = None
+        if self.persist_identity:
+            self.persist_identity(job)
+        outcome = StudioGeneration(self.dom, job, self.persist_identity).run(retry_failed=True)
+        metadata = ResumeMetadata(job.notebook_id, job.notebook_url, job.script_name)
+        self._record_submission(job, metadata, outcome)
+        return NotebookSubmissionResult(job.notebook_id, job.notebook_url, outcome)
 
     def recheck_cloud_limit(self, notebook_url=None):
         if notebook_url:
@@ -1765,6 +1825,10 @@ class NotebookEngineAdapter:
         if status in {"READY", "GENERATING", "WAITING"}:
             return {"artifact": status}
         source_state = self.dom.source_state(Path(job.source_path).name)
+        if self.generation_method == 'STUDIO_DIRECT':
+            return {'artifact': status, 'source': source_state,
+                    'preset': 'NOT_SENT', 'reply': 'NO_RESPONSE',
+                    'studio': 'CLICK_CLAIMED' if job.studio_generate_claimed_at else 'STUDIO_GENERATION_PENDING'}
         reply_kind = "NO_RESPONSE"
         sent = False
         if job.preset_body_snapshot:
