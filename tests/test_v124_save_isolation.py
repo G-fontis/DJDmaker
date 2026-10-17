@@ -293,7 +293,8 @@ def test_validated_hls_zip_checkpoint_never_reencodes(tmp_path, monkeypatch, sta
     from djd_maker.packaging.portable_e2e import _make_fixture
     ffmpeg, ffprobe = shutil.which('ffmpeg'), shutil.which('ffprobe')
     assert ffmpeg and ffprobe
-    raw = tmp_path / 'raw.mp4'
+    raw = tmp_path / 'raw_files' / 'one.mp4'
+    raw.parent.mkdir()
     _make_fixture(Path(ffmpeg), raw, 'blue', 1)
     from dataclasses import replace
     from hashlib import sha256

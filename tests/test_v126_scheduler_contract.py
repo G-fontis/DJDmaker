@@ -102,7 +102,8 @@ def test_ten_minute_wait_is_immediately_pause_stop_interruptible():
 
 def test_persisted_three_attempt_budget_does_not_stop_other_job(tmp_path):
     from test_pipeline import Ending
-    raw = tmp_path/'bad.mp4'
+    raw = tmp_path/'raw_files'/'bad.mp4'
+    raw.parent.mkdir()
     raw.write_bytes(b'raw')
     bad = Job('bad.txt', state=JobState.RAW_READY, raw_path=str(raw))
     good = Job('good.txt', state=JobState.WAITING_VIDEO, notebook_id='good',

@@ -10,6 +10,7 @@ from djd_maker.core.models import Job, JobState
 from djd_maker.core.settings import AppSettings
 from djd_maker.orchestration.gui_controller import GuiPipelineController
 from djd_maker.orchestration.pipeline import PipelineCoordinator, PipelinePaths
+from test_pipeline import RawStore
 
 
 class ThreadSafeJobs:
@@ -72,7 +73,8 @@ class MinimalHls:
 
 
 def test_ffmpeg_lane_really_runs_two_distinct_job_id_workspaces_in_parallel(tmp_path):
-    raw_a, raw_b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    raw_a, raw_b = tmp_path / "raw_files" / "A.mp4", tmp_path / "raw_files" / "B.mp4"
+    raw_a.parent.mkdir()
     raw_a.write_bytes(b"a")
     raw_b.write_bytes(b"b")
     first = Job("A.txt", id="job-a", state=JobState.RAW_READY, raw_path=str(raw_a))
@@ -84,7 +86,7 @@ def test_ffmpeg_lane_really_runs_two_distinct_job_id_workspaces_in_parallel(tmp_
     pipeline = PipelineCoordinator(
         jobs=jobs,
         notebook=SimpleNamespace(),
-        raw_store=SimpleNamespace(),
+        raw_store=RawStore(),
         ending=ending,
         hls=MinimalHls(),
         validator=SimpleNamespace(validate=lambda path: SimpleNamespace(valid=True)),

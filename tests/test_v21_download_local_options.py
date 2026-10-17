@@ -107,7 +107,7 @@ def test_all_sixteen_local_and_hls_contracts(tmp_path, ending, tail, encode, hls
             return MediaResult(output, 1.0, output.stat().st_size, .4, .9)
 
     case = f'{int(ending)}{int(tail)}{int(encode)}-{int(hls)}'
-    raw = tmp_path / case / 'raw.mp4'
+    raw = tmp_path / case / 'raw_files' / (case+'.mp4')
     raw.parent.mkdir(parents=True)
     raw.write_bytes(b'raw')
     source = tmp_path / case / (case + '.txt')

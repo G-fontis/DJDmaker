@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.5"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.6"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -674,7 +674,12 @@ class MainWindow(Phase2Presentation, QMainWindow):
                 self.pipeline_steps[key].setState(state)
             import shutil
             try:
-                self.storage_free_label.setText(f'空き容量: {shutil.disk_usage(self.app_root).free // (1024**3)} GiB')
+                raw_volume = Path(self.settings.raw_directory).expanduser()
+                if not raw_volume.is_absolute():
+                    raw_volume = self.app_root / raw_volume
+                while not raw_volume.exists() and raw_volume != raw_volume.parent:
+                    raw_volume = raw_volume.parent
+                self.storage_free_label.setText(f'RAW空き容量: {shutil.disk_usage(raw_volume).free // (1024**3)} GiB')
             except OSError:
                 self.storage_free_label.setText('空き容量: 取得不可')
         self._update_action_state()

@@ -300,7 +300,8 @@ def test_one_failure_does_not_stop_other_two_jobs(tmp_path: Path) -> None:
     raws = []
     jobs_list = []
     for stem in ("A", "B", "C"):
-        raw = tmp_path / f"{stem}.mp4"
+        raw = tmp_path / "raw_files" / f"{stem}.mp4"
+        raw.parent.mkdir(exist_ok=True)
         raw.write_bytes(stem.encode())
         raws.append(raw)
         jobs_list.append(Job(f"{stem}.txt", id=stem, state=JobState.RAW_READY, raw_path=str(raw)))
@@ -333,12 +334,13 @@ def test_restart_recovers_three_stages_without_touching_completed_job(
         notebook_id="waiting",
         notebook_url="https://notebook.google.com/notebook/waiting",
     )
-    raw_ready_file = tmp_path / "raw-ready.mp4"
+    raw_ready_file = tmp_path / "raw_files" / "raw-ready.mp4"
+    raw_ready_file.parent.mkdir()
     raw_ready_file.write_bytes(b"raw-ready")
     raw_ready = Job(
         "raw-ready.txt", id="raw-ready", state=JobState.RAW_READY, raw_path=str(raw_ready_file)
     )
-    hls_raw = tmp_path / "hls.mp4"
+    hls_raw = tmp_path / "raw_files" / "hls.mp4"
     hls_raw.write_bytes(b"hls-raw")
     hls_job = Job(
         "hls.txt", id="hls", state=JobState.HLS_ENCODING, raw_path=str(hls_raw)

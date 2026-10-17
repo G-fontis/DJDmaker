@@ -50,7 +50,7 @@ def test_unknown_limit_time_never_resumes(tmp_path, clock_text):
 
 
 def test_limit_interrupts_dispatch_and_drains_raw(tmp_path):
-    raw = tmp_path/'raw.mp4'; raw.write_bytes(b'RAW')
+    raw = tmp_path/'raw_files'/'local.mp4'; raw.parent.mkdir();raw.write_bytes(b'RAW')
     waiting = [Job(f'{i}.txt') for i in range(3)]
     local = Job('local.txt', state=JobState.RAW_READY, raw_path=str(raw))
     repo = MemoryJobs(*waiting, local)
@@ -237,7 +237,7 @@ def test_limit_downloaded_validation_and_local_only_cleanup(tmp_path):
     job = Job('downloaded.txt', state=JobState.DOWNLOADING, notebook_id='kept', artifact_status='READY')
     remote=Remote([])
     pipe=coordinator(tmp_path, MemoryJobs(job), remote)
-    download=pipe.paths.work_directory/job.id/'download'/f'{job.script_name}.mp4'
+    download=pipe._download_path(job)
     download.parent.mkdir(parents=True)
     download.write_bytes(b'validated-by-test-raw-store')
     pipe.cloud_limit.clock=lambda: NOW

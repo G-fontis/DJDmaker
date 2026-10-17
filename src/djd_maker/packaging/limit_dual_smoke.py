@@ -81,11 +81,11 @@ def run_limit_dual_smoke(root, report, *, video=None, observed_limit=None):
     source.parent.mkdir(parents=True,exist_ok=True)
     source.write_text('isolated acceptance only',encoding='utf-8')
     local=Job(str(source),id='limit-local',state=JobState.RAW_READY)
-    downloaded=root/'work'/local.id/'download'/f'{local.script_name}.mp4'
+    downloaded=root/'raw_files/.djd_download_tmp'/local.id/f'{local.script_name}.mp4'
     downloaded.parent.mkdir(parents=True)
     shutil.copyfile(fixture,downloaded)
     validator=VideoValidator(ffprobe)
-    saved=RawSafeStore(validator,root/'raw_files').save(downloaded,root/'raw_files'/f'{local.script_name}.mp4')
+    saved=RawSafeStore(validator,root/'raw_files').publish(downloaded,root/'raw_files'/f'{local.script_name}.mp4')
     local.raw_path=str(saved.path)
     local.raw_size_bytes=saved.media.size_bytes
     local.duration_seconds=saved.media.duration_seconds

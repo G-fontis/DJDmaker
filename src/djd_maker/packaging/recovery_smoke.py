@@ -113,7 +113,8 @@ def run_recovery_smoke(root, report):
         ffprobe = resolve_executable('ffprobe', tools/'ffprobe.exe' if (tools/'ffprobe.exe').exists() else None)
         raw = root/'fixture.mp4'
         _make_fixture(ffmpeg, raw, 'blue', 2)
-        raw_a, raw_b = root/'a.mp4', root/'b.mp4'
+        raw_a, raw_b = root/'raw/a.mp4', root/'raw/b.mp4'
+        raw_a.parent.mkdir()
         for owned_raw in (raw_a, raw_b):
             shutil.copy2(raw, owned_raw)
         local_repo = JobRepository(root/'priority/jobs')

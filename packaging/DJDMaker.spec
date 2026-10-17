@@ -84,5 +84,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="DJDmaker_Ver2.5",
+    name="DJDmaker_Ver2.6",
 )

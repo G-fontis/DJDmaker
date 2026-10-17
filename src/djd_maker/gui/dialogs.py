@@ -389,7 +389,12 @@ class JobDetailDialog(QDialog):
         form.addRow("生成開始", QLabel(job.generation_started_at or "－"))
         form.addRow("最終確認", QLabel(job.last_polled_at or "－"))
         form.addRow("次回確認", QLabel(job.next_poll_at or "－"))
-        form.addRow("RAW", QLabel(job.raw_path or "－"))
+        saved_raw = Path(job.raw_path) if job.raw_path else None
+        legacy_work_raw = bool(saved_raw and job.raw_storage_version < 2 and (
+            (saved_raw.parent.name == 'download' and saved_raw.parent.parent.name == job.id)
+            or (saved_raw.name == 'raw.mp4' and saved_raw.parent.name.startswith('manual-')
+                and saved_raw.parent.parent.name == job.id)))
+        form.addRow("RAW", QLabel('旧RAWの移行待ち' if legacy_work_raw else job.raw_path or "－"))
         form.addRow("RAW size", QLabel(str(job.raw_size_bytes) if job.raw_size_bytes is not None else "－"))
         form.addRow("duration", QLabel(str(job.duration_seconds) if job.duration_seconds is not None else "－"))
         form.addRow("保存リトライ", QLabel(f"{job.download_retry_count}/5"))
@@ -459,7 +464,7 @@ class JobDetailDialog(QDialog):
         layout.addWidget(close)
 
         failed = job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
-        raw = safe_existing_file(job.raw_path)
+        raw = None if legacy_work_raw else safe_existing_file(job.raw_path)
         edited = safe_existing_file(job.edited_path)
         zip_path = safe_existing_file(job.zip_path)
         self.retry_job_button.setEnabled(failed)

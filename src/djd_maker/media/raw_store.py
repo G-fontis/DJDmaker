@@ -143,6 +143,26 @@ class RawSafeStore:
             destination_path, media, source_result, raw_result, gate
         )
 
+    def publish(self, source: str | Path, destination: str | Path) -> RawStoreResult:
+        """Consume a validated candidate on the RAW volume without copying it."""
+        source, destination = Path(source), Path(destination)
+        self.validator.validate(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() == destination.resolve():
+            return self.verify_existing(source, destination)
+        if destination.exists():
+            result = self.verify_existing(source, destination)
+        else:
+            try:
+                checkpoint('raw.publish')
+                os.link(source, destination)  # Atomic, same-volume, no overwrite.
+            except FileExistsError:
+                result = self.verify_existing(source, destination)
+            else:
+                result = self.verify_existing(source, destination)
+        source.unlink()
+        return result
+
     def store(self, source: str | Path, filename: str | None = None) -> RawStoreResult:
         """Directory-oriented convenience wrapper used by standalone callers."""
         if self.raw_directory is None:

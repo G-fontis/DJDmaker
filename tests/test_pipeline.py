@@ -137,7 +137,7 @@ def coordinator(tmp_path, jobs, notebook, ending=None, preset=None):
 @pytest.mark.parametrize('state',[JobState.RAW_READY,JobState.ENDING,JobState.HLS_ENCODING,JobState.ZIPPING])
 def test_optional_ending_uses_immutable_raw_and_can_resume(tmp_path,state):
     from dataclasses import replace
-    raw=tmp_path/'raw.mp4';raw.write_bytes(b'original raw video')
+    raw=tmp_path/'raw_files'/'optional.mp4';raw.parent.mkdir();raw.write_bytes(b'original raw video')
     job=Job('optional.txt',state=state,raw_path=str(raw))
     if state in {JobState.HLS_ENCODING,JobState.ZIPPING}:
         job.edited_path=str(raw);job.ending_result='SKIPPED (not configured)'
@@ -391,7 +391,8 @@ def test_waiting_notebook_does_not_block_raw_ready_job(tmp_path):
         notebook_id="a",
         notebook_url="https://notebook.google.com/notebook/a",
     )
-    raw = tmp_path / "raw-b.mp4"
+    raw = tmp_path / "raw_files" / "B.mp4"
+    raw.parent.mkdir()
     raw.write_bytes(b"raw")
     ready = Job("B.txt", state=JobState.RAW_READY, raw_path=str(raw))
     jobs = MemoryJobs(waiting, ready)
@@ -402,8 +403,9 @@ def test_waiting_notebook_does_not_block_raw_ready_job(tmp_path):
 
 
 def test_one_media_failure_does_not_stop_other_job(tmp_path):
-    bad_raw = tmp_path / "bad.mp4"
-    good_raw = tmp_path / "good.mp4"
+    bad_raw = tmp_path / "raw_files" / "bad.mp4"
+    good_raw = tmp_path / "raw_files" / "good.mp4"
+    bad_raw.parent.mkdir()
     bad_raw.write_bytes(b"bad")
     good_raw.write_bytes(b"good")
     bad = Job("bad.txt", state=JobState.RAW_READY, raw_path=str(bad_raw))
@@ -449,6 +451,8 @@ def test_download_restart_reuses_verified_existing_raw(tmp_path):
         "resume.txt",
         id="job",
         state=JobState.DOWNLOADING,
+        raw_storage_version=1,
+        download_status='DOWNLOADED',
         notebook_id="remote",
         notebook_url="https://notebook.google.com/notebook/remote",
     )
@@ -461,7 +465,8 @@ def test_download_restart_reuses_verified_existing_raw(tmp_path):
 
 
 def test_ending_restart_uses_valid_checkpoint_without_reencoding(tmp_path):
-    raw = tmp_path / "raw.mp4"
+    raw = tmp_path / "raw_files" / "resume-ending.mp4"
+    raw.parent.mkdir()
     raw.write_bytes(b"raw")
     job = Job("resume-ending.txt", state=JobState.ENDING, raw_path=str(raw))
     edited = tmp_path / "work" / job.id / "ending" / "resume-ending.mp4"

@@ -10,7 +10,8 @@ from test_v125_limit_pause_contract import NOW
 
 @pytest.mark.parametrize('stage', ['ENDING', 'HLS_ENCODING'])
 def test_quota_recovery_preempts_next_local_after_running_task_finishes(tmp_path, stage):
-    raw_a, raw_b = tmp_path/'a.mp4', tmp_path/'b.mp4'
+    raw_a, raw_b = tmp_path/'raw_files'/'a.mp4', tmp_path/'raw_files'/'b.mp4'
+    raw_a.parent.mkdir()
     for raw in (raw_a, raw_b):
         raw.write_bytes(b'raw')
     a = Job('a.txt', state=JobState(stage), raw_path=str(raw_a), edited_path=str(raw_a))
@@ -73,7 +74,8 @@ def test_hls_checkpoint_yields_before_zip_and_resumes_without_reencoding(tmp_pat
     from pathlib import Path
     from types import SimpleNamespace
     from djd_maker.adapters.hls import HlsAdapter, ProbeResult
-    raw_a, raw_b = tmp_path/'a.mp4', tmp_path/'b.mp4'
+    raw_a, raw_b = tmp_path/'raw_files'/'a.mp4', tmp_path/'raw_files'/'b.mp4'
+    raw_a.parent.mkdir()
     for raw in (raw_a, raw_b):
         raw.write_bytes(b'raw')
     tool = tmp_path/'tool.exe'
@@ -120,7 +122,8 @@ def test_two_running_workers_finish_but_no_queued_third_task_starts(tmp_path):
     b_started, b_release = threading.Event(), threading.Event()
     jobs = []
     for name in ('a', 'b', 'c'):
-        raw = tmp_path/f'{name}.mp4'
+        raw = tmp_path/'raw_files'/f'{name}.mp4'
+        raw.parent.mkdir(exist_ok=True)
         raw.write_bytes(b'raw')
         jobs.append(Job(f'{name}.txt', state=JobState.ENDING, raw_path=str(raw)))
     cloud = Job('cloud.txt')
@@ -172,7 +175,8 @@ def test_near_warning_does_not_mask_explicit_hard_limit():
 
 
 def test_one_job_progress_is_not_counted_again_for_each_local_stage(tmp_path):
-    raw = tmp_path/'raw.mp4'
+    raw = tmp_path/'raw_files'/'one.mp4'
+    raw.parent.mkdir()
     raw.write_bytes(b'raw')
     job = Job('one.txt', state=JobState.RAW_READY, raw_path=str(raw))
     pipe = coordinator(tmp_path, MemoryJobs(job), Remote([]))

@@ -81,7 +81,7 @@ def test_due_failed_remote_remains_unfinished_even_with_old_fatal_class():
 
 @pytest.mark.parametrize('state', [JobState.RAW_READY, JobState.ENDING, JobState.HLS_ENCODING])
 def test_legacy_pending_delete_is_retained_during_local_resume(tmp_path, state):
-    raw = tmp_path/'raw.mp4'; raw.write_bytes(b'raw')
+    raw = tmp_path/'raw_files'/'retained.mp4';raw.parent.mkdir();raw.write_bytes(b'raw')
     job = Job('retained.txt', state=state, raw_path=str(raw), edited_path=str(raw),
               notebook_id='remote', artifact_status='DELETE_PENDING')
     jobs=MemoryJobs(job); remote=FakeNotebookAdapter({})

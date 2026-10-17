@@ -78,9 +78,10 @@ class DeferredRecovery:
             entry = self.deferred.entries[job_id]
             if local_only and entry.snapshot:
                 snapshot = Job.from_dict(entry.snapshot)
-                downloaded = self.paths.work_directory / snapshot.id / 'download' / f'{snapshot.script_name}.mp4'
-                raw = Path(snapshot.raw_path) if snapshot.raw_path else self.paths.raw_directory / f'{snapshot.script_name}.mp4'
-                if snapshot.notebook_url and not (raw.is_file() or downloaded.is_file() or snapshot.state is JobState.COMPLETED):
+                downloaded = self._download_path(snapshot)
+                raw = self._raw_path(snapshot)
+                legacy = self._legacy_raw_source(snapshot)
+                if snapshot.notebook_url and not (raw.is_file() or downloaded.is_file() or legacy is not None or snapshot.state is JobState.COMPLETED):
                     continue
             self._deferred_attempts[job_id] = attempts + 1
             entry.retry_count += 1
@@ -149,8 +150,8 @@ class DeferredRecovery:
             job.state = JobState.COMPLETED
             job.progress_percent = 100
             return job
-        download = self.paths.work_directory / job.id / 'download' / f'{job.script_name}.mp4'
-        raw = Path(job.raw_path) if job.raw_path else self.paths.raw_directory / f'{job.script_name}.mp4'
+        download = self._download_path(job)
+        raw = self._canonical_raw(job, recover=True) or self._raw_path(job)
         if raw.is_file() and (job.raw_path or job.download_status == 'DOWNLOADED'):
             from djd_maker.core.output_ownership import path_identity
             if (not job.raw_path and not download.is_file()) or any(
@@ -162,7 +163,7 @@ class DeferredRecovery:
                 return None
             # Reuse the original RAW safety validator; never infer the 12 gates
             # from existence alone. No new remote download is invoked here.
-            stored = self.raw_store.verify_existing(download if download.is_file() else raw, raw)
+            stored = self.raw_store.verify_existing(raw, raw)
             if stored.safety_gate.failed_checks:
                 return None
             job.raw_path = str(raw)

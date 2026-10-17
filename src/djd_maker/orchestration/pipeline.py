@@ -75,6 +75,7 @@ class PipelinePaths:
 
 
 from .deferred_recovery import DeferredRecovery
+from .raw_storage import RawStorage
 from .task_discovery import (
     Capabilities, RESCAN_SECONDS, MAX_ERROR_ATTEMPTS, due, terminal,
     remote_reconcile_candidate, automatic_download_recovery_candidate,
@@ -104,7 +105,7 @@ def _download_failure_reason(error: object) -> str:
     return 'DOWNLOAD_INCOMPLETE'
 
 
-class PipelineCoordinator(DeferredRecovery):
+class PipelineCoordinator(RawStorage, DeferredRecovery):
     """Notebook laneとbounded FFmpeg laneを1 cycleずつ前進させる。"""
 
     NOTEBOOK_STATES = frozenset(
@@ -391,7 +392,7 @@ class PipelineCoordinator(DeferredRecovery):
                 continue
             target = None
             try:
-                if job.raw_path and Path(job.raw_path).is_file():
+                if self._canonical_raw(job) is not None:
                     if getattr(self.validator.validate(Path(job.raw_path)), "valid", True):
                         target = JobState.RAW_READY
                         if job.edited_path and Path(job.edited_path).is_file() and getattr(self.validator.validate(Path(job.edited_path)), "valid", True):
@@ -759,8 +760,14 @@ class PipelineCoordinator(DeferredRecovery):
         for job in self.jobs.list():
             if job.id in self.deferred_ids or job.state not in {JobState.DOWNLOADING, JobState.DOWNLOAD_PENDING}:
                 continue
-            download = self.paths.work_directory / job.id / 'download' / f'{job.script_name}.mp4'
-            if not download.is_file() and (local_only or not getattr(self.notebook, 'download_during_limit_verified', False)):
+            download = self._download_path(job)
+            from djd_maker.core.output_ownership import path_identity
+            from djd_maker.core.artifact_ownership import _digest
+            canonical = self._raw_path(job)
+            local_raw = canonical.is_file() and (
+                (job.raw_path and path_identity(job.raw_path) == path_identity(canonical))
+                or (job.raw_publish_sha256 and _digest(canonical) == job.raw_publish_sha256))
+            if not (download.is_file() or local_raw) and (local_only or not getattr(self.notebook, 'download_during_limit_verified', False)):
                 continue
             if self._generation_preempts():
                 return
@@ -1171,7 +1178,7 @@ class PipelineCoordinator(DeferredRecovery):
         try:
             if not Path(job.source_path).is_file():
                 job.local_error_code = 'LOCAL_SOURCE_FILE_MISSING'
-            if job.raw_path and Path(job.raw_path).is_file():
+            if self._canonical_raw(job, recover=True) is not None:
                 from djd_maker.core.output_ownership import path_identity
                 if any(other.id != job.id and other.raw_path
                        and path_identity(other.raw_path) == path_identity(job.raw_path)
@@ -1310,6 +1317,12 @@ class PipelineCoordinator(DeferredRecovery):
         while True:
             checkpoint('download.quality_gate')
             candidate = Path(job.download_candidate_path) if job.download_candidate_path else None
+            if candidate is not None and candidate.parent.resolve() != destination.parent.resolve():
+                # Old work candidates are never a new write/delete target.
+                job.download_candidate_path = None
+                job.next_quality_check_at = None
+                self._save(job)
+                candidate = None
             if candidate is not None and candidate.is_file():
                 due_at = self._parse_utc(job.next_quality_check_at)
                 now = self.cloud_limit.clock()
@@ -1355,8 +1368,6 @@ class PipelineCoordinator(DeferredRecovery):
 
                 job.next_quality_check_at = None
                 if passed:
-                    if destination.exists():
-                        destination.unlink()
                     os.replace(candidate, destination)
                     job.download_candidate_path = None
                     job.download_status = 'DOWNLOADED_QUALITY_ACCEPTED'
@@ -1609,6 +1620,14 @@ class PipelineCoordinator(DeferredRecovery):
         status = None
         raw_validation_started = False
         try:
+            if job.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING} and not job.manual_retry_requested:
+                if job.state is JobState.DOWNLOAD_PENDING:
+                    self._transition(job, JobState.DOWNLOADING)
+                raw_validation_started = self._raw_path(job).is_file()
+                if self._canonical_raw(job, recover=True) is not None:
+                    job.raw_status = 'READY'
+                    job.download_validation_status = 'DOWNLOAD_VALIDATED'
+                    self._transition(job, JobState.RAW_READY)
             if job.state is JobState.WAITING:
                 checkpoint('notebook.submit')
                 if self.generation_preset is None:
@@ -1709,12 +1728,7 @@ class PipelineCoordinator(DeferredRecovery):
 
             if job.state is JobState.DOWNLOADING:
                 checkpoint('download.start')
-                download = (
-                    self.paths.work_directory
-                    / job.id
-                    / "download"
-                    / f"{job.script_name}.mp4"
-                )
+                download = self._download_path(job)
                 download = self._download_with_size_gate(job, download)
                 if download is None:
                     return
@@ -1726,16 +1740,24 @@ class PipelineCoordinator(DeferredRecovery):
                 report_operation('download.complete')
                 report_operation('raw.validate')
                 raw_path = self.paths.raw_directory / f"{job.script_name}.mp4"
+                # Durable ownership before publish permits crash recovery of
+                # this exact canonical file without scanning work.
+                from djd_maker.core.artifact_ownership import _digest
+                job.raw_publish_sha256 = _digest(download)
+                self._save(job)
                 if raw_path.exists():
                     stored = self.raw_store.verify_existing(download, raw_path)
                 else:
-                    stored = self.raw_store.save(download, raw_path)
+                    publish = getattr(self.raw_store, 'publish', self.raw_store.save)
+                    stored = publish(download, raw_path)
                 media = getattr(stored, "media", stored)
                 gate = getattr(stored, "safety_gate", None)
                 if gate is None:
                     raise RuntimeError("RAW store did not return a deletion safety gate")
                 if gate.failed_checks:
                     raise RuntimeError('RAW safety gate failed: ' + ', '.join(gate.failed_checks))
+                if download != raw_path:
+                    download.unlink(missing_ok=True)
                 job.raw_path = str(getattr(media, "path", raw_path))
                 job.raw_size_bytes = getattr(media, "size_bytes", None)
                 job.duration_seconds = getattr(media, "duration_seconds", None)
@@ -1748,7 +1770,7 @@ class PipelineCoordinator(DeferredRecovery):
                 job.download_validation_status = 'DOWNLOAD_VALIDATED'
                 job.artifact_status = 'RETAINED'
                 self._transition(job, JobState.RAW_READY)
-                report_operation('raw.saved', decision='RAW_READY', next_action='動画をNotebookに保持してローカル処理')
+                report_operation('raw.saved', decision='RAW保存：' + job.raw_path, next_action='動画をNotebookに保持してローカル処理')
         except (SourceRetryExhausted, GenerationRetryExhausted) as exc:
             job.error_code = str(exc).split(':', 1)[0]
             job.error_message = str(exc)
@@ -1888,6 +1910,15 @@ class PipelineCoordinator(DeferredRecovery):
     def _run_media_job(self, job: Job, *, one_task=False) -> None:
         try:
             checkpoint('media.start', job.id)
+            if self._canonical_raw(job) is None:
+                from djd_maker.core.final_mp4 import owned_mp4
+                completed_input = Path(job.final_mp4_path) if job.final_mp4_path else None
+                if (job.state not in {JobState.HLS_ENCODING, JobState.ZIPPING}
+                        or completed_input is None or not owned_mp4(job, completed_input, self.jobs)):
+                    raise ValueError('CANONICAL_RAW_MISSING: 指定RAW保存先の正本を確認できません')
+                # Explicit HLS-from-completed-MP4 needs its owned completed
+                # input, not a second RAW or a work-RAW fallback.
+                job.raw_path = str(self._raw_path(job))
             if job.download_validation_status not in {
                 'DOWNLOAD_VALIDATED', 'PASS', 'PASS_LEGACY_RAW_REVALIDATED'
             }:
@@ -2100,6 +2131,18 @@ class PipelineCoordinator(DeferredRecovery):
         status = self.notebook.inspect_status(job)
         if status != 'READY':
             raise ValueError('NotebookにDownload可能な動画がありません')
+        if job.raw_storage_version >= 2:
+            # A fresh explicit retry supersedes this job's previous temporary
+            # candidate. Never scan work or remove canonical/rollback RAWs.
+            previous = self._download_path(job)
+            leftovers = {previous}
+            if job.download_candidate_path:
+                candidate = Path(job.download_candidate_path)
+                if (candidate.parent.resolve() == previous.parent.resolve()
+                        and candidate.name.startswith(f'.{previous.stem}.attempt-')):
+                    leftovers.add(candidate)
+            for leftover in leftovers:
+                leftover.unlink(missing_ok=True)
         job.ending_enabled, job.tail_cut_enabled, job.encode_enabled, job.hls_zip_enabled = config
         job.manual_download_session += 1
         job.manual_retry_requested = True
@@ -2209,13 +2252,13 @@ class PipelineCoordinator(DeferredRecovery):
         return job_ids
 
     def _commit_manual_retry(self, job: Job, download: Path) -> None:
-        """Build every replacement in work, then commit or roll back as a set."""
+        """Keep RAW on its own volume; commit validated RAW/output as a set."""
         from djd_maker.core.artifact_ownership import _digest
-        tx = self.paths.work_directory / job.id / f'manual-{job.manual_download_session}'
+        from uuid import uuid4
+        tx = self.paths.output_directory / '.djd_publish_tmp' / job.id / uuid4().hex
         tx.mkdir(parents=True, exist_ok=True)
-        staged_raw = tx / 'raw.mp4'
-        staged_raw.unlink(missing_ok=True)
-        stored = self.raw_store.save(download, staged_raw)
+        staged_raw = download
+        stored = self.raw_store.verify_existing(download, download)
         final_source = staged_raw
         if job.ending_enabled or job.tail_cut_enabled or job.encode_enabled:
             staged_edited = tx / 'edited.mp4'
@@ -2251,9 +2294,11 @@ class PipelineCoordinator(DeferredRecovery):
                 # RAW and completed MP4 normally share a filename. Keep their
                 # rollback copies distinct so restoring the second target can
                 # never consume the first target's backup.
-                backup = tx / f'backup-{index}-{target.name}'
-                backup.unlink(missing_ok=True)
+                backup = (self._download_path(job).parent if index == 1 else tx) / f'backup-{uuid4().hex}-{target.name}'
+                backup.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
+                    # Preserve the original target during publish, including
+                    # when a subsequent rename fails. RAW backups stay on RAW.
                     shutil.copy2(target, backup)
                     backups.append((target, backup))
                 else:
@@ -2267,9 +2312,16 @@ class PipelineCoordinator(DeferredRecovery):
                         target.unlink(missing_ok=True)
                     else:
                         os.replace(backup, target)
+            for _, backup in backups:
+                if backup is not None:
+                    backup.unlink(missing_ok=True)
             raise
+        for _, backup in backups:
+            if backup is not None:
+                backup.unlink(missing_ok=True)
         media = getattr(stored, 'media', stored)
         job.raw_path = str(formal_raw)
+        job.raw_storage_version = 2
         job.raw_size_bytes = formal_raw.stat().st_size
         job.duration_seconds = getattr(media, 'duration_seconds', None)
         job.safety_gate = stored.safety_gate

@@ -93,6 +93,9 @@ def _preset_smoke(report_path: Path) -> int:
 
 
 def _dispatch() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-raw-storage-smoke':
+        from djd_maker.packaging.raw_storage_smoke import run_raw_storage_smoke
+        return run_raw_storage_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) == 4 and sys.argv[1] == '--packaging-studio-direct-smoke':
         from djd_maker.packaging.studio_direct_smoke import run_studio_direct_smoke
         return run_studio_direct_smoke(Path(sys.argv[2]), Path(sys.argv[3]))

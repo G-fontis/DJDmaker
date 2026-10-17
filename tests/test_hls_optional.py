@@ -19,7 +19,8 @@ def setup_run(tmp_path, *, enabled=False, ending=False, state=JobState.RAW_READY
     tmp_path.mkdir(parents=True, exist_ok=True)
     source = tmp_path / '日本語 台本.txt'
     source.write_text('test source', encoding='utf-8')
-    raw = tmp_path / 'raw.mp4'
+    raw = tmp_path / 'raw_files' / '日本語 台本.mp4'
+    raw.parent.mkdir()
     raw.write_bytes(b'validated video fixture')
     job = Job(str(source), state=state, raw_path=str(raw), safety_gate=full_gate(),
               source_sha256=_digest(source), hls_zip_enabled=enabled)
@@ -117,7 +118,7 @@ def test_never_overwrite_unowned_mp4(tmp_path):
 
 def test_same_raw_output_directory(tmp_path):
     pipe, jobs, job = setup_run(tmp_path)
-    pipe.paths = replace(pipe.paths, output_directory=tmp_path, raw_directory=tmp_path)
+    pipe.paths = replace(pipe.paths, output_directory=pipe.paths.raw_directory)
     pipe.run_cycle()
     saved = jobs.get(job.id)
     assert saved.state is JobState.COMPLETED
@@ -155,7 +156,7 @@ def test_multiple_jobs_snapshot_once(tmp_path):
     pipe, jobs, first = setup_run(tmp_path)
     second_source = tmp_path / 'second.txt'
     second_source.write_text('second', encoding='utf-8')
-    second_raw = tmp_path / 'second.mp4'
+    second_raw = tmp_path / 'raw_files' / 'second.mp4'
     second_raw.write_bytes(b'second raw')
     second = Job(str(second_source), state=JobState.RAW_READY, raw_path=str(second_raw),
                  safety_gate=full_gate(), source_sha256=_digest(second_source))

@@ -168,6 +168,8 @@ class Job:
     last_quality_result: str | None = None
     download_failure_reason: str | None = None
     manual_download_session: int = 0
+    raw_storage_version: int = 2
+    raw_publish_sha256: str | None = None
     manual_retry_requested: bool = False
     raw_status: str = "PENDING"
     recovery_retry_count: int = 0
@@ -296,6 +298,7 @@ class Job:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Job:
         values = dict(data)
+        values.setdefault('raw_storage_version', 1)
         # Ver2.0 jobs had one combined Ending/Tail/Encode stage.  Preserve its
         # behaviour instead of applying arbitrary new defaults during migration.
         if not {'ending_enabled', 'tail_cut_enabled', 'encode_enabled'} & values.keys():
