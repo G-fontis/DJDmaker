@@ -168,13 +168,15 @@ def test_real_dom_user_dismissal_reactivates_notebook_and_preserves_external_tab
     p.goto('https://notebook.google.com/')
     p.evaluate('''()=>{window.autoClicks=0;document.body.insertAdjacentHTML('beforeend',
       '<div role="dialog">Unknown product<button onclick="window.autoClicks++">Close</button></div>'+
-      '<div data-testid="modal-scrim" style="position:fixed;inset:0;background:#8888"></div>');
-      setTimeout(()=>{document.querySelector('[role=dialog]').remove();document.querySelector('[data-testid=modal-scrim]').remove();},200);}''')
+      '<div data-testid="modal-scrim" style="position:fixed;inset:0;background:#8888"></div>');}''')
     external=context.new_page();external.set_content('<title>Human review page</title>')
     events=[]
+    def human_actor(message):
+        if message=='MODAL_STILL_VISIBLE':
+            p.evaluate("document.querySelector('[role=dialog]').remove();document.querySelector('[data-testid=modal-scrim]').remove()")
     try:
         with operation_scope(lambda s,f:events.append(s)):
-            assert ensure_notebook_interactable(p,owned_context=context,poll_seconds=.05) is p
+            assert ensure_notebook_interactable(p,owned_context=context,poll_seconds=.05,diagnostic=human_actor) is p
         assert p.evaluate('window.autoClicks')==0
         assert not external.is_closed() and len(context.pages)==2
         assert 'PIPELINE_RESUMED_AFTER_MODAL' in events

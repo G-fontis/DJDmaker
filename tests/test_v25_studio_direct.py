@@ -149,9 +149,15 @@ def test_failed_generation_retry_uses_studio_and_preserves_failed_item(studio):
 
 def test_modal_human_review_resumes_owned_studio_without_duplicate(studio):
     s=studio;s.page.evaluate('''()=>{openStudioFixture();document.body.insertAdjacentHTML('beforeend',
-      '<div role="dialog" id="unknown">Unclassified introduction<button onclick="window.badClicks++">Close</button></div>');
-      setTimeout(()=>document.querySelector('#unknown').remove(),150)}''')
+      '<div role="dialog" id="unknown">Unclassified introduction<button onclick="window.badClicks++">Close</button></div>');}''')
+    reviewed=[]
+    def human_actor(message):
+        if message=='MODAL_STILL_VISIBLE':
+            reviewed.append(message)
+            s.page.evaluate("document.querySelector('#unknown').remove()")
+    s.dom.diagnostic=human_actor
     assert s.flow.run().remote_status is RemoteVideoStatus.GENERATING
+    assert reviewed
     assert s.page.evaluate('window.badClicks')==0 and s.page.evaluate('window.generateClicks')==1
 
 def test_actual_limit_blocks_generate_but_almost_warning_does_not(studio):

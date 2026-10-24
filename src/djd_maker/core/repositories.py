@@ -249,6 +249,10 @@ class _VersionedDocument:
             if self.path.exists():
                 try:
                     previous = self._validate(self._read(self.path))
+                except UnsupportedSchemaError:
+                    # A newer document may have appeared after this repository
+                    # was created. It is intentional data, not corruption.
+                    raise
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError, RepositoryError):
                     previous = None
                 if previous is not None:

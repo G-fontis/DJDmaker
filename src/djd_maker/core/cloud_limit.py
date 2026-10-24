@@ -60,12 +60,31 @@ def is_limit_warning(message: str) -> bool:
         r'|上限\s*(?:が近|に近|に接近)', message, re.I))
 
 
+class _CloudLimitDocument(_VersionedDocument):
+    """Migrate the flat quota document in memory; preserve future schemas."""
+
+    def _validate(self, value):
+        from .repositories import MalformedJsonError, UnsupportedSchemaError
+        if not isinstance(value, dict):
+            raise MalformedJsonError('cloud_limit must contain a JSON object')
+        version = value.get('schema_version')
+        if version is not None and (type(version) is not int or version not in {0, SCHEMA_VERSION}):
+            raise UnsupportedSchemaError(f'cloud_limit schema {version!r} is not supported; expected {SCHEMA_VERSION}')
+        if value.get('kind', 'cloud_limit') != 'cloud_limit':
+            raise MalformedJsonError('cloud_limit document kind mismatch')
+        payload = dict(value)
+        payload['schema_version'] = SCHEMA_VERSION
+        payload['kind'] = 'cloud_limit'
+        return super()._validate(payload)
+
+
 class CloudLimitGate:
     def __init__(self, path: Path, *, clock=None):
         self.clock = clock or (lambda: datetime.now().astimezone())
-        self.document = _VersionedDocument(path, 'cloud_limit', use_file_lock=False,
+        self.document = _CloudLimitDocument(path, 'cloud_limit', use_file_lock=False,
                                           replace_retry_delays=(.1, .2, .4, .8))
-        self.state = self.document.load(default={})
+        document = self.document.load(default={})
+        self.state = {key: value for key, value in document.items() if key not in {'schema_version', 'kind'}}
 
     @property
     def blocked(self):
@@ -114,7 +133,10 @@ class CloudLimitGate:
         self._save()
 
     def _save(self):
-        self.document.save(dict(schema_version=SCHEMA_VERSION, kind='cloud_limit', **self.state))
+        payload = dict(self.state)
+        payload.setdefault('schema_version', SCHEMA_VERSION)
+        payload.setdefault('kind', 'cloud_limit')
+        self.document.save(payload)  # Validation owns the single current schema.
 
     def status(self):
         value = self._date('cloud_resume_at')
