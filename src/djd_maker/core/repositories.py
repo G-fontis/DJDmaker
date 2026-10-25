@@ -13,6 +13,7 @@ from uuid import uuid4
 from .models import Job, JobState, Preset, utc_now
 from .settings import AppSettings
 from .storage import JsonStore, RetryObserver, is_transient_replace_error
+from .job_numbers import JobNumbering, valid_number
 
 
 SCHEMA_VERSION = 1
@@ -510,7 +511,7 @@ class PresetRepository:
         return self.create(name, original.prompt_text, generation_settings=original.generation_settings)
 
 
-class JobRepository:
+class JobRepository(JobNumbering):
     REPLACE_RETRY_DELAYS = JOB_REPLACE_RETRY_DELAYS
 
     def __init__(
@@ -555,7 +556,18 @@ class JobRepository:
 
     def save(self, job: Job) -> None:
         try:
-            self._document(job.id).save(self._envelope(job))
+            previous = self.get(job.id)
+            if previous and valid_number(previous.job_no):
+                job.job_no = previous.job_no
+                self._document(job.id).save(self._envelope(job))
+            else:
+                # Same identity racing in separate import workers must not be
+                # assigned twice. Serialize reservation AND its first publish.
+                with _document_lock(self._number_path):
+                    previous = self.get(job.id)
+                    job.job_no = (previous.job_no if previous and valid_number(previous.job_no)
+                                  else self._reserve_number_locked())
+                    self._document(job.id).save(self._envelope(job))
         except OSError as error:
             if not is_transient_replace_error(error):
                 raise

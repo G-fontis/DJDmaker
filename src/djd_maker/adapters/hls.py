@@ -13,6 +13,7 @@ from djd_maker.core.deferred_state import SaveDeferred
 from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_STORED, BadZipFile, ZipFile
+from djd_maker.core.media_process import run_media_process
 
 from djd_maker.core.interfaces import HlsResult
 
@@ -60,8 +61,8 @@ def _resolve_tool(value: str | Path, name: str) -> Path:
 
 def _run(command: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     try:
-        return run_process(
-            command,
+        return run_media_process(
+            command, runner=run_process, purpose='HLS' if Path(command[0]).stem.casefold() == 'ffmpeg' else 'HLS probe',
             capture_output=True,
             text=True,
             encoding="utf-8",

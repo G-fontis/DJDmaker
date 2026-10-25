@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from djd_maker.core.cancellation import run_process
 
 
 WRITABLE_DIRECTORIES = (
@@ -270,7 +271,7 @@ def inspect_packaging(
     release_tree: bool = False,
     environ: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] = shutil.which,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = run_process,
     module_finder: Callable[[str], object | None] = importlib.util.find_spec,
 ) -> PreflightReport:
     root = root.resolve()

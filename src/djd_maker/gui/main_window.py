@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.7"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.8"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -92,7 +92,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.preset_repository = preset_repository
         self.settings = self.settings_repository.load()
         self.jobs: list[Job] = []
-        self._checked_job_ids: set[str] = set()
+        from djd_maker.core.selection import JobSelectionService
+        self.selection_service = JobSelectionService()
+        self._checked_job_ids = self.selection_service.checked_ids
         store = getattr(self.job_repository, '_deferred_state', None)
         self._deferred_overlays = set(store.entries) if store else set()
         self._running = False
@@ -114,6 +116,9 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._build_ui()
         self._connect_controller()
         self.apply_settings(self.settings)
+        migrate_numbers = getattr(self.job_repository, 'ensure_job_numbers', None)
+        if callable(migrate_numbers):
+            migrate_numbers()
         self.reload_jobs(local_only=True)
         service = getattr(self.controller, "controller", None)
         refresh_credit = getattr(self.controller, "refresh_credit", None)
@@ -275,6 +280,10 @@ class MainWindow(Phase2Presentation, QMainWindow):
         deletes = QHBoxLayout()
         self.save_retry_button = QPushButton("保存リトライ")
         self.delete_selected_button = QPushButton("選択したものを削除")
+        self.select_all_button = QPushButton('すべて選択')
+        self.clear_all_button = QPushButton('すべて解除')
+        deletes.addWidget(self.select_all_button)
+        deletes.addWidget(self.clear_all_button)
         self.delete_completed_button = QPushButton("完成したジョブを削除")
         deletes.addWidget(self.delete_selected_button)
         deletes.addWidget(self.delete_completed_button)
@@ -316,6 +325,8 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.scheduler_label.setWordWrap(True)
         self.centralWidget().layout().addWidget(self.scheduler_label)
         commands = {
+            CommandId.SELECT_ALL: lambda _: self._select_visible_jobs(True),
+            CommandId.CLEAR_ALL: lambda _: self._select_visible_jobs(False),
             CommandId.SETTINGS_OPEN: lambda _: self.show_settings(),
             CommandId.GOOGLE_LOGIN: lambda _: self.start_login(),
             CommandId.CLASS_VIDEO_START: lambda _: self.start_processing(),
@@ -556,7 +567,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.job_table.setRowCount(len(self.jobs))
         for row, job in enumerate(self.jobs):
             notebook, ending, hls = job_stage_texts(job)
-            values = (str(row + 1), job.script_name, notebook, ending, hls, state_display(job))
+            values = (str(job.job_no) if job.job_no else '－', job.script_name, notebook, ending, hls, state_display(job))
             for column, value in enumerate(values):
                 item = NaturalItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, job.id)
@@ -598,7 +609,7 @@ class MainWindow(Phase2Presentation, QMainWindow):
             row = self.job_table.rowCount()
             self.job_table.insertRow(row)
         model = JobViewModel.from_job(job)
-        values = (str(row+1), model.name, *model.stages, model.state, '')
+        values = (str(job.job_no) if job.job_no else '－', model.name, *model.stages, model.state, '')
         if self.settings.gui_type == 'PHASE2':
             values += (f'{model.progress}%', model.started)
         for column, value in enumerate(values):
@@ -622,6 +633,25 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.job_table.horizontalScrollBar().setValue(horizontal)
         self.job_table.blockSignals(False)
         self._refresh_summary()
+
+    def _select_visible_jobs(self, checked):
+        items = [self.job_table.item(row, 6) for row in range(self.job_table.rowCount())
+                 if not self.job_table.isRowHidden(row)]
+        items = [item for item in items if item is not None and
+                 item.flags() & Qt.ItemFlag.ItemIsEnabled and
+                 item.flags() & Qt.ItemFlag.ItemIsUserCheckable]
+        self.selection_service.select_visible(
+            [item.data(Qt.ItemDataRole.UserRole) for item in items], checked)
+        self.job_table.blockSignals(True)
+        sorting = self.job_table.isSortingEnabled()
+        self.job_table.setSortingEnabled(False)
+        try:
+            for item in items:
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        finally:
+            self.job_table.setSortingEnabled(sorting)
+            self.job_table.blockSignals(False)
+        self._update_action_state()
 
     def _refresh_summary(self) -> None:
         self._render_deferred_overlays()

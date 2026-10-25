@@ -19,6 +19,8 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'ffmpeg.retry': 'FFmpeg起動失敗・自動再試行',
+    'ffmpeg.exhausted': 'FFmpeg処理に3回再試行しましたが失敗しました。このJobをエラーとして他のJobを続行します。',
     'STUDIO_OPENING': 'Studioの動画解説を開いています',
     'VIDEO_SETTINGS_OPEN': '動画設定',
     'VIDEO_TYPE_SELECTED': '動画形式：説明動画',
@@ -112,6 +114,8 @@ LABELS = {
 
 
 def operation_text(value, fields=None):
+    if value == 'ffmpeg.retry' and fields:
+        return f"FFmpegを起動できませんでした。自動再試行します。{fields.get('retry', 1)}/3"
     if value == 'STYLE_SELECTED' and fields and fields.get('visual_style'):
         return 'スタイル：' + str(fields['visual_style'])
     return LABELS.get(str(value), str(value))

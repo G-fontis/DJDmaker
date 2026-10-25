@@ -59,6 +59,8 @@ def automatic_download_recovery_candidate(job):
 
 
 def remote_reconcile_candidate(job):
+    if str(job.error_code).startswith('FFMPEG_') and job.failure_class == 'TERMINAL_FAILED':
+        return False
     if automatic_download_recovery_candidate(job):
         return True
     return (job.state is JobState.FAILED and bool(job.notebook_id or job.notebook_url
@@ -68,6 +70,8 @@ def remote_reconcile_candidate(job):
 
 
 def terminal(job):
+    if str(job.error_code).startswith('FFMPEG_') and job.failure_class == 'TERMINAL_FAILED':
+        return True
     # Download exhaustion is not a normal terminal result: a human can start a
     # fresh bounded manual session against the same READY artifact.
     return bool(job.duplicate_of_job_id) or job.state is JobState.COMPLETED or (

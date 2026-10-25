@@ -27,10 +27,14 @@ class CommandId(StrEnum):
     ENDING_PREVIEW = 'CMD_ENDING_PREVIEW'
     PRESET_SELECT = 'CMD_PRESET_SELECT'
     SAVE_RETRY = 'CMD_SAVE_RETRY'
+    SELECT_ALL = 'CMD_SELECT_ALL'
+    CLEAR_ALL = 'CMD_CLEAR_ALL'
 
 
 REQUIRED_COMMANDS = frozenset(CommandId)
 BUTTON_COMMANDS = {
+    'select_all_button': CommandId.SELECT_ALL,
+    'clear_all_button': CommandId.CLEAR_ALL,
     'settings_button': CommandId.SETTINGS_OPEN,
     'login_button': CommandId.GOOGLE_LOGIN,
     'start_button': CommandId.CLASS_VIDEO_START,

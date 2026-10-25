@@ -14,6 +14,7 @@ import shutil
 import subprocess
 from djd_maker.core.cancellation import run_process, checkpoint, current_token, interruptible_sleep
 import time
+from djd_maker.core.media_process import run_media_process
 from typing import Callable
 
 
@@ -113,8 +114,8 @@ class VideoValidator:
             "-show_format", "-of", "json", str(target),
         ]
         try:
-            completed = run_process(
-                command,
+            completed = run_media_process(
+                command, runner=run_process, purpose='video probe',
                 shell=False,
                 capture_output=True,
                 text=True,

@@ -72,6 +72,11 @@ def test_job_publish_source_handle_is_closed_before_replace(
 
     real_replace = storage.os.replace
     reopened: list[bool] = []
+    repository = JobRepository(tmp_path / 'jobs')
+    job = _job()
+    job.job_no = repository._reserve_number()
+    # Number reservation is a separate document; inject failures only into job publish.
+    monkeypatch.setattr(repository, "_reserve_number_locked", lambda: job.job_no)
 
     def inspect_then_replace(source: Path, destination: Path) -> None:
         with Path(source).open("r+", encoding="utf-8") as stream:
@@ -79,7 +84,7 @@ def test_job_publish_source_handle_is_closed_before_replace(
         real_replace(source, destination)
 
     monkeypatch.setattr(storage.os, "replace", inspect_then_replace)
-    JobRepository(tmp_path / "jobs").save(_job())
+    repository.save(job)
 
     assert reopened == [True]
 
@@ -132,6 +137,11 @@ def test_job_plain_permission_error_is_retried(tmp_path: Path, monkeypatch) -> N
 
     real_replace = storage.os.replace
     calls = 0
+    repository = JobRepository(tmp_path / 'jobs')
+    job = _job()
+    job.job_no = repository._reserve_number()
+    # Number reservation is a separate document; inject failures only into job publish.
+    monkeypatch.setattr(repository, "_reserve_number_locked", lambda: job.job_no)
 
     def transient(source: Path, destination: Path) -> None:
         nonlocal calls
@@ -142,7 +152,7 @@ def test_job_plain_permission_error_is_retried(tmp_path: Path, monkeypatch) -> N
 
     monkeypatch.setattr(storage.os, "replace", transient)
     monkeypatch.setattr(storage.time, "sleep", lambda _delay: None)
-    JobRepository(tmp_path / "jobs").save(_job())
+    repository.save(job)
     assert calls == 2
 
 
@@ -171,11 +181,16 @@ def test_committed_replace_error_republishes_fsynced_payload_when_verification_i
             return False
         return real_match(source, destination, expected)
 
+    repository = JobRepository(tmp_path / 'jobs')
+    job = _job(5)
+    job.job_no = repository._reserve_number()
+    # Number reservation is a separate document; inject failures only into job publish.
+    monkeypatch.setattr(repository, "_reserve_number_locked", lambda: job.job_no)
     monkeypatch.setattr(storage.os, "replace", committed_then_error)
     monkeypatch.setattr(storage.JsonStore, "_published_content_matches", staticmethod(temporarily_unreadable))
     monkeypatch.setattr(storage.time, "sleep", sleeps.append)
 
-    JobRepository(tmp_path / "jobs").save(_job(5))
+    repository.save(job)
 
     assert replace_calls == 2
     assert sleeps == [0.1, 0.2]
@@ -190,6 +205,11 @@ def test_committed_replace_unverifiable_exhaustion_raises_original_transient(
     real_replace = storage.os.replace
     original = _windows_error(32)
     replace_calls = 0
+    repository = JobRepository(tmp_path / 'jobs')
+    job = _job()
+    job.job_no = repository._reserve_number()
+    # Number reservation is a separate document; inject failures only into job publish.
+    monkeypatch.setattr(repository, "_reserve_number_locked", lambda: job.job_no)
 
     def committed_then_error(source: Path, destination: Path) -> None:
         nonlocal replace_calls
@@ -206,7 +226,7 @@ def test_committed_replace_unverifiable_exhaustion_raises_original_transient(
     monkeypatch.setattr(storage.time, "sleep", lambda _delay: None)
 
     with pytest.raises(JobStateSaveError) as raised:
-        JobRepository(tmp_path / "jobs").save(_job())
+        repository.save(job)
 
     assert replace_calls == 4
     assert raised.value.__cause__ is original
@@ -243,6 +263,11 @@ def test_job_retry_observer_failure_does_not_break_recovered_save(
 
     real_replace = storage.os.replace
     calls = 0
+    repository = JobRepository(tmp_path / 'jobs')
+    job = _job(6)
+    job.job_no = repository._reserve_number()
+    # Number reservation is a separate document; inject failures only into job publish.
+    monkeypatch.setattr(repository, "_reserve_number_locked", lambda: job.job_no)
 
     def transient(source: Path, destination: Path) -> None:
         nonlocal calls
@@ -256,7 +281,8 @@ def test_job_retry_observer_failure_does_not_break_recovered_save(
 
     monkeypatch.setattr(storage.os, "replace", transient)
     monkeypatch.setattr(storage.time, "sleep", lambda _delay: None)
-    JobRepository(tmp_path / "jobs", retry_observer=broken_observer).save(_job(6))
+    repository.retry_observer = broken_observer
+    repository.save(job)
     assert JobRepository(tmp_path / "jobs").require("job").progress_percent == 6
 
 

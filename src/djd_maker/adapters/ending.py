@@ -8,6 +8,7 @@ import os
 import subprocess
 from djd_maker.core.cancellation import run_process, checkpoint
 from uuid import uuid4
+from djd_maker.core.media_process import run_media_process
 
 from djd_maker.core.interfaces import MediaResult
 from djd_maker.media.validator import (
@@ -49,8 +50,8 @@ class EndingEngineAdapter:
 
     def _run(self, command: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
         try:
-            completed = run_process(
-                command, shell=False, capture_output=True, text=True,
+            completed = run_media_process(
+                command, runner=run_process, purpose=purpose, shell=False, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=self.timeout_seconds,
                 check=False,
             )

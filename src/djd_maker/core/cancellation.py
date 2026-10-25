@@ -164,20 +164,29 @@ def interruptible_sleep(seconds):
 def run_process(command, **kwargs):
     """Keep subprocess.run compatibility outside a cancellable pipeline run."""
     token = current_token()
-    if token is None:
+    from pathlib import Path
+    from .media_process import media_spawn_options, process_audit
+    media = Path(str(command[0])).stem.casefold() in {'ffmpeg', 'ffprobe'}
+    if token is None and not media:
         return subprocess.run(command, **kwargs)
-    token.check('subprocess.start')
+    if token:
+        token.check('subprocess.start')
     timeout = kwargs.pop('timeout', None)
     check = kwargs.pop('check', False)
     if kwargs.pop('capture_output', False):
         kwargs['stdout'] = subprocess.PIPE
         kwargs['stderr'] = subprocess.PIPE
-    process = subprocess.Popen(command, **kwargs)
-    token.children[process.pid] = process
+    with media_spawn_options(command, kwargs):
+        process = subprocess.Popen(command, **kwargs)
+    if media:
+        process_audit(1)
+    if token:
+        token.children[process.pid] = process
     started = time.monotonic()
     try:
         while True:
-            token.check('subprocess.wait')
+            if token:
+                token.check('subprocess.wait')
             if timeout is not None and time.monotonic()-started >= timeout:
                 raise subprocess.TimeoutExpired(command, timeout)
             try:
@@ -185,7 +194,8 @@ def run_process(command, **kwargs):
                 result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
                 if check:
                     result.check_returncode()
-                token.check()
+                if token:
+                    token.check()
                 return result
             except subprocess.TimeoutExpired:
                 continue
@@ -197,4 +207,7 @@ def run_process(command, **kwargs):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.communicate(timeout=2)
-        token.children.pop(process.pid, None)
+        if token:
+            token.children.pop(process.pid, None)
+        if media:
+            process_audit(-1)

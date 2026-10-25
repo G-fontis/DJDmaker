@@ -1908,6 +1908,11 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             f'ending={job.ending_enabled},tail={job.tail_cut_enabled},encode={job.encode_enabled}'))
 
     def _run_media_job(self, job: Job, *, one_task=False) -> None:
+        from djd_maker.core.media_process import media_retry_scope
+        with media_retry_scope(job, self._save):
+            self._run_media_job_with_retry(job, one_task=one_task)
+
+    def _run_media_job_with_retry(self, job: Job, *, one_task=False) -> None:
         try:
             checkpoint('media.start', job.id)
             if self._canonical_raw(job) is None:
@@ -2070,7 +2075,12 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         except BlockingModalError:
             raise
         except Exception as exc:
-            job.error_code = "MEDIA_STAGE_FAILED"
+            from djd_maker.core.media_process import MediaProcessError
+            job.error_code = exc.code if isinstance(exc, MediaProcessError) else "MEDIA_STAGE_FAILED"
+            if isinstance(exc, MediaProcessError):
+                job.failure_class = 'TERMINAL_FAILED'
+                if exc.code == 'FFMPEG_RETRY_EXHAUSTED':
+                    report_operation('ffmpeg.exhausted', outcome='FAILED')
             if isinstance(exc, FileExistsError):
                 job.failure_class = 'FATAL_FAILED'
             job.resume_checkpoint = job.state.value

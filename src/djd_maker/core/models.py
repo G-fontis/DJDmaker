@@ -121,6 +121,7 @@ class Preset:
 class Job:
     source_path: str
     id: str = field(default_factory=lambda: uuid4().hex)
+    job_no: int | None = None
     parent_job_id: str | None = None
     state: JobState = JobState.WAITING
     notebook_id: str | None = None
