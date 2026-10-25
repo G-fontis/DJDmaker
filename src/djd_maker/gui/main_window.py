@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.8"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.9"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -118,7 +118,11 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.apply_settings(self.settings)
         migrate_numbers = getattr(self.job_repository, 'ensure_job_numbers', None)
         if callable(migrate_numbers):
-            migrate_numbers()
+            from djd_maker.core.sequence_lock import SequenceUnavailable
+            try:migrate_numbers()
+            except SequenceUnavailable:
+                self.statusBar().showMessage('Job番号管理を再確認しています。')
+                self.controller.reload()
         self.reload_jobs(local_only=True)
         service = getattr(self.controller, "controller", None)
         refresh_credit = getattr(self.controller, "refresh_credit", None)

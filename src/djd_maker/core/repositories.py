@@ -561,13 +561,10 @@ class JobRepository(JobNumbering):
                 job.job_no = previous.job_no
                 self._document(job.id).save(self._envelope(job))
             else:
-                # Same identity racing in separate import workers must not be
-                # assigned twice. Serialize reservation AND its first publish.
-                with _document_lock(self._number_path):
-                    previous = self.get(job.id)
-                    job.job_no = (previous.job_no if previous and valid_number(previous.job_no)
-                                  else self._reserve_number_locked())
-                    self._document(job.id).save(self._envelope(job))
+                # Durable identity reservation deduplicates racing importers;
+                # job publish and its retries happen after sequence release.
+                job.job_no = self._reserve_number(job.id)
+                self._document(job.id).save(self._envelope(job))
         except OSError as error:
             if not is_transient_replace_error(error):
                 raise

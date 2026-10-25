@@ -19,6 +19,8 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'WAITING_FOR_JOBNO_LOCK': 'Job番号管理ファイルを使用中です。解放を待って処理を再開します。',
+    'sequence.ready': 'Job番号管理を確認しました。処理を再開します。',
     'ffmpeg.retry': 'FFmpeg起動失敗・自動再試行',
     'ffmpeg.exhausted': 'FFmpeg処理に3回再試行しましたが失敗しました。このJobをエラーとして他のJobを続行します。',
     'STUDIO_OPENING': 'Studioの動画解説を開いています',

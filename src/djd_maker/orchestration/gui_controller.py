@@ -62,6 +62,10 @@ class GuiPipelineController:
         self.cancellation = CancellationToken()
         self._stop_event = self.cancellation.event
         self._command_wake = threading.Event()
+        self._number_wait_pending = threading.Event()
+        self._number_wait_shutdown = threading.Event()
+        self._number_wait_worker = None
+        self._pending_number_jobs = {}
         self._guard = threading.RLock()
         self._worker: threading.Thread | None = None
         self._retiring_worker: threading.Thread | None = None
@@ -104,6 +108,9 @@ class GuiPipelineController:
         self._job_callback(job)
 
     def _runtime_update(self, record: dict) -> None:
+        if record.get('stage')=='WAITING_FOR_JOBNO_LOCK':
+            self._number_wait_pending.set()
+            self._schedule_number_recheck()
         with self._guard:
             if record.get('scheduler'):
                 view=record['scheduler']
@@ -147,8 +154,43 @@ class GuiPipelineController:
 
     def reload(self) -> list[Job]:
         from djd_maker.core.output_ownership import import_lock
-        with import_lock(self.jobs,self.app_root/'system/jobs'):
-            return self._reload_serialized()
+        from djd_maker.core.sequence_lock import SequenceUnavailable
+        try:
+            with import_lock(self.jobs,self.app_root/'system/jobs'):
+                migrate=getattr(self.jobs,'ensure_job_numbers',None)
+                if callable(migrate):migrate()
+                result=self._reload_serialized()
+            was_waiting=self._number_wait_pending.is_set()
+            self._number_wait_pending.clear()
+            if was_waiting:
+                if self.pipeline is not None and hasattr(self.pipeline,'deferred'):
+                    for jid,entry in self.pipeline.deferred.entries.items():
+                        if entry.reason.startswith('SequenceUnavailable'):
+                            self.pipeline._deferred_attempts.pop(jid,None)
+                            entry.unresolved=False
+                self._runtime_update({'stage':'sequence.ready','message':'Job番号管理を確認しました。処理を再開します。'})
+                self._command_wake.set()
+            return result
+        except SequenceUnavailable as exc:
+            self._number_wait_pending.set()
+            self._runtime_update({'stage':'WAITING_FOR_JOBNO_LOCK','level':'INFO',
+                'message':'Job番号管理ファイルを使用中です。解放を待って処理を再開します。',
+                'sequence_owner':exc.owner,'sequence_reason':exc.reason})
+            self._schedule_number_recheck()
+            return self.jobs.list()
+
+    def _schedule_number_recheck(self):
+        with self._guard:
+            if self._number_wait_shutdown.is_set() or self._number_wait_worker and self._number_wait_worker.is_alive():return
+            def poll():
+                while not self._number_wait_shutdown.wait(1):
+                    if not self._number_wait_pending.is_set():return
+                    try:self.reload()
+                    except Exception as exc:
+                        self._log_callback({'level':'ERROR','stage':'sequence.attention','message':str(exc)})
+                        return
+            self._number_wait_worker=threading.Thread(target=poll,name='djd-sequence-recheck',daemon=True)
+            self._number_wait_worker.start()
 
     def _reload_serialized(self) -> list[Job]:
         from djd_maker.core.deferred_state import store_for
@@ -171,9 +213,10 @@ class GuiPipelineController:
                     digest = None
                     self._log_callback({'level':'WARNING','stage':'source.identity',
                         'message':f'台本 {source.name} のハッシュを読めません。対象jobで再確認します。他の台本を継続します。{exc}'})
-                job = Job(str(source.resolve()), source_sha256=digest)
+                job = self._pending_number_jobs.setdefault(resolved,Job(str(source.resolve()), source_sha256=digest))
                 try:
                     self.jobs.save(job)
+                    self._pending_number_jobs.pop(resolved,None)
                 except JobStateSaveError as error:
                     deferred.record(job, type(error).__name__)
                     self._runtime_update(dict(stage='save.deferred', job_id=job.id, job=job.script_name,
@@ -429,6 +472,9 @@ class GuiPipelineController:
         return self.status()
 
     def shutdown(self) -> None:
+        self._number_wait_shutdown.set()
+        waiter=self._number_wait_worker
+        if waiter and waiter is not threading.current_thread():waiter.join(timeout=5)
         self._stop_request_reason = 'APP_CLOSE'
         lifecycle = self.download_lifecycle
         if lifecycle is not None and lifecycle.active_download_count:
@@ -638,6 +684,11 @@ class GuiPipelineController:
                         scan['runnable'] = True
                         scan['download_lifecycle_pending'] = len(lifecycle.pending)
                     self.final_discovery_result = scan
+                    if self._number_wait_pending.is_set():
+                        scan=dict(scan,complete=False,runnable=True,sequence_waiting=True)
+                        self.final_discovery_result=scan
+                        self._runtime_update({'stage':'WAITING_FOR_JOBNO_LOCK',
+                            'message':'Job番号管理ファイルの解放を待っています。他のJobは継続します。'})
                     if scan['complete']:
                         self._set_stop_reason('ALL_TASKS_COMPLETED')
                         break
@@ -652,6 +703,7 @@ class GuiPipelineController:
                             'message':'現在実行可能なjobがないため、次回確認まで待機しています。',
                             'wait_reason':'NO_RUNNABLE_TASK_WAIT'})
                 interval = getattr(self.pipeline, 'wait_seconds', 0) or self.cycle_interval_seconds
+                if self._number_wait_pending.is_set():interval=min(interval,1)
                 self._command_wake.wait(interval)
                 self._command_wake.clear()
         except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError) as exc:

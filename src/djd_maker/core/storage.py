@@ -30,10 +30,14 @@ class JsonStore:
         *,
         replace_retry_delays: tuple[float, ...] = (),
         retry_observer: RetryObserver | None = None,
+        temporary_tag: str | None = None,
     ) -> None:
         self.path = Path(path)
         self.replace_retry_delays = replace_retry_delays
         self.retry_observer = retry_observer
+        if temporary_tag is not None and not temporary_tag.replace('-','').isalnum():
+            raise ValueError('temporary_tag must be a plain token')
+        self.temporary_tag = temporary_tag
 
     def load(self, default: Any = None) -> Any:
         if not self.path.exists():
@@ -43,7 +47,7 @@ class JsonStore:
 
     def save(self, value: Any) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+        temporary = self.path.with_name(f".{self.path.name}.{self.temporary_tag or uuid4().hex}.tmp")
         ready_to_publish = False
         try:
             payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
@@ -56,7 +60,7 @@ class JsonStore:
         finally:
             # A fully flushed temporary is crash/retry recovery evidence when
             # the final publish remains blocked. Partial JSON is never kept.
-            if not ready_to_publish:
+            if not ready_to_publish or self.temporary_tag is not None:
                 temporary.unlink(missing_ok=True)
 
     def _replace(

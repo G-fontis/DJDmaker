@@ -295,11 +295,17 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         self._transition(job, JobState.COMPLETED)
 
     def _save(self, job: Job) -> None:
+        from djd_maker.core.sequence_lock import SequenceUnavailable
         if job.id in self.deferred_ids:
             raise SaveDeferred()
         job.presentation_revision += 1
         try:
             self.jobs.save(job)
+        except SequenceUnavailable as error:
+            self._defer(job,error)
+            self.runtime_callback({'stage':'WAITING_FOR_JOBNO_LOCK','job_id':job.id,
+                'level':'INFO','message':'Job番号管理を再確認しています。他のJobを続行します。'})
+            raise SaveDeferred() from error
         except JobStateSaveError as error:
             self._defer(job, error)
             raise SaveDeferred() from error
