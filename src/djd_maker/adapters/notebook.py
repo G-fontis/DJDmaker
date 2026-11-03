@@ -1716,10 +1716,49 @@ class NotebookEngineAdapter:
         job.studio_generate_claimed_at = None
         if self.persist_identity:
             self.persist_identity(job)
-        outcome = StudioGeneration(self.dom, job, self.persist_identity).run(retry_failed=True)
+        try:
+            outcome = StudioGeneration(self.dom, job, self.persist_identity).run(retry_failed=True)
+        except Exception as exc:
+            from djd_maker.core.cloud_limit import CloudLimitReached, CREDIT_LIMIT_MESSAGE
+            if isinstance(exc, CloudLimitReached) and exc.observation.message == CREDIT_LIMIT_MESSAGE:
+                job.attempt_by_stage['generation.failed_retry'] = used
+                if self.persist_identity:
+                    self.persist_identity(job)
+            raise
         metadata = ResumeMetadata(job.notebook_id, job.notebook_url, job.script_name)
         self._record_submission(job, metadata, outcome)
         return NotebookSubmissionResult(job.notebook_id, job.notebook_url, outcome)
+
+    def probe_generation_credit(self, job):
+        """Observe an existing Notebook form. No upload, create, settings change or Generate."""
+        from .studio_generation import (StudioGeneration, GenerateButtonState,
+            generation_button_state, close_video_settings, check_deferred_credit)
+        self.dom.studio_settings_owned = True
+        owner = getattr(self.dom.interactable_guard, '__self__', None)
+        guard = getattr(owner, 'lifecycle_guard', None)
+        if guard is not None and guard.active_download_count:
+            return False
+        self._open_job(job)
+        flow = StudioGeneration(self.dom, job, None)
+        flow.guard()
+        # Existing artifacts must never become probe generation attempts.
+        current = self.dom.inspect_status()
+        if current in {RemoteVideoStatus.GENERATING, RemoteVideoStatus.READY}:
+            return False
+        if current is not RemoteVideoStatus.NOT_STARTED:
+            return False
+        if self.dom.source_state(Path(job.source_path).name, include_hidden=True) != 'READY':
+            return False
+        if flow.panel() is None:
+            button = self.dom.page.locator('studio-panel').get_by_role('button', name='動画解説', exact=True)
+            if button.count() != 1 or not button.is_enabled():
+                return False
+            button.click(timeout=3000)
+        panel = flow.wait(flow.panel, 'Credit Probeの動画設定画面')
+        check_deferred_credit(self.dom, panel)
+        state = generation_button_state(panel)
+        close_video_settings(self.dom, panel)
+        return state is GenerateButtonState.GENERATE_AVAILABLE
 
     def recheck_cloud_limit(self, notebook_url=None):
         if notebook_url:

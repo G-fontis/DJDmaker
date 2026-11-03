@@ -33,7 +33,6 @@ a = Analysis(
     ],
     datas=[
         *playwright_datas,
-        (str(PROJECT_ROOT / "src/djd_maker/testing/assets/studio_video_settings.html"), "djd_maker/testing/assets"),
         (str(PROJECT_ROOT / "config" / "default-settings.json"), "config"),
         (str(PROJECT_ROOT / "config" / "download-quality-profile.json"), "config"),
         (str(ffmpeg_license), "licenses"),
@@ -84,5 +83,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="DJDmaker_Ver2.9",
+    name="DJDmaker_Ver2.10",
 )

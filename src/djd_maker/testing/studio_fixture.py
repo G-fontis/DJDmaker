@@ -8,7 +8,7 @@ def settings_html():
     return Path(__file__).with_name('assets').joinpath('studio_video_settings.html').read_text(encoding='utf8')
 
 
-def install_studio_fixture(page, settings_html, *, opened=False, delay_ms=0):
+def install_studio_fixture(page, settings_html, *, opened=False, delay_ms=0, deferred=False):
     page.set_content('''<section class="source-panel"><div class="single-source-container">
       <button class="source-stretched-button" aria-label="lesson.txt">lesson.txt</button>
       <input type="checkbox" checked aria-label="lesson.txt を選択"></div></section>
@@ -41,6 +41,12 @@ def install_studio_fixture(page, settings_html, *, opened=False, delay_ms=0):
           option.onclick=()=>{language.textContent='日本語';box.remove()};box.append(option);document.body.append(box)};
         const toggle=dialog.querySelector('[role=switch]');toggle.onclick=()=>toggle.setAttribute('aria-checked',toggle.getAttribute('aria-checked')==='true'?'false':'true');
         const generate=[...dialog.querySelectorAll('button')].find(e=>e.textContent.trim()==='生成');
+        // Live UI after partial recovery shows both controls. The exhausted
+        // fixture removes only Generate; never click the reservation action.
+        const later=[...dialog.querySelectorAll('button')].find(e=>e.textContent.trim()==='後で生成');
+        if(window.fixtureDeferred){generate.remove();later.onclick=()=>window.badClicks++}
+        const close=dialog.querySelector('button:has(mat-icon)');
+        if(close)close.onclick=()=>{dialog.remove();document.querySelector('[data-testid=fixture-backdrop]')?.remove()};
         generate.onclick=()=>{window.generateClicks++;if(window.suppressGeneration)return;
           dialog.remove();document.querySelector('[data-testid=fixture-backdrop]')?.remove();
           const library=document.querySelector('artifact-library');
@@ -50,5 +56,7 @@ def install_studio_fixture(page, settings_html, *, opened=False, delay_ms=0):
       }
       window.openStudioFixture=open;
       document.querySelector('#video').onclick=()=>{window.studioOpens++;setTimeout(open,delay)};
-      if(opened)open();
-    }''', {'html':settings_html,'opened':opened,'delay':delay_ms})
+    }''', {'html':settings_html,'opened':False,'delay':delay_ms})
+    page.evaluate('(value)=>window.fixtureDeferred=value', deferred)
+    if opened:
+        page.evaluate('openStudioFixture()')

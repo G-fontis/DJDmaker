@@ -39,8 +39,9 @@ class Capabilities:
     can_local_process: bool = True
 
     @classmethod
-    def from_limit(cls, blocked):
-        return cls(not blocked, not blocked, not blocked)
+    def from_limit(cls, blocked, *, generation_only=False, chat_disabled=False):
+        return cls(not blocked, not blocked or generation_only,
+                   not blocked or generation_only and not chat_disabled)
 
 
 def manual_download_recovery_available(job):

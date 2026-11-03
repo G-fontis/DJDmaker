@@ -50,7 +50,15 @@ class CreditLimitViewModel:
     @classmethod
     def from_status(cls, state):
         if not state.get('active'):
-            return cls(False,'AI使用量上限: 未検出')
+            return cls(False,'Cloud生成: 利用可能 / AI使用量上限: 未検出')
+        if state.get('signal') == 'CLOUD_CREDIT_LIMIT_REACHED':
+            from datetime import datetime
+            try:
+                next_time = datetime.fromisoformat(state['next_credit_probe_at']).astimezone().strftime('%H:%M')
+            except (KeyError, ValueError, TypeError):
+                next_time = '再確認待ち'
+            return cls(True, 'Cloud生成: クレジット上限のため保留中 / 残りTask: 処理継続中\n'
+                f'動画生成クレジットの回復を待っています。10分ごとに確認します。次回確認: {next_time}')
         if state.get('reconciliation') == 'LIMIT_UNKNOWN_NEEDS_RECHECK' or not state.get('cloud_resume_at'):
             return cls(True, 'Cloud状態: 再確認必要 — 保存されたLimit情報の期限が不明または経過しています。現在のNotebook状態を確認します。')
         seconds=state.get('remaining_seconds')

@@ -19,6 +19,14 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'CREDIT_LIMIT_DETECTED_BY_DEFERRED_BUTTON': '動画生成クレジットの上限に達しました',
+    'CREDIT_MODAL_CLOSED': '動画設定を閉じ、他の処理を続行します',
+    'CLOUD_GENERATION_PAUSED': '生成を一時保留し、他の処理を続行します',
+    'CREDIT_PROBE_SCHEDULED': '10分後に動画生成クレジットを再確認します',
+    'CREDIT_PROBE_STARTED': '現在の動画設定からクレジットを確認しています',
+    'CREDIT_STILL_LIMITED': '動画生成クレジット上限のため生成を保留中です',
+    'CREDIT_RECOVERED': '動画生成が再び利用可能になりました。未生成Jobの処理を再開します。',
+    'GENERATION_RESUMED_AFTER_CREDIT_RECOVERY': '未生成Jobの動画生成を優先して再開します',
     'WAITING_FOR_JOBNO_LOCK': 'Job番号管理ファイルを使用中です。解放を待って処理を再開します。',
     'sequence.ready': 'Job番号管理を確認しました。処理を再開します。',
     'ffmpeg.retry': 'FFmpeg起動失敗・自動再試行',

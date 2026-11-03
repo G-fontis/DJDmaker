@@ -7,6 +7,7 @@ import re
 from .repositories import _VersionedDocument, SCHEMA_VERSION
 
 LIMIT_RESUME_MARGIN_MINUTES = 5
+CREDIT_LIMIT_MESSAGE = 'CLOUD_CREDIT_LIMIT_REACHED'
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,9 @@ class CloudLimitGate:
     @property
     def recheck_delay(self):
         now = self.clock()
+        if self.state.get('signal') == CREDIT_LIMIT_MESSAGE:
+            probe = self._date('next_credit_probe_at')
+            return max(0, (probe-now).total_seconds()) if probe and probe <= now+timedelta(seconds=600) else 0
         resume = self._date('cloud_resume_at')
         probe = self._date('next_recheck_at')
         # Retry backoff is bounded; corrupt/old future probes cannot suspend forever.
@@ -113,6 +117,11 @@ class CloudLimitGate:
         return max(0, (max(deadlines)-now).total_seconds()) if deadlines else 0
 
     def defer_recheck(self, seconds=120):
+        if self.state.get('signal') == CREDIT_LIMIT_MESSAGE:
+            self.state['last_credit_probe_at'] = self.clock().isoformat()
+            self.state['next_credit_probe_at'] = (self.clock()+timedelta(seconds=600)).isoformat()
+            self._save()
+            return
         self.state['next_recheck_at'] = (self.clock()+timedelta(seconds=seconds)).isoformat()
         self._save()
 
@@ -123,13 +132,24 @@ class CloudLimitGate:
                           cloud_blocked_until=reset.isoformat() if reset else None,
                           cloud_resume_at=(reset + timedelta(minutes=LIMIT_RESUME_MARGIN_MINUTES)).isoformat() if reset else None)
         self.state['observed_at'] = self.clock().isoformat()
+        if observation.message == CREDIT_LIMIT_MESSAGE:
+            self.state.update(signal=CREDIT_LIMIT_MESSAGE, cloud_blocked_until=None,
+                cloud_resume_at=None, last_credit_probe_at=self.clock().isoformat(),
+                next_credit_probe_at=(self.clock()+timedelta(seconds=600)).isoformat(),
+                chat_disabled=observation.chat_disabled)
+            self._save()
+            return
         if reset is None:
             # A current quota reply remains effective until a later UI recheck.
             self.state['next_recheck_at'] = (self.clock()+timedelta(seconds=120)).isoformat()
         self._save()
 
     def release(self):
+        was_credit = self.state.get('signal') == CREDIT_LIMIT_MESSAGE
         self.state = dict(active=False)
+        if was_credit:
+            self.state.update(last_credit_probe_at=self.clock().isoformat(),
+                              credit_probe_result='GENERATE_AVAILABLE')
         self._save()
 
     def _save(self):

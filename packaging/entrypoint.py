@@ -93,6 +93,9 @@ def _preset_smoke(report_path: Path) -> int:
 
 
 def _dispatch() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == '--packaging-v210-smoke':
+        from djd_maker.packaging.v210_smoke import run_v210_smoke
+        return run_v210_smoke(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) == 5 and sys.argv[1] == '--packaging-sequence-owner':
         from djd_maker.packaging.v29_smoke import sequence_owner
         return sequence_owner(*sys.argv[2:])

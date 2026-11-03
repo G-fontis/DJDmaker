@@ -3,6 +3,86 @@ from djd_maker.core.cancellation import checkpoint, active_monotonic
 from djd_maker.core.generation_settings import STYLE_LABELS
 from djd_maker.core.models import utc_now
 from djd_maker.core.runtime_operation import report_operation
+from enum import StrEnum
+import re
+
+
+class GenerateButtonState(StrEnum):
+    GENERATE_AVAILABLE = 'GENERATE_AVAILABLE'
+    GENERATE_DISABLED = 'GENERATE_DISABLED'
+    GENERATE_DEFERRED_CREDIT_LIMIT = 'GENERATE_DEFERRED_CREDIT_LIMIT'
+    GENERATE_BUTTON_UNKNOWN = 'GENERATE_BUTTON_UNKNOWN'
+    AUTH_REQUIRED = 'AUTH_REQUIRED'
+    BLOCKING_MODAL_UNKNOWN = 'BLOCKING_MODAL_UNKNOWN'
+
+
+def generation_button_state(dialog):
+    from .notebook_modal import classify_modal, ModalKind
+    kind = classify_modal(dialog.inner_text())
+    if kind is ModalKind.AUTH_REQUIRED:
+        return GenerateButtonState.AUTH_REQUIRED
+    if kind not in {ModalKind.UNKNOWN, ModalKind.USAGE_LIMIT}:
+        return GenerateButtonState.BLOCKING_MODAL_UNKNOWN
+    if (dialog.get_by_role('heading', name='動画解説をカスタマイズ', exact=True).count() != 1
+            or dialog.get_by_role('combobox', name='言語を選択', exact=True).count() != 1
+            or dialog.get_by_text('説明動画', exact=True).count() != 1):
+        return GenerateButtonState.BLOCKING_MODAL_UNKNOWN
+    actions = dialog.locator('mat-dialog-actions, [role="group"][aria-label="動画生成アクション"]')
+    if actions.count() != 1:
+        return GenerateButtonState.GENERATE_BUTTON_UNKNOWN
+    deferred = actions.get_by_role('button', name='後で生成', exact=True)
+    generate = actions.get_by_role('button', name='生成', exact=True)
+    # Both actions coexist after partial recovery. Current enabled Generate
+    # is authoritative; the optional background reservation is never clicked.
+    if generate.count() == 1 and generate.is_visible() and generate.is_enabled():
+        return GenerateButtonState.GENERATE_AVAILABLE
+    if deferred.count() == 1 and deferred.is_visible():
+        return GenerateButtonState.GENERATE_DEFERRED_CREDIT_LIMIT
+    if generate.count() == 1 and generate.is_visible():
+        return (GenerateButtonState.GENERATE_AVAILABLE if generate.is_enabled()
+                else GenerateButtonState.GENERATE_DISABLED)
+    return GenerateButtonState.GENERATE_BUTTON_UNKNOWN
+
+
+def close_video_settings(dom, dialog, *, timeout_seconds=5):
+    """Close only this identified form and verify the whole Notebook is usable."""
+    from .notebook_modal import SCRIMS, DIALOGS, BlockingModalError
+    dialogs = dom.page.locator(DIALOGS)
+    if not owned_video_dialog(dialog) or sum(dialogs.nth(i).is_visible() for i in range(dialogs.count())) != 1:
+        raise BlockingModalError('MODAL_CLOSE_NEEDS_REVIEW: 対象設定画面が一意でありません')
+    close = dialog.get_by_role('button', name=re.compile(r'^(閉じる|ダイアログを閉じる|Close|close|×|✕)$'))
+    if close.count() != 1:
+        close = dialog.locator('button:has(mat-icon:text-is("close"))')
+    if close.count() != 1 or not close.is_visible() or not close.is_enabled():
+        raise BlockingModalError('MODAL_CLOSE_NEEDS_REVIEW: close control未確認')
+    close.click(timeout=1000)  # One click; bounded observation, never blind repeated clicks.
+    deadline = active_monotonic()+timeout_seconds
+    while active_monotonic() < deadline:
+        checkpoint('credit.modal.close')
+        dialogs, scrims = dom.page.locator(DIALOGS), dom.page.locator(SCRIMS)
+        if (not dialog.is_visible()
+                and not any(dialogs.nth(i).is_visible() for i in range(dialogs.count()))
+                and not any(scrims.nth(i).is_visible() for i in range(scrims.count()))):
+            studio = dom.page.locator('studio-panel')
+            button = studio.get_by_role('button', name='動画解説', exact=True)
+            if studio.count() == 1 and studio.is_visible() and button.count() == 1 and button.is_enabled():
+                button.click(trial=True, timeout=1000)
+                report_operation('CREDIT_MODAL_CLOSED', human_modal_wait=False,
+                                 dialog_hidden=True, scrim_gone=True)
+                return
+        dom.page.wait_for_timeout(100)
+    raise BlockingModalError('MODAL_CLOSE_NEEDS_REVIEW: dialog/overlay消失未確認')
+
+
+def check_deferred_credit(dom, dialog):
+    if generation_button_state(dialog) is GenerateButtonState.GENERATE_DEFERRED_CREDIT_LIMIT:
+        from djd_maker.core.cloud_limit import CloudLimitReached, LimitObservation, CREDIT_LIMIT_MESSAGE
+        report_operation('CREDIT_LIMIT_DETECTED_BY_DEFERRED_BUTTON', human_modal_wait=False)
+        close_video_settings(dom, dialog)
+        from .usage_limit import UsageLimitDetector
+        hard_limit, chat_enabled = UsageLimitDetector(dom.page, dom.clock).observe()
+        raise CloudLimitReached(LimitObservation(CREDIT_LIMIT_MESSAGE, None,
+            chat_disabled=bool(hard_limit and not chat_enabled)))
 
 
 class ConfigurationUIFailed(RuntimeError):
@@ -18,10 +98,9 @@ UI_STYLE_LABELS = {**STYLE_LABELS, 'paper_craft': 'ペーパー クラフト'}
 
 def owned_video_dialog(dialog):
     """Transaction-local recognition, never a new globally auto-dismissed modal."""
-    return (dialog.get_by_role('heading', name='動画解説をカスタマイズ', exact=True).count() == 1
-            and dialog.get_by_role('combobox', name='言語を選択', exact=True).count() == 1
-            and dialog.get_by_text('説明動画', exact=True).count() == 1
-            and dialog.get_by_role('button', name='生成', exact=True).count() == 1)
+    return generation_button_state(dialog) in {
+        GenerateButtonState.GENERATE_AVAILABLE, GenerateButtonState.GENERATE_DISABLED,
+        GenerateButtonState.GENERATE_DEFERRED_CREDIT_LIMIT}
 
 
 def ensure_studio_interactable(dom, expected_url=None):
@@ -95,6 +174,9 @@ class StudioGeneration:
         if lifecycle is not None and lifecycle.active_download_count:
             raise StudioOutcomePending('WAITING_DOWNLOAD: Download完了後にStudioを再確認します')
         ensure_studio_interactable(self.dom, self.job.notebook_url)
+        panel = self.panel()
+        if panel is not None:
+            check_deferred_credit(self.dom, panel)
 
     def wait(self, predicate, description):
         deadline = active_monotonic() + self.timeout

@@ -31,9 +31,11 @@ class DeferredTaskType(StrEnum):
     AUTOMATION_CLEANUP = "AUTOMATION_CLEANUP"
     ERROR_CLEANUP = "ERROR_CLEANUP"
     PHASE_TRANSITION = "PHASE_TRANSITION"
+    CREDIT_PROBE = "CREDIT_PROBE"
 
 
 _PRIORITY = {
+    DeferredTaskType.CREDIT_PROBE: 4,
     DeferredTaskType.USER_STOP: 0,
     DeferredTaskType.APP_CLOSE: 1,
     DeferredTaskType.DOWNLOAD_RETRY: 2,
@@ -54,6 +56,9 @@ _PRIORITY = {
 }
 
 _RUNTIME_ONLY = {
+    # The durable source of truth is cloud-limit.json's probe deadline.
+    # A queued wake-up must not survive without its in-process consumer.
+    DeferredTaskType.CREDIT_PROBE,
     DeferredTaskType.PAGE_CLOSE,
     DeferredTaskType.POPUP_CLOSE,
     DeferredTaskType.CONTEXT_CLOSE,

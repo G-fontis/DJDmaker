@@ -23,6 +23,7 @@ from djd_maker.core.repositories import JobStateSaveError
 from djd_maker.core.cancellation import RunCancelled, checkpoint
 from djd_maker.adapters.studio_generation import StudioOutcomePending
 from djd_maker.core.cloud_limit import CloudLimitGate, CloudLimitReached
+from djd_maker.adapters.browser import BrowserAuthenticationRequired
 from djd_maker.adapters.notebook_modal import BlockingModalError
 from djd_maker.adapters.notebook import SourceRetryExhausted, GenerationRetryExhausted
 from djd_maker.core.runtime_operation import operation_scope, report_operation, local_task_scope, LocalTaskComplete
@@ -218,7 +219,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         self._idle_announced: dict[str, tuple] = {}
         self._media_progress_lock = threading.Lock()
         self._media_completed = 0
-        self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
+        self.capabilities = self._limit_capabilities()
         self.wait_seconds = 0
         self.scheduler_view = {}
         self._init_deferred()
@@ -325,7 +326,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             # effect. The adapter continues its existing source/reply/artifact
             # readback, then the scheduler recomputes priority at its boundary.
             self._progress_jobs = {j.id: j for j in self.jobs.list()}
-            self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
+            self.capabilities = self._limit_capabilities()
             self.wait_seconds = 0
             self.final_discovery()
         if stage in {'UNKNOWN_MODAL_DETECTED', 'WAITING_FOR_HUMAN_MODAL_DISMISSAL',
@@ -553,21 +554,58 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 job.next_poll_at = None
                 self._save(job)
 
+    def _limit_capabilities(self):
+        return Capabilities.from_limit(self.cloud_limit.blocked,
+            generation_only=self.cloud_limit.state.get('signal') == 'CLOUD_CREDIT_LIMIT_REACHED',
+            chat_disabled=bool(self.cloud_limit.state.get('chat_disabled')))
+
     def _refresh_capabilities(self):
         """Recheck on the browser owner thread, never inside an FFmpeg worker."""
         checkpoint('capability.refresh')
+        from djd_maker.core.cloud_limit import CREDIT_LIMIT_MESSAGE
+        credit = self.cloud_limit.state.get('signal') == CREDIT_LIMIT_MESSAGE
+        if credit and getattr(self, '_credit_local_active', False):
+            self.capabilities = self._limit_capabilities()
+            return
         if self.cloud_limit.blocked:
             if self.cloud_limit.due:
-                recheck = getattr(self.notebook, 'recheck_cloud_limit', None)
+                recheck = getattr(self.notebook, 'probe_generation_credit' if credit else 'recheck_cloud_limit', None)
+                target = self.cloud_limit.state.get('notebook_url')
+                if credit:
+                    owner = getattr(getattr(getattr(self.notebook, 'dom', None), 'interactable_guard', None), '__self__', None)
+                    guard = getattr(owner, 'lifecycle_guard', None)
+                    if guard is not None and guard.active_download_count:
+                        from djd_maker.core.download_guard import DeferredTaskType
+                        guard.register_handler(DeferredTaskType.CREDIT_PROBE, lambda _task: None)
+                        guard.defer(DeferredTaskType.CREDIT_PROBE)
+                        self.capabilities = self._limit_capabilities()
+                        return
+                    candidates = [j for j in self.jobs.list() if j.notebook_url and j.source_status == 'READY'
+                        and not j.studio_generate_claimed_at and not j.generation_started_at
+                        and j.artifact_status in {'NOT_STARTED','ABSENT','UNKNOWN','NOT_CHECKED'}
+                        and j.state in {JobState.WAITING, JobState.UPLOADING, JobState.RECOVERY_PENDING}]
+                    candidates.sort(key=lambda j: j.notebook_url != target)
+                    target = candidates[0] if candidates else None
+                    self.runtime_callback(dict(stage='CREDIT_PROBE_STARTED', level='INFO', human_modal_wait=False))
+                    if target is None:
+                        self.cloud_limit.defer_recheck()
+                        self.capabilities = self._limit_capabilities()
+                        return
                 if callable(recheck):
                     try:
-                        if recheck(self.cloud_limit.state.get('notebook_url')):
+                        if recheck(target):
                             self.cloud_limit.release()
+                            if credit:
+                                self.runtime_callback(dict(stage='CREDIT_RECOVERED', level='INFO', human_modal_wait=False,
+                                    message='動画生成が再び利用可能になりました。未生成Jobの処理を再開します。'))
+                                self.runtime_callback(dict(stage='GENERATION_RESUMED_AFTER_CREDIT_RECOVERY', level='INFO'))
                         else:
                             self.cloud_limit.defer_recheck()
                     except CloudLimitReached as exc:
                         self.cloud_limit.block(exc.observation)
-                    except BlockingModalError:
+                        if credit:
+                            self.runtime_callback(dict(stage='CREDIT_STILL_LIMITED', level='INFO', human_modal_wait=False))
+                    except (BlockingModalError, BrowserAuthenticationRequired, RunCancelled):
                         raise
                     except Exception as exc:
                         self.cloud_limit.defer_recheck()
@@ -577,7 +615,9 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                     self.cloud_limit.defer_recheck()
                     self.runtime_callback(dict(stage='limit.recheck.unavailable', level='WARNING',
                         message='現在Notebookの確認経路がありません。生成せず再確認を待ちます。'))
-        self.capabilities = Capabilities.from_limit(self.cloud_limit.blocked)
+                if credit and self.cloud_limit.blocked:
+                    self.runtime_callback(dict(stage='CREDIT_PROBE_SCHEDULED', level='INFO', cloud_limit=self.cloud_limit.status()))
+        self.capabilities = self._limit_capabilities()
 
     def _generation_preempts(self):
         self._refresh_capabilities()
@@ -715,6 +755,10 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             runnable = runnable or bool(self._manual_retry_requests)
         if not self.all_tasks_completed() and not runnable:
             self.wait_seconds = RESCAN_SECONDS
+            if self.cloud_limit.state.get('signal') == 'CLOUD_CREDIT_LIMIT_REACHED':
+                self.wait_seconds = max(1, self.cloud_limit.recheck_delay)
+                self._scheduler_status(5, '動画生成クレジットの回復を待っています。10分ごとに確認します。')
+                return
             if self.cloud_limit.blocked and self.cloud_limit.recheck_delay < RESCAN_SECONDS:
                 self.wait_seconds = max(1, self.cloud_limit.recheck_delay)
                 self._scheduler_status(5, 'Cloud状態の再確認待ち。未処理候補を保持しています')
@@ -799,6 +843,12 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         self._retry_deferred(local_only=True)
 
     def _run_local_tasks(self, jobs):
+        try:
+            self._run_local_tasks_lane(jobs)
+        finally:
+            self._credit_local_active = False
+
+    def _run_local_tasks_lane(self, jobs):
         """Submit only available slots; refresh priority before every next task.
 
         Already running tasks finish normally. No executor backlog can start
@@ -810,6 +860,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             active = {}
             preempt = False
             while pending or active:
+                self._credit_local_active = bool(active)
                 preempt = preempt or self._generation_preempts()
                 while pending and len(active) < self.ffmpeg_concurrency and not preempt:
                     job = pending.pop(0)
@@ -826,7 +877,9 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                     latest = self.jobs.get(job_id)
                     if latest and latest.state in self.MEDIA_STATES and job_id not in self.deferred_ids:
                         pending.insert(0, latest)
+                self._credit_local_active = bool(active)
                 preempt = preempt or self._generation_preempts()
+        self._credit_local_active = False
 
     def _run_cycle_lane(self, *, selected_jobs=None, allow_collection=False) -> None:
         self._reject_output_name_collisions()
@@ -1798,7 +1851,19 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             job.credit_state = 'CLOUD_BLOCKED_UNTIL'
             job.error_code = None
             job.runtime_reason = 'CLOUD_BLOCKED_UNTIL' if job.state is JobState.WAITING else 'WAITING_REMOTE_ACCESS'
+            if exc.observation.message == 'CLOUD_CREDIT_LIMIT_REACHED':
+                job.credit_state = 'CLOUD_CREDIT_LIMIT_REACHED'
+                job.credit_reset_at = None
+                job.credit_percent = None
+                job.runtime_reason = 'CREDIT_LIMIT_WAIT'
+                job.error_message = None
             self._save(job)
+            from djd_maker.core.cloud_limit import CREDIT_LIMIT_MESSAGE
+            if exc.observation.message == CREDIT_LIMIT_MESSAGE:
+                self.runtime_callback(dict(stage='CLOUD_GENERATION_PAUSED', level='INFO', human_modal_wait=False,
+                    cloud_limit=self.cloud_limit.status(),
+                    message='動画生成クレジットの上限に達しました。生成を一時保留し、他の処理を続行します。'))
+                self.runtime_callback(dict(stage='CREDIT_PROBE_SCHEDULED', level='INFO', cloud_limit=self.cloud_limit.status()))
         except StudioOutcomePending as exc:
             job.state = JobState.RECOVERY_PENDING
             job.resume_checkpoint = 'STUDIO_GENERATION_CLAIMED' if job.studio_generate_claimed_at else 'STUDIO_GENERATION_PENDING'
