@@ -331,7 +331,10 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             self.final_discovery()
         if stage in {'UNKNOWN_MODAL_DETECTED', 'WAITING_FOR_HUMAN_MODAL_DISMISSAL',
                      'MODAL_STILL_VISIBLE', 'MODAL_DISMISSED_BY_USER',
-                     'NOTEBOOK_UI_RESTORED', 'PIPELINE_RESUMED_AFTER_MODAL'}:
+                     'NOTEBOOK_UI_RESTORED', 'PIPELINE_RESUMED_AFTER_MODAL',
+                     'UI_OVERLAY_DETECTED', 'NON_BLOCKING_SORT_MENU', 'NOTEBOOK_TARGET_ACTIONABLE',
+                     'SORT_MENU_DISMISSED', 'SORT_MENU_DISMISS_NEEDS_REVIEW',
+                     'HUMAN_REVIEW_ENTERED', 'STALE_HUMAN_WAIT_CLEARED', 'PIPELINE_RESUMED'}:
             return  # Human wait is runtime-only; leave durable checkpoints intact.
         if stage in {'state.saved', 'job.start', 'job.result', 'job.next', 'limit.warning'} or job.state is JobState.COMPLETED:
             return

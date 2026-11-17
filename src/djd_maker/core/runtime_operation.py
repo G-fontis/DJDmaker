@@ -19,6 +19,14 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'UI_OVERLAY_DETECTED': 'Notebookの表示を確認しています',
+    'NON_BLOCKING_SORT_MENU': 'Notebookの並び替えメニューを確認しました',
+    'NOTEBOOK_TARGET_ACTIONABLE': 'Notebookの操作可能状態を確認しました',
+    'SORT_MENU_DISMISSED': '並び替えメニューを閉じ、処理を続行します',
+    'SORT_MENU_DISMISS_NEEDS_REVIEW': 'Notebookの並び替えメニューを閉じてください。閉じると自動で再開します。',
+    'HUMAN_REVIEW_ENTERED': 'Notebookの確認待ち',
+    'STALE_HUMAN_WAIT_CLEARED': 'Notebookの確認待ちを解除しました',
+    'PIPELINE_RESUMED': 'Notebook処理を自動再開します',
     'CREDIT_LIMIT_DETECTED_BY_DEFERRED_BUTTON': '動画生成クレジットの上限に達しました',
     'CREDIT_MODAL_CLOSED': '動画設定を閉じ、他の処理を続行します',
     'CLOUD_GENERATION_PAUSED': '生成を一時保留し、他の処理を続行します',

@@ -56,6 +56,16 @@ def ensure_notebook_interactable(page, *, diagnostic=lambda _: None, target=None
     dismissed = False
     while True:
         checkpoint('modal.detect')
+        from .sort_menu import recover_sort_menu
+        recovery = recover_sort_menu(page, target=target, lifecycle_guard=lifecycle_guard, diagnostic=diagnostic)
+        if recovery.state == 'RECOVERED':
+            return _restored(page, diagnostic, owned_context)
+        if recovery.state == 'DEFERRED':
+            return page  # Current transfer retains ownership; never press Escape during it.
+        if recovery.state == 'NEEDS_REVIEW':
+            return wait_for_human_modal(page, diagnostic=diagnostic, target=recovery.target,
+                verify_ready=verify_ready, owned_context=owned_context, lifecycle_guard=lifecycle_guard,
+                poll_seconds=poll_seconds, owned_dialog=owned_dialog, sort_attempted=True)
         dialogs = page.locator('[role="dialog"], [aria-modal="true"], dialog[open]')
         visible = [dialogs.nth(i) for i in range(dialogs.count()) if dialogs.nth(i).is_visible()]
         owned = [dialog for dialog in visible if owned_dialog is not None and owned_dialog(dialog)]
@@ -130,6 +140,7 @@ HUMAN_MODAL_MESSAGE = (
     'ChromeのNotebook画面を確認し、表示されているモーダルを閉じてください。\n'
     '閉じると処理は自動的に再開します。'
 )
+SORT_REVIEW_MESSAGE = ('Notebookの並び替えメニューを閉じてください。\n閉じると自動で再開します。')
 SCRIMS = ('.cdk-overlay-backdrop.cdk-overlay-backdrop-showing, [data-testid="modal-scrim"], '
           '.modal-backdrop.show, [data-testid="blocking-overlay"]')
 DIALOGS = '[role="dialog"], [aria-modal="true"], dialog[open]'
@@ -205,15 +216,40 @@ def _classified_error(kind, page):
     raise BlockingModalError(f'BLOCKING_MODAL_{kind.value}: 自動で閉じず確認が必要です')
 
 
+def _restored(current, diagnostic, owned_context, *, stale=False):
+    if owned_context is not None:
+        current.bring_to_front()
+    if stale:
+        diagnostic('STALE_HUMAN_WAIT_CLEARED')
+        report_operation('STALE_HUMAN_WAIT_CLEARED', human_modal_wait=False)
+    diagnostic('NOTEBOOK_UI_RESTORED')
+    report_operation('NOTEBOOK_UI_RESTORED', human_modal_wait=False, message='Notebook画面を確認しました。')
+    diagnostic('PIPELINE_RESUMED_AFTER_MODAL')
+    report_operation('PIPELINE_RESUMED_AFTER_MODAL', human_modal_wait=False, message='Notebook処理を自動再開します。')
+    report_operation('PIPELINE_RESUMED', human_modal_wait=False)
+    return current
+
+
 def wait_for_human_modal(page, *, diagnostic, target, verify_ready, owned_context,
-                         lifecycle_guard, poll_seconds, owned_dialog=None, expected_identity=None):
+                         lifecycle_guard, poll_seconds, owned_dialog=None, expected_identity=None,
+                         sort_attempted=False):
     identity = expected_identity or _identity(page)
     if owned_context is not None and (identity is None or identity[:2] != ('https', 'notebook.google.com')):
         raise BlockingModalError('NOTEBOOK_IDENTITY_UNVERIFIED')
+    from .sort_menu import recover_sort_menu
+    if not sort_attempted and _identity(page) == identity:
+        recovery = recover_sort_menu(page, target=target, lifecycle_guard=lifecycle_guard, diagnostic=diagnostic)
+        if recovery.state == 'RECOVERED':
+            return _restored(page, diagnostic, owned_context, stale=True)
+        if recovery.state == 'NEEDS_REVIEW':
+            sort_attempted=True
+            target=recovery.target
+    review_message = SORT_REVIEW_MESSAGE if sort_attempted else HUMAN_MODAL_MESSAGE
     domain = identity[1] if identity else None
-    diagnostic(f'UNKNOWN_MODAL_DETECTED:role=dialog_or_overlay:text_summary=unclassified:domain={domain}')
-    report_operation('UNKNOWN_MODAL_DETECTED', human_modal_wait=True, message=HUMAN_MODAL_MESSAGE,
+    diagnostic(f'{"SORT_MENU_DISMISS_NEEDS_REVIEW" if sort_attempted else "UNKNOWN_MODAL_DETECTED"}:role=dialog_or_overlay:text_summary=unclassified:domain={domain}')
+    report_operation('SORT_MENU_DISMISS_NEEDS_REVIEW' if sort_attempted else 'UNKNOWN_MODAL_DETECTED', human_modal_wait=True, message=review_message,
                      modal_role='dialog_or_overlay', text_summary='unclassified', current_domain=domain)
+    report_operation('HUMAN_REVIEW_ENTERED', human_modal_wait=True, message=review_message)
     reported_hidden = False
     with human_wait_scope():
         while True:
@@ -221,10 +257,17 @@ def wait_for_human_modal(page, *, diagnostic, target, verify_ready, owned_contex
             if owned_context is not None and _identity(page) and _identity(page)[1] == 'accounts.google.com':
                 _classified_error(ModalKind.AUTH_REQUIRED, page)
             current = _current_notebook(page, owned_context, identity)
-            message = HUMAN_MODAL_MESSAGE
+            message = review_message
             if current is None:
                 message = 'Notebook画面を確認できません。Notebookのタブを開いた状態にしてください。'
             else:
+                if not sort_attempted:
+                    recovery = recover_sort_menu(current, target=target if current is page else None,
+                        lifecycle_guard=lifecycle_guard, diagnostic=diagnostic)
+                    if recovery.state == 'RECOVERED':
+                        return _restored(current, diagnostic, owned_context, stale=True)
+                    if recovery.state == 'NEEDS_REVIEW':
+                        sort_attempted=True;target=recovery.target;review_message=SORT_REVIEW_MESSAGE
                 try:
                     dialogs = _visible(current, DIALOGS)
                     owned = [dialog for dialog in dialogs if owned_dialog is not None and owned_dialog(dialog)]
@@ -265,10 +308,4 @@ def wait_for_human_modal(page, *, diagnostic, target, verify_ready, owned_contex
                         current = None  # Closed tab: wait for the same Notebook identity.
                 else:
                     interruptible_sleep(wait_ms/1000)
-    if owned_context is not None:
-        current.bring_to_front()
-    diagnostic('NOTEBOOK_UI_RESTORED')
-    report_operation('NOTEBOOK_UI_RESTORED', human_modal_wait=False, message='Notebook画面を確認しました。')
-    diagnostic('PIPELINE_RESUMED_AFTER_MODAL')
-    report_operation('PIPELINE_RESUMED_AFTER_MODAL', human_modal_wait=False, message='Notebook処理を自動再開します。')
-    return current
+    return _restored(current, diagnostic, owned_context, stale=True)
