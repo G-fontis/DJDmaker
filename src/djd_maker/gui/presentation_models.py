@@ -49,6 +49,21 @@ class CreditLimitViewModel:
 
     @classmethod
     def from_status(cls, state):
+        recovery = state.get('credit_state')
+        if state.get('active') and recovery in {'CREDIT_RECHECK_DUE', 'CREDIT_RECHECK_IN_PROGRESS',
+                'CREDIT_RECHECK_BROWSER_BUSY', 'CREDIT_RECHECK_TRANSIENT_ERROR', 'AUTH_REQUIRED', 'UNKNOWN_UI_NEEDS_REVIEW'}:
+            from datetime import datetime
+            try:
+                next_time = datetime.fromisoformat(state.get('next_browser_retry_at') or '').astimezone().strftime('%H:%M')
+            except (ValueError, TypeError):
+                next_time = 'まもなく'
+            if recovery in {'CREDIT_RECHECK_DUE', 'CREDIT_RECHECK_IN_PROGRESS'}:
+                next_time = '確認中'
+            reason = {'CREDIT_RECHECK_BROWSER_BUSY':'Chrome接続を確認しています。接続でき次第、動画生成の可否を再確認します。',
+                'AUTH_REQUIRED':'Googleログインを確認してください。',
+                'UNKNOWN_UI_NEEDS_REVIEW':'現在の動画生成画面を確認できません。',
+                'CREDIT_RECHECK_TRANSIENT_ERROR':'Notebookの確認を再試行します。'}.get(recovery, '現在のNotebookで動画生成の可否を再確認します。')
+            return cls(True, f'Cloud生成: 回復確認中 / {reason}\n次回確認: {next_time} / ローカル処理は継続します。')
         if not state.get('active'):
             return cls(False,'Cloud生成: 利用可能 / AI使用量上限: 未検出')
         if state.get('signal') == 'CLOUD_CREDIT_LIMIT_REACHED':

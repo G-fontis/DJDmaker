@@ -56,7 +56,9 @@ def test_stale_limit_reconciles_only_with_current_available_ui(tmp_path, availab
     else:
         assert not remote.events
         assert 0 < pipe.wait_seconds <= 120
-        assert pipe.capabilities.can_download
+        # Ver2.12 separates an unclassified credit UI from a transient
+        # browser failure; the latter waits before another browser task.
+        assert pipe.capabilities.can_download is (available != 'exception')
 
 
 def test_future_limit_deadline_is_not_overridden_by_unprocessed_jobs(tmp_path):

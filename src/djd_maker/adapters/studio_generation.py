@@ -56,6 +56,7 @@ def close_video_settings(dom, dialog, *, timeout_seconds=5):
     if close.count() != 1 or not close.is_visible() or not close.is_enabled():
         raise BlockingModalError('MODAL_CLOSE_NEEDS_REVIEW: close control未確認')
     close.click(timeout=1000)  # One click; bounded observation, never blind repeated clicks.
+    dom.page.mouse.move(0, 0)  # Let transient Studio hover tooltips disappear.
     deadline = active_monotonic()+timeout_seconds
     while active_monotonic() < deadline:
         checkpoint('credit.modal.close')
@@ -66,7 +67,13 @@ def close_video_settings(dom, dialog, *, timeout_seconds=5):
             studio = dom.page.locator('studio-panel')
             button = studio.get_by_role('button', name='動画解説', exact=True)
             if studio.count() == 1 and studio.is_visible() and button.count() == 1 and button.is_enabled():
-                button.click(trial=True, timeout=1000)
+                from playwright.sync_api import Error as PlaywrightError
+                try:
+                    button.click(trial=True, timeout=500)
+                except PlaywrightError:
+                    dom.page.mouse.move(0, 0)
+                    dom.page.wait_for_timeout(100)
+                    continue  # bounded observation; no forced click or modal key
                 report_operation('CREDIT_MODAL_CLOSED', human_modal_wait=False,
                                  dialog_hidden=True, scrim_gone=True)
                 return

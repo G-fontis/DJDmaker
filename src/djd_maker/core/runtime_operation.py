@@ -19,6 +19,14 @@ def local_task_scope(enabled):
         _yield_after_hls.reset(marker)
 
 LABELS = {
+    'BROWSER_OWNER_CLASSIFIED': 'Chromeの現在の所有状態を確認しました',
+    'BROWSER_RECONNECT_ATTEMPT': 'Chrome接続を確認しています',
+    'BROWSER_RECONNECT_SUCCESS': 'Chrome接続を確認しました',
+    'CREDIT_RECHECK_DUE': '動画生成の回復確認を行います',
+    'CREDIT_DEADLINE_EXPIRED': '保存された回復確認時刻を過ぎています',
+    'CREDIT_RECHECK_RETRIED': '現在の動画生成画面を再確認しています',
+    'BROWSER_PROFILE_LOCK_DETECTED': 'Chrome接続待ち・ローカル処理継続',
+    'GENERATION_RESUMED': '未生成Jobの処理を再開します',
     'UI_OVERLAY_DETECTED': 'Notebookの表示を確認しています',
     'NON_BLOCKING_SORT_MENU': 'Notebookの並び替えメニューを確認しました',
     'NOTEBOOK_TARGET_ACTIONABLE': 'Notebookの操作可能状態を確認しました',

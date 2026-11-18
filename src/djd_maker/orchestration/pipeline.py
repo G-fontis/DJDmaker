@@ -334,7 +334,8 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                      'NOTEBOOK_UI_RESTORED', 'PIPELINE_RESUMED_AFTER_MODAL',
                      'UI_OVERLAY_DETECTED', 'NON_BLOCKING_SORT_MENU', 'NOTEBOOK_TARGET_ACTIONABLE',
                      'SORT_MENU_DISMISSED', 'SORT_MENU_DISMISS_NEEDS_REVIEW',
-                     'HUMAN_REVIEW_ENTERED', 'STALE_HUMAN_WAIT_CLEARED', 'PIPELINE_RESUMED'}:
+                     'HUMAN_REVIEW_ENTERED', 'STALE_HUMAN_WAIT_CLEARED', 'PIPELINE_RESUMED',
+                     'BROWSER_OWNER_CLASSIFIED', 'BROWSER_RECONNECT_ATTEMPT', 'BROWSER_RECONNECT_SUCCESS'}:
             return  # Human wait is runtime-only; leave durable checkpoints intact.
         if stage in {'state.saved', 'job.start', 'job.result', 'job.next', 'limit.warning'} or job.state is JobState.COMPLETED:
             return
@@ -558,23 +559,31 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 self._save(job)
 
     def _limit_capabilities(self):
-        return Capabilities.from_limit(self.cloud_limit.blocked,
+        value = Capabilities.from_limit(self.cloud_limit.blocked,
             generation_only=self.cloud_limit.state.get('signal') == 'CLOUD_CREDIT_LIMIT_REACHED',
             chat_disabled=bool(self.cloud_limit.state.get('chat_disabled')))
+        if self.cloud_limit.state.get('credit_state') in {'CREDIT_RECHECK_BROWSER_BUSY', 'CREDIT_RECHECK_TRANSIENT_ERROR', 'AUTH_REQUIRED'}:
+            from dataclasses import replace
+            value = replace(value, can_upload_source=False, can_chat=False, can_check_artifact=False, can_download=False)
+        return value
 
     def _refresh_capabilities(self):
         """Recheck on the browser owner thread, never inside an FFmpeg worker."""
         checkpoint('capability.refresh')
         from djd_maker.core.cloud_limit import CREDIT_LIMIT_MESSAGE
         credit = self.cloud_limit.state.get('signal') == CREDIT_LIMIT_MESSAGE
-        if credit and getattr(self, '_credit_local_active', False):
+        studio_probe = credit or callable(getattr(self.notebook, 'probe_generation_credit', None))
+        if studio_probe and getattr(self, '_credit_local_active', False):
             self.capabilities = self._limit_capabilities()
             return
         if self.cloud_limit.blocked:
             if self.cloud_limit.due:
-                recheck = getattr(self.notebook, 'probe_generation_credit' if credit else 'recheck_cloud_limit', None)
+                recovery_probe = getattr(self.notebook, 'probe_credit_recovery', None)
+                recheck = recovery_probe if callable(recovery_probe) else getattr(self.notebook, 'probe_generation_credit' if studio_probe else 'recheck_cloud_limit', None)
                 target = self.cloud_limit.state.get('notebook_url')
-                if credit:
+                self.runtime_callback(dict(stage='CREDIT_DEADLINE_EXPIRED', level='INFO'))
+                self.runtime_callback(dict(stage='CREDIT_RECHECK_DUE', level='INFO', cloud_limit=self.cloud_limit.status()))
+                if studio_probe:
                     owner = getattr(getattr(getattr(self.notebook, 'dom', None), 'interactable_guard', None), '__self__', None)
                     guard = getattr(owner, 'lifecycle_guard', None)
                     if guard is not None and guard.active_download_count:
@@ -588,37 +597,58 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                         and j.artifact_status in {'NOT_STARTED','ABSENT','UNKNOWN','NOT_CHECKED'}
                         and j.state in {JobState.WAITING, JobState.UPLOADING, JobState.RECOVERY_PENDING}]
                     candidates.sort(key=lambda j: j.notebook_url != target)
+                    if not candidates and callable(recovery_probe):
+                        # Read-only form inspection can use a completed Notebook;
+                        # it does not make that Job runnable or change its snapshot.
+                        candidates = [j for j in self.jobs.list() if j.notebook_url and j.notebook_id
+                            and j.source_status == 'READY' and j.state is JobState.COMPLETED]
                     target = candidates[0] if candidates else None
                     self.runtime_callback(dict(stage='CREDIT_PROBE_STARTED', level='INFO', human_modal_wait=False))
                     if target is None:
-                        self.cloud_limit.defer_recheck()
+                        self.cloud_limit.recheck_failed('UNKNOWN_UI_NEEDS_REVIEW')
                         self.capabilities = self._limit_capabilities()
                         return
                 if callable(recheck):
+                    self.cloud_limit.begin_recheck()
+                    self.runtime_callback(dict(stage='CREDIT_RECHECK_RETRIED', level='INFO',
+                        current_time=self.cloud_limit.clock().isoformat(),
+                        last_limit_source=self.cloud_limit.state.get('message'),
+                        resume_at=self.cloud_limit.state.get('cloud_resume_at'),
+                        recheck_attempt=self.cloud_limit.state.get('recheck_attempt')))
                     try:
                         if recheck(target):
                             self.cloud_limit.release()
-                            if credit:
+                            if studio_probe:
                                 self.runtime_callback(dict(stage='CREDIT_RECOVERED', level='INFO', human_modal_wait=False,
                                     message='動画生成が再び利用可能になりました。未生成Jobの処理を再開します。'))
                                 self.runtime_callback(dict(stage='GENERATION_RESUMED_AFTER_CREDIT_RECOVERY', level='INFO'))
+                                self.runtime_callback(dict(stage='GENERATION_RESUMED', level='INFO'))
                         else:
-                            self.cloud_limit.defer_recheck()
+                            self.cloud_limit.recheck_failed('UNKNOWN_UI_NEEDS_REVIEW')
                     except CloudLimitReached as exc:
                         self.cloud_limit.block(exc.observation)
-                        if credit:
+                        if studio_probe:
                             self.runtime_callback(dict(stage='CREDIT_STILL_LIMITED', level='INFO', human_modal_wait=False))
-                    except (BlockingModalError, BrowserAuthenticationRequired, RunCancelled):
+                    except (BlockingModalError, RunCancelled):
                         raise
+                    except BrowserAuthenticationRequired:
+                        self.cloud_limit.recheck_failed('AUTH_REQUIRED')
+                        self.runtime_callback(dict(stage='AUTH_REQUIRED', level='INFO', message='Googleログインを確認してください。ローカル処理は継続します。'))
                     except Exception as exc:
-                        self.cloud_limit.defer_recheck()
-                        self.runtime_callback(dict(stage='limit.recheck.failed', level='WARNING',
-                            message=f'上限解除を確認できません。待機を維持して再確認します: {type(exc).__name__}'))
+                        from djd_maker.adapters.browser import BrowserProfileLocked, AuthChromeStillRunning
+                        busy = isinstance(exc, (BrowserProfileLocked, AuthChromeStillRunning))
+                        owner = getattr(getattr(getattr(self.notebook, 'dom', None), 'interactable_guard', None), '__self__', None)
+                        status = owner.profile_owner_status() if owner and hasattr(owner, 'profile_owner_status') else {}
+                        self.cloud_limit.recheck_failed('CREDIT_RECHECK_BROWSER_BUSY' if busy else 'CREDIT_RECHECK_TRANSIENT_ERROR', owner=status.get('owner'))
+                        self.runtime_callback(dict(stage='BROWSER_PROFILE_LOCK_DETECTED' if busy else 'CREDIT_RECHECK_TRANSIENT_ERROR', level='INFO',
+                            message='Chrome接続を確認しています。接続でき次第、動画生成の可否を再確認します。' if busy else 'Notebookの確認を再試行します。',
+                            browser_owner=status.get('owner'), browser_connected=status.get('connected'),
+                            failure_reason=type(exc).__name__, cloud_limit=self.cloud_limit.status()))
                 else:
                     self.cloud_limit.defer_recheck()
                     self.runtime_callback(dict(stage='limit.recheck.unavailable', level='WARNING',
                         message='現在Notebookの確認経路がありません。生成せず再確認を待ちます。'))
-                if credit and self.cloud_limit.blocked:
+                if studio_probe and self.cloud_limit.blocked:
                     self.runtime_callback(dict(stage='CREDIT_PROBE_SCHEDULED', level='INFO', cloud_limit=self.cloud_limit.status()))
         self.capabilities = self._limit_capabilities()
 
@@ -726,7 +756,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 JobState.DOWNLOADING, JobState.RESERVED_WAITING_CREDIT_RESET, JobState.RECOVERY_PENDING}
                 or remote_reconcile_candidate(j)
                 or j.state in self.MEDIA_STATES and j.artifact_status == 'DELETE_PENDING')]
-        if remote:
+        if remote and self.capabilities.can_check_artifact:
             self._scheduler_status(3, '期限到達動画の確認・Download')
             self._run_cycle_lane(selected_jobs=remote, allow_collection=True)
         # P4 is reached only after higher-priority work has had its turn.
@@ -736,7 +766,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                     and job.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
                     and not (job.state is JobState.DOWNLOAD_VERIFY_FAILED
                              and not automatic_download_recovery_candidate(job))
-                    and due(job, now)):
+                    and due(job, now) and self.capabilities.can_check_artifact):
                 self._scheduler_status(4, f'Error再診断: {job.script_name}')
                 self._run_cycle_lane(selected_jobs=[job], allow_collection=True)
                 # Re-evaluate generation priority before processing another error.
@@ -747,9 +777,9 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         runnable = any(j.id not in self.deferred_ids and not terminal(j) and
             (j.state in self.MEDIA_STATES or
              (self._needs_dispatch(j) and not self.cloud_limit.blocked) or
-             (j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
+             (self.capabilities.can_download and j.state in {JobState.DOWNLOAD_PENDING, JobState.DOWNLOADING}
               and self._quality_check_due(j, now)) or
-              (j.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
+              (self.capabilities.can_check_artifact and j.state in {JobState.FAILED, JobState.DOWNLOAD_VERIFY_FAILED}
                and not (j.state is JobState.DOWNLOAD_VERIFY_FAILED
                         and not automatic_download_recovery_candidate(j))
                and j.failure_class != 'OUTPUT_BLOCKED' and due(j, now)))
@@ -760,7 +790,10 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             self.wait_seconds = RESCAN_SECONDS
             if self.cloud_limit.state.get('signal') == 'CLOUD_CREDIT_LIMIT_REACHED':
                 self.wait_seconds = max(1, self.cloud_limit.recheck_delay)
-                self._scheduler_status(5, '動画生成クレジットの回復を待っています。10分ごとに確認します。')
+                task = ('Chrome接続を確認しています。接続でき次第、動画生成の可否を再確認します。'
+                    if self.cloud_limit.state.get('credit_state')=='CREDIT_RECHECK_BROWSER_BUSY'
+                    else '動画生成クレジットの回復確認を待っています。')
+                self._scheduler_status(5, task)
                 return
             if self.cloud_limit.blocked and self.cloud_limit.recheck_delay < RESCAN_SECONDS:
                 self.wait_seconds = max(1, self.cloud_limit.recheck_delay)
@@ -865,7 +898,8 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             while pending or active:
                 self._credit_local_active = bool(active)
                 preempt = preempt or self._generation_preempts()
-                while pending and len(active) < self.ffmpeg_concurrency and not preempt:
+                probe_waiting = bool(active) and self.cloud_limit.due
+                while pending and len(active) < self.ffmpeg_concurrency and not preempt and not probe_waiting:
                     job = pending.pop(0)
                     checkpoint('media.dequeue', job.id)
                     future = pool.submit(copy_context().run, self._local_media_with_progress,

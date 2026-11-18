@@ -1729,7 +1729,15 @@ class NotebookEngineAdapter:
         self._record_submission(job, metadata, outcome)
         return NotebookSubmissionResult(job.notebook_id, job.notebook_url, outcome)
 
-    def probe_generation_credit(self, job):
+    def probe_credit_recovery(self, job):
+        """Read-only recovery probe may use an existing completed Notebook.
+
+        A completed artifact is never a generation candidate. Only observe and
+        close the settings form; no checkpoint is changed or Generate clicked.
+        """
+        return self.probe_generation_credit(job, allow_existing_checkpoint=True)
+
+    def probe_generation_credit(self, job, *, allow_existing_checkpoint=False):
         """Observe an existing Notebook form. No upload, create, settings change or Generate."""
         from .studio_generation import (StudioGeneration, GenerateButtonState,
             generation_button_state, close_video_settings, check_deferred_credit)
@@ -1743,9 +1751,20 @@ class NotebookEngineAdapter:
         flow.guard()
         # Existing artifacts must never become probe generation attempts.
         current = self.dom.inspect_status()
-        if current in {RemoteVideoStatus.GENERATING, RemoteVideoStatus.READY}:
+        if allow_existing_checkpoint:
+            deadline = active_monotonic()+min(self.dom.timeout_ms, 30_000)/1000
+            while active_monotonic()<deadline:
+                checkpoint('credit.recovery.hydrate')
+                ready_source = self.dom.source_state(Path(job.source_path).name, include_hidden=True)=='READY'
+                if current in {RemoteVideoStatus.NOT_STARTED, RemoteVideoStatus.READY} and ready_source:
+                    break
+                if current in {RemoteVideoStatus.GENERATING, RemoteVideoStatus.FAILED}:
+                    return False
+                self.dom.page.wait_for_timeout(250)
+                current = self.dom.inspect_status()
+        if current in {RemoteVideoStatus.GENERATING, RemoteVideoStatus.READY} and not allow_existing_checkpoint:
             return False
-        if current is not RemoteVideoStatus.NOT_STARTED:
+        if current is not RemoteVideoStatus.NOT_STARTED and not (allow_existing_checkpoint and current is RemoteVideoStatus.READY):
             return False
         if self.dom.source_state(Path(job.source_path).name, include_hidden=True) != 'READY':
             return False
@@ -1755,6 +1774,10 @@ class NotebookEngineAdapter:
                 return False
             button.click(timeout=3000)
         panel = flow.wait(flow.panel, 'Credit Probeの動画設定画面')
+        # Leave the pointer outside Studio before closing. A hover tooltip for
+        # another Studio card can otherwise intercept the post-close trial.
+        if allow_existing_checkpoint:
+            self.dom.page.mouse.move(0, 0)
         check_deferred_credit(self.dom, panel)
         state = generation_button_state(panel)
         close_video_settings(self.dom, panel)

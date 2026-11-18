@@ -79,6 +79,7 @@ class BrowserManager:
         home_dom_probe: Callable[[Any], bool] | None = None,
         selector_probe: Callable[[Any], bool] | None = None,
         profile_lock_probe: Callable[[Path], bool] | None = None,
+        profile_owner_probe: Callable[[Path], Any] | None = None,
         lock_retry_delays: tuple[float, ...] = (0.1, 0.2, 0.4, 0.8),
         lifecycle_guard: Any | None = None,
     ) -> None:
@@ -92,6 +93,8 @@ class BrowserManager:
         self._home_dom_probe = home_dom_probe
         self._selector_probe = selector_probe
         self._profile_lock_probe = profile_lock_probe or self._default_profile_lock_probe
+        self._profile_owner_probe = profile_owner_probe
+        self._profile_owner_state = 'UNCERTAIN'
         self.lock_retry_delays = lock_retry_delays
         self.lifecycle_guard = lifecycle_guard
         self._guard = threading.RLock()
@@ -164,8 +167,9 @@ class BrowserManager:
         with self._guard:
             if self.auth_process_alive:
                 raise AuthChromeStillRunning("Googleログイン用Chromeを閉じてから開始してください")
-            self._wait_for_profile_unlock()
-            self._ensure_automation_context()
+            if not self._context_alive(self.context):
+                self._wait_for_profile_unlock()
+            self._ensure_automation_context(profile_checked=True)
             return self.ensure_page_alive()
 
     def prepare_for_processing(self) -> Any:
@@ -178,13 +182,14 @@ class BrowserManager:
                 raise AuthChromeStillRunning("Googleログイン用Chromeを閉じてから開始してください")
             self._pass_check("auth_chrome_closed")
             try:
-                self._wait_for_profile_unlock()
+                if not self._context_alive(self.context):
+                    self._wait_for_profile_unlock()
             except Exception:
                 self._fail_check("profile_unlocked")
                 raise
             self._pass_check("profile_unlocked")
             try:
-                self._ensure_automation_context()
+                self._ensure_automation_context(profile_checked=True)
             except Exception:
                 self._fail_check("automation_chrome_started")
                 raise
@@ -242,18 +247,27 @@ class BrowserManager:
     def _default_profile_lock_probe(self, profile: Path) -> bool:
         if self.auth_process_alive:
             return False
-        for name in ("lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"):
-            try:
-                (profile / name).unlink(missing_ok=True)
-            except (PermissionError, OSError):
-                return False
-        try:
-            (profile / "DevToolsActivePort").unlink(missing_ok=True)
-        except (PermissionError, OSError):
-            return False
-        return True
+        state = self.profile_owner_status()
+        # Chrome itself handles stale markers after no live owner is found.
+        # Do not delete lock files, DevToolsActivePort, or modify the profile.
+        return state['owner'] == 'NO_LIVE_OWNER'
+
+    def profile_owner_status(self):
+        if self._context_alive(self.context):
+            owner = 'CONNECTED_CURRENT'
+        elif self.auth_process_alive:
+            owner = 'AUTH_CURRENT'
+        elif self._automation_process is not None and self._automation_process.poll() is None:
+            owner = 'OWNED_PROCESS_BUSY'
+        else:
+            from .profile_owner import profile_owners
+            rows = (self._profile_owner_probe or profile_owners)(self.user_data_dir)
+            owner = 'UNCERTAIN' if rows is None else 'FOREIGN_LIVE' if rows else 'NO_LIVE_OWNER'
+        self._profile_owner_state = owner
+        return {'owner': owner, 'connected': self._context_alive(self.context)}
 
     def _wait_for_profile_unlock(self) -> None:
+        from djd_maker.core.runtime_operation import report_operation
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
         attempts = (0.0, *self.lock_retry_delays)
         for index, delay in enumerate(attempts):
@@ -261,6 +275,7 @@ class BrowserManager:
                 interruptible_sleep(delay)
             if self._profile_lock_probe(self.user_data_dir):
                 return
+            report_operation('BROWSER_OWNER_CLASSIFIED', browser_owner=self._profile_owner_state)
             if index == len(attempts) - 1:
                 break
         raise BrowserProfileLocked(
@@ -278,9 +293,19 @@ class BrowserManager:
             )
         )
 
-    def _ensure_automation_context(self) -> None:
+    def _ensure_automation_context(self, *, profile_checked=False) -> None:
         if self._context_alive(self.context):
+            if self._automation_owner not in {None, threading.get_ident()}:
+                raise BrowserProfileLocked('接続済みChromeは別workerで利用中です')
+            from djd_maker.core.runtime_operation import report_operation
+            report_operation('BROWSER_RECONNECT_SUCCESS', browser_connection='REUSED_CURRENT')
             return
+        # Check current owners before cleanup/launch, including reconnect paths.
+        if not profile_checked:
+            self._wait_for_profile_unlock()
+        from djd_maker.core.runtime_operation import report_operation
+        report_operation('BROWSER_OWNER_CLASSIFIED', browser_owner=self._profile_owner_state)
+        report_operation('BROWSER_RECONNECT_ATTEMPT')
         self._stop_automation()
         if self.chrome_executable is None or not self.chrome_executable.is_file():
             raise BrowserStartError("Google Chromeの実行ファイルが見つかりません")
@@ -311,6 +336,7 @@ class BrowserManager:
                     self.context = wrap(self.context)
                 self.context.set_default_timeout(self.timeout_ms)
                 self.browser = getattr(self.context, "browser", None)
+                report_operation('BROWSER_RECONNECT_SUCCESS', browser_connection='CONNECTED_CURRENT')
                 return
             except Exception as exc:
                 checkpoint('browser.launch_failed')
@@ -494,6 +520,7 @@ class BrowserManager:
             "auth_process_alive": self.auth_process_alive,
             "auth_pid": getattr(self._auth_process, "pid", None) if self.auth_process_alive else None,
             "automation_connected": self._context_alive(self.context),
+            "profile_owner": self._profile_owner_state,
             "page_count": len(pages),
             "gemini_page_count": sum(self._is_gemini_url(page.url) for page in pages),
             "selected_page_url": self._safe_url(self._managed_page),

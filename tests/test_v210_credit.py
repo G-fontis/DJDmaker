@@ -126,7 +126,9 @@ def test_probe_scheduler_recovery_and_reschedule(tmp_path,result):
     clock[0]+=timedelta(seconds=600);pipe._refresh_capabilities()
     assert calls==[job.id]
     assert pipe.capabilities.can_generate is (result is True)
-    assert pipe.capabilities.can_download and pipe.capabilities.can_check_artifact and pipe.capabilities.can_local_process
+    assert pipe.capabilities.can_download is (result!='timeout')
+    assert pipe.capabilities.can_check_artifact is (result!='timeout')
+    assert pipe.capabilities.can_local_process
     assert pipe.jobs.get(job.id).attempt_by_stage=={}
     assert not pipe.jobs.get(job.id).studio_generate_claimed_at
     if result is True:
@@ -135,7 +137,8 @@ def test_probe_scheduler_recovery_and_reschedule(tmp_path,result):
         assert any(e['stage']=='CREDIT_RECOVERED' for e in events)
         assert pipe._generation_preempts()
     else:
-        assert pipe.cloud_limit.recheck_delay==600
+        # Ver2.12: only confirmed deferred credit uses the 600-second probe.
+        assert pipe.cloud_limit.recheck_delay==(600 if result=='deferred' else 15)
         assert not pipe.all_tasks_completed()
         pipe._refresh_capabilities();assert calls==[job.id]
 
@@ -305,7 +308,12 @@ def test_probe_auth_unknown_and_stop_preserve_existing_handling(tmp_path,excepti
     error={'auth':BrowserAuthenticationRequired,'modal':BlockingModalError,'cancel':RunCancelled}[exception]
     def probe(_):raise error('test')
     pipe.notebook.probe_generation_credit=probe
-    with pytest.raises(error):pipe._refresh_capabilities()
+    if exception=='auth':
+        pipe._refresh_capabilities()
+        assert pipe.cloud_limit.status()['credit_state']=='AUTH_REQUIRED'
+        assert not pipe.capabilities.can_generate and pipe.capabilities.can_local_process
+    else:
+        with pytest.raises(error):pipe._refresh_capabilities()
 
 
 def test_no_safe_probe_target_keeps_bounded_recheck(tmp_path):
@@ -313,7 +321,8 @@ def test_no_safe_probe_target_keeps_bounded_recheck(tmp_path):
     clock[0]+=timedelta(seconds=600)
     pipe.notebook.probe_generation_credit=lambda _:pytest.fail('unsafe target')
     pipe._refresh_capabilities()
-    assert pipe.cloud_limit.recheck_delay==600 and pipe.cloud_limit.blocked
+    assert pipe.cloud_limit.recheck_delay==15 and pipe.cloud_limit.blocked
+    assert pipe.cloud_limit.status()['credit_state']=='UNKNOWN_UI_NEEDS_REVIEW'
 
 
 @pytest.mark.parametrize('deadline',['bad',None,'2099-01-01T00:00:00+00:00'])

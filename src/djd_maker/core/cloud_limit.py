@@ -86,6 +86,8 @@ class CloudLimitGate:
                                           replace_retry_delays=(.1, .2, .4, .8))
         document = self.document.load(default={})
         self.state = {key: value for key, value in document.items() if key not in {'schema_version', 'kind'}}
+        if self.state.get('credit_state') == 'CREDIT_RECHECK_IN_PROGRESS':
+            self.state['credit_state'] = 'CREDIT_RECHECK_DUE'
 
     @property
     def blocked(self):
@@ -105,6 +107,9 @@ class CloudLimitGate:
     @property
     def recheck_delay(self):
         now = self.clock()
+        retry = self._date('next_browser_retry_at')
+        if retry and self.state.get('credit_state') in {'CREDIT_RECHECK_BROWSER_BUSY', 'CREDIT_RECHECK_TRANSIENT_ERROR', 'UNKNOWN_UI_NEEDS_REVIEW', 'AUTH_REQUIRED'}:
+            return max(0, (retry-now).total_seconds()) if retry <= now+timedelta(seconds=120) else 0
         if self.state.get('signal') == CREDIT_LIMIT_MESSAGE:
             probe = self._date('next_credit_probe_at')
             return max(0, (probe-now).total_seconds()) if probe and probe <= now+timedelta(seconds=600) else 0
@@ -117,6 +122,8 @@ class CloudLimitGate:
         return max(0, (max(deadlines)-now).total_seconds()) if deadlines else 0
 
     def defer_recheck(self, seconds=120):
+        self.state.pop('next_browser_retry_at', None)
+        self.state['credit_state'] = 'CREDIT_LIMIT_ACTIVE'
         if self.state.get('signal') == CREDIT_LIMIT_MESSAGE:
             self.state['last_credit_probe_at'] = self.clock().isoformat()
             self.state['next_credit_probe_at'] = (self.clock()+timedelta(seconds=600)).isoformat()
@@ -128,6 +135,7 @@ class CloudLimitGate:
     def block(self, observation, *, notebook_url=None):
         reset = observation.blocked_until
         self.state = dict(active=True, message=observation.message,
+                          credit_state='CREDIT_LIMIT_ACTIVE',
                           notebook_url=notebook_url or self.state.get('notebook_url'),
                           cloud_blocked_until=reset.isoformat() if reset else None,
                           cloud_resume_at=(reset + timedelta(minutes=LIMIT_RESUME_MARGIN_MINUTES)).isoformat() if reset else None)
@@ -146,10 +154,25 @@ class CloudLimitGate:
 
     def release(self):
         was_credit = self.state.get('signal') == CREDIT_LIMIT_MESSAGE
-        self.state = dict(active=False)
+        self.state = dict(active=False, credit_state='CREDIT_RECOVERED')
         if was_credit:
             self.state.update(last_credit_probe_at=self.clock().isoformat(),
                               credit_probe_result='GENERATE_AVAILABLE')
+        self._save()
+
+    def begin_recheck(self):
+        self.state.update(credit_state='CREDIT_RECHECK_IN_PROGRESS',
+                          recheck_attempt=int(self.state.get('recheck_attempt', 0))+1)
+        self._save()
+
+    def recheck_failed(self, reason, *, owner=None):
+        attempts = int(self.state.get('recheck_failures', 0))+1
+        seconds = min(120, 15 * 2**min(attempts-1, 3))
+        self.state.update(credit_state=reason, recheck_failures=attempts,
+            browser_owner=owner, recheck_failure_reason=reason,
+            next_browser_retry_at=(self.clock()+timedelta(seconds=seconds)).isoformat())
+        # Keep the last observed quota and its source; connection failure is
+        # never evidence of a new limit or of recovered credit.
         self._save()
 
     def _save(self):
@@ -162,6 +185,11 @@ class CloudLimitGate:
         value = self._date('cloud_resume_at')
         remaining = max(0, int((value-self.clock()).total_seconds())) if value else None
         needs = self.blocked and (value is None or self.clock() >= value)
-        return dict(self.state, remaining_seconds=remaining,
+        state = self.state.get('credit_state')
+        if self.blocked and self.due and state != 'CREDIT_RECHECK_IN_PROGRESS':
+            state = 'CREDIT_RECHECK_DUE'
+        elif not state:
+            state = 'CREDIT_LIMIT_ACTIVE' if self.blocked else 'CREDIT_RECOVERED'
+        return dict(self.state, credit_state=state, remaining_seconds=remaining,
                     reconciliation='LIMIT_UNKNOWN_NEEDS_RECHECK' if needs else 'DEADLINE_WAIT' if self.blocked else 'AVAILABLE',
                     recheck_seconds=self.recheck_delay if self.blocked else 0)
