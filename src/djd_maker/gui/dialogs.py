@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QTableView,
+    QAbstractItemView,
     QVBoxLayout,
     QWidget,
 )
@@ -425,7 +426,9 @@ class JobDetailDialog(QDialog):
         form.addRow("HLS結果", QLabel(job.hls_result or "－"))
         form.addRow("試行回数", QLabel(", ".join(f"{k}: {v}" for k, v in job.attempt_by_stage.items()) or "－"))
         form.addRow("エラーコード", QLabel(job.error_code or "－"))
-        error = QLabel(job.error_message or "－")
+        from djd_maker.core.diagnostics import job_error,error_summary
+        error = QLabel(error_summary(job,job_error(job,job.presentation_stage or job.resume_checkpoint or '状態確認'))
+            if job.error_code or job.error_message or job.failure_class else '－')
         error.setWordWrap(True)
         form.addRow("エラー詳細", error)
         layout.addLayout(form)
@@ -494,10 +497,12 @@ class _LogFilter(QSortFilterProxyModel):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.criteria = ["", "", "", "", ""]
+        self.show_debug=False
 
     def filterAcceptsRow(self, source_row: int, source_parent) -> bool:  # type: ignore[no-untyped-def]
         model = self.sourceModel()
         assert model is not None
+        if not self.show_debug and model.index(source_row,4,source_parent).data()=='DEBUG':return False
         for column, criterion in enumerate(self.criteria, start=1):
             if criterion and criterion.casefold() not in str(model.index(source_row, column, source_parent).data() or "").casefold():
                 return False
@@ -521,30 +526,78 @@ class LogDialog(QDialog):
             filters.addWidget(edit)
             self.filter_edits.append(edit)
         layout.addLayout(filters)
+        self.details_checkbox=QCheckBox('詳細ログを表示')
+        self._was_debug=False
+        self.details_checkbox.toggled.connect(self._update_filter)
+        layout.addWidget(self.details_checkbox)
+        layout.addWidget(QLabel('最新5,000件を表示します。全記録はlogs/events.jsonlに保持します。'))
         self.model = QStandardItemModel(0, len(self.HEADERS), self)
         self.model.setHorizontalHeaderLabels(self.HEADERS)
         self.proxy = _LogFilter(self)
         self.proxy.setSourceModel(self.model)
         self.table = QTableView()
         self.table.setModel(self.proxy)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
+        self.details=QPlainTextEdit();self.details.setReadOnly(True);self.details.setMaximumHeight(180)
+        layout.addWidget(self.details)
+        self.table.selectionModel().currentRowChanged.connect(self._show_details)
+        for i,width in enumerate((170,260,110,180,80)):self.table.setColumnWidth(i,width)
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
         layout.addWidget(close)
 
     def append_record(self, record: LogRecord | dict[str, object] | object) -> None:
-        if isinstance(record, dict):
-            allowed = {key: record.get(key, "") for key in ("timestamp", "job_id", "engine", "stage", "level", "message")}
-            record = LogRecord(**allowed)  # type: ignore[arg-type]
-        if not isinstance(record, LogRecord):
-            record = LogRecord("", message=str(record))
-        value = record.sanitized()
-        self.model.appendRow([QStandardItem(text) for text in (
-            value.timestamp, value.job_id, value.engine, value.stage, value.level, value.message
-        )])
+        from dataclasses import asdict
+        from djd_maker.core.diagnostics import normalize
+        if isinstance(record,LogRecord):record=asdict(record)
+        value=normalize(record if isinstance(record,dict) else {'message':str(record)})
+        label=(f'No. {value["job_no"]} / ' if value.get('job_no') else '')+str(value.get('job_title') or value.get('job_id') or 'システム')
+        if value.get('job_id'):label+=' ['+value['job_id']+']'
+        items=[QStandardItem(str(text)) for text in (value['timestamp'],label,value['engine'],value['stage'],value['level'],value['message'])]
+        items[0].setData(value,Qt.ItemDataRole.UserRole)
+        self.model.appendRow(items)
+        if self.model.rowCount()>5000:self.model.removeRows(0,self.model.rowCount()-5000)
+        return value
+
+    def append_records(self,records):
+        self.table.setSortingEnabled(False);self.model.blockSignals(True)
+        try:
+            for record in records[-5000:]:self.append_record(record)
+        finally:
+            self.model.blockSignals(False);self.proxy.invalidate();self.table.setSortingEnabled(True)
+
+    def _show_details(self,current,_previous):
+        import json,re
+        from djd_maker.core.diagnostics import redact
+        index=self.proxy.mapToSource(current)
+        record=self.model.index(index.row(),0).data(Qt.ItemDataRole.UserRole) or {}
+        reference=(record.get('error_details') or {}).get('traceback_reference')
+        if reference and re.fullmatch(r'diagnostics/[0-9a-f]{32}\.json',reference):
+            root=getattr(self.parent(),'app_root',None)
+            if root is not None:
+                path=root/'logs'/reference
+                if path.is_file() and path.resolve().is_relative_to((root/'logs').resolve()):
+                    try:record={**record,'diagnostic':json.loads(path.read_text(encoding='utf8'))}
+                    except (OSError,ValueError) as exc:record={**record,'diagnostic_unavailable':type(exc).__name__}
+        summary=str(record.get('message') or '')
+        details=record.get('error_details') or {}
+        if details:
+            summary+='\n原因: '+str(details.get('safe_error_message') or '原因未確定')
+            summary+='\n次の操作: '+str(details.get('next_action') or '診断情報を確認してください。')
+        self.details.setPlainText(summary+'\n\n詳細診断:\n'+json.dumps(redact(record),ensure_ascii=False,indent=2,default=str))
 
     def _update_filter(self) -> None:
+        selected=self.details_checkbox.isChecked()
+        if selected and not self._was_debug:
+            root=getattr(self.parent(),'app_root',None)
+            if root is not None and (root/'logs/events.jsonl').is_file():
+                from djd_maker.core.diagnostics import EventJournal
+                self.model.setRowCount(0)
+                self.append_records(EventJournal(root/'logs').recent())
+        self._was_debug=selected
+        self.proxy.show_debug=self.details_checkbox.isChecked()
         self.proxy.criteria = [edit.text().strip() for edit in self.filter_edits]
         self.proxy.invalidate()

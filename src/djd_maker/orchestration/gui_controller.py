@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import sys
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -76,8 +77,13 @@ class GuiPipelineController:
         self._phase = "idle"
         self._jobs_callback: Callable[[object], None] = lambda _value: None
         self._status_callback: Callable[[object], None] = lambda _value: None
-        self._log_callback: Callable[[object], None] = lambda _value: None
-        self._error_callback: Callable[[str, str], None] = lambda _op, _message: None
+        self._log_sink: Callable[[object], None] = lambda _value: None
+        from djd_maker.core.diagnostics import EventJournal
+        from uuid import uuid4
+        self.log_journal = EventJournal(app_root/'logs')
+        self._log_run_id = uuid4().hex
+        self._normal_announced = {}
+        self._error_sink: Callable[[str, str], None] = lambda _op, _message: None
         self._last_states: dict[str, JobState] = {}
         self._runtime: dict[str, object] = {}
         self._stop_reason = None
@@ -108,6 +114,11 @@ class GuiPipelineController:
         self._job_callback(job)
 
     def _runtime_update(self, record: dict) -> None:
+        from djd_maker.core.diagnostics import normalize, occurrence
+        if record.get('event_id') and record.get('event_id')==self._runtime.get('event_id'):
+            record={**record,**occurrence()}
+        job_id=record.get('job_id')
+        record=normalize(record,new=True,job=self._job_snapshots.get(job_id),run_id=self._log_run_id)
         if record.get('stage')=='WAITING_FOR_JOBNO_LOCK':
             self._number_wait_pending.set()
             self._schedule_number_recheck()
@@ -122,14 +133,54 @@ class GuiPipelineController:
             snapshots = list(self._job_snapshots.values())
         if any(previous.get(k) != record.get(k) for k in ('job_id', 'stage', 'decision', 'attempt')):
             self._status_callback({**self.status(snapshots), 'runtime': dict(record)})
-            self._log_callback({'level': record.get('level', 'INFO'), 'stage': record.get('stage', ''),
-                                'message': record.get('message', record.get('stage', '')),
-                                'runtime': dict(record)})
+        self._log_callback(record)
+
+    def _log_callback(self, record):
+        from djd_maker.core.diagnostics import normalize, occurrence
+        if not isinstance(record,dict):record={'message':str(record)}
+        job_id=record.get('job_id') or (record.get('runtime') or {}).get('job_id')
+        value=normalize(record,new=True,job=self._job_snapshots.get(job_id),run_id=self._log_run_id)
+        import time
+        key=(value.get('job_id'),value['stage'],value['level'],value['message'])
+        previous=self._normal_announced.get(key)
+        now=time.monotonic()
+        if previous and now-previous[0]<60:
+            value.update(level='DEBUG',repeat_of=previous[1])
+        elif value['level']!='DEBUG':
+            self._normal_announced[key]=(now,value['event_id'])
+        if len(self._normal_announced)>2000:self._normal_announced.clear()
+        try:self.log_journal.append(value)
+        except OSError as exc:value['log_persistence_error']=type(exc).__name__
+        self._log_sink(value)
+        if value['stage'] in {'job.start','job.result'} and value['level']=='DEBUG':
+            if value.get('decision') in {'COMPLETED_SKIP','WAITING_FOR_NEXT_CHECK','RESERVED_WAITING_RESET'}:return
+            code='JOB_STARTED' if value['stage']=='job.start' else 'JOB_RESULT'
+            summary={**value,**occurrence(),'level':'INFO','event_code':code,
+                'message':'処理を開始します。' if code=='JOB_STARTED' else value['message']}
+            try:self.log_journal.append(summary)
+            except OSError as exc:summary['log_persistence_error']=type(exc).__name__
+            self._log_sink(summary)
+
+    def _error_callback(self,operation,message):
+        from djd_maker.core.diagnostics import safe_text
+        self._error_sink(operation,safe_text(message))
+
+    def _global_exception(self,exc,stage):
+        if isinstance(exc,RunCancelled):return
+        try:
+            details=self.log_journal.exception(exc,None,stage)
+            self._log_callback({'level':'ERROR','stage':stage,'error_details':details,
+                'message':details['safe_error_message']+' 診断ID: '+details['diagnostic_id']})
+        except OSError:
+            from djd_maker.core.diagnostics import normalize
+            import traceback
+            self._log_sink(normalize({'level':'ERROR','stage':stage,'message':str(exc),
+                'traceback':''.join(traceback.format_exception(exc)),'log_persistence_error':'OSError'},new=True))
 
     def _set_stop_reason(self, code, detail=''):
         from djd_maker.core.stop_reason import StopReason
         self._stop_reason = StopReason.make(code,detail)
-        self._runtime_update({**self._runtime, 'stage':'lifecycle.'+code,
+        self._runtime_update({'stage':'lifecycle.'+code, 'component':'GuiPipelineController',
             'message':self._stop_reason.message, 'stop_reason':self._stop_reason.to_dict(),
             'human_modal_wait': False})
 
@@ -143,8 +194,8 @@ class GuiPipelineController:
     ) -> None:
         self._jobs_callback = jobs
         self._status_callback = status
-        self._log_callback = log
-        self._error_callback = error
+        self._log_sink = log
+        self._error_sink = error
 
     def _input_directory(self) -> Path:
         settings = self.settings_provider() if self.settings_provider else self.settings
@@ -187,6 +238,7 @@ class GuiPipelineController:
                     if not self._number_wait_pending.is_set():return
                     try:self.reload()
                     except Exception as exc:
+                        self._global_exception(exc, sys._getframe().f_code.co_name)
                         self._log_callback({'level':'ERROR','stage':'sequence.attention','message':str(exc)})
                         return
             self._number_wait_worker=threading.Thread(target=poll,name='djd-sequence-recheck',daemon=True)
@@ -354,6 +406,7 @@ class GuiPipelineController:
             self._set_stop_reason(self._stop_request_reason or 'USER_STOP')
             return {'pending': 0, 'checked': 0, 'stopped': True}
         except Exception as exc:
+            self._global_exception(exc, sys._getframe().f_code.co_name)
             from djd_maker.core.stop_reason import exception_reason
             self._set_stop_reason(exception_reason(exc),str(exc))
             raise
@@ -601,7 +654,10 @@ class GuiPipelineController:
                 assert self.pipeline_factory is not None
                 try:
                     self.pipeline = self.pipeline_factory()
+                except RunCancelled:
+                    raise
                 except Exception as exc:
+                    self._global_exception(exc, sys._getframe().f_code.co_name)
                     from djd_maker.core.stop_reason import exception_reason
                     self._set_stop_reason(exception_reason(exc),str(exc))
                     cleanup_browser = not bool(
@@ -636,9 +692,10 @@ class GuiPipelineController:
                 if not paused:
                     try:
                         self.pipeline.run_cycle()
-                    except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError):
+                    except (BlockingModalError, NoOpJobTransitionError, JobStateSaveError, RunCancelled):
                         raise
                     except Exception as exc:
+                        self._global_exception(exc, sys._getframe().f_code.co_name)
                         self._log_callback(
                             {
                                 "level": "ERROR",
@@ -715,6 +772,7 @@ class GuiPipelineController:
             self._set_stop_reason(self._stop_request_reason or 'USER_STOP')
             self._log_callback({'level':'INFO', 'stage':'stopped', 'message':json.dumps(self.cancellation.diagnostic())})
         except Exception as exc:
+            self._global_exception(exc, sys._getframe().f_code.co_name)
             from djd_maker.core.stop_reason import exception_reason
             self._set_stop_reason(exception_reason(exc),str(exc))
             self._error_callback('pipeline',str(exc))
@@ -726,6 +784,7 @@ class GuiPipelineController:
                 try:
                     summary()
                 except Exception as exc:
+                    self._global_exception(exc, sys._getframe().f_code.co_name)
                     self._set_stop_reason('STORAGE_FATAL',str(exc))
             # No terminal job can require another Notebook poll. Keep scheduler
             # state aligned with the stopped worker after natural completion too.
@@ -735,6 +794,7 @@ class GuiPipelineController:
                     with cancellation_scope(None):
                         self.cleanup()
                 except Exception as exc:
+                    self._global_exception(exc, sys._getframe().f_code.co_name)
                     self._log_callback(
                         {"level": "WARNING", "stage": "shutdown", "message": str(exc)}
                     )

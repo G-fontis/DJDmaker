@@ -69,7 +69,7 @@ class NaturalItem(QTableWidgetItem):
 
 
 class MainWindow(Phase2Presentation, QMainWindow):
-    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.12"
+    APPLICATION_NAME = "台本から授業動画つくるマシーン Ver2.13"
     ENGINE_CAPTION = "GNBCreator / ドウガッチンガー / HLS Converter の3エンジン構成"
     CREDIT = "Created by 福ゼミ塾長"
     JOB_COLUMNS = ("No", "台本名", "Notebook", "End処理", "HLS/ZIP", "状態", "選択")
@@ -108,6 +108,12 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self._closing = False
         self._close_after_download = False
         self._log_dialog = LogDialog(self)
+        from djd_maker.core.diagnostics import EventJournal
+        try:self._log_dialog.append_records(EventJournal(self.app_root/'logs').recent())
+        except OSError as exc:
+            from djd_maker.core.diagnostics import normalize
+            self._log_dialog.append_record(normalize({'level':'ERROR','stage':'log.read',
+                'message':'既存ログを読み込めません: '+type(exc).__name__},new=True))
         self._preview_player = EndingPreviewPlayer(
             lambda path: open_local_path(path, parent=self), self
         )
@@ -461,7 +467,13 @@ class MainWindow(Phase2Presentation, QMainWindow):
             self._append_log_record({'level': 'ERROR', **event.payload})
 
     def _append_log_record(self, record):
-        self._log_dialog.append_record(record)
+        if isinstance(record,dict) and record.get('level')=='DEBUG' and not self._log_dialog.details_checkbox.isChecked():
+            if not str(record.get('stage','')).startswith('browser-'):return
+        from djd_maker.core.diagnostics import normalize
+        from dataclasses import asdict,is_dataclass
+        record=normalize(record if isinstance(record,dict) else asdict(record) if is_dataclass(record) else {'message':str(record)})
+        if record.get('level')!='DEBUG' or self._log_dialog.details_checkbox.isChecked():
+            self._log_dialog.append_record(record)
         if self.settings.gui_type != 'PHASE2':
             return
         if isinstance(record, dict):
@@ -471,15 +483,13 @@ class MainWindow(Phase2Presentation, QMainWindow):
                 preflight = re.search(r'(?:^|, )preflight_result=([^,]+)', message)
                 self.browser_status_label.setText('● ' + {'authenticated':'認証確認済み', 'login-required':'ログインが必要'}.get(auth.group(1) if auth else '', '認証状態: 未確認'))
                 self.browser_detail_label.setText('Pre-flight: ' + (preflight.group(1) if preflight else 'NOT_RUN'))
-            runtime = record.get('runtime')
-            if isinstance(runtime, dict):
-                message = f"[{runtime.get('job', '－')}] {operation_text(runtime.get('stage', ''))} / {operation_text(runtime.get('decision', ''))}"
         else:
             level, message = 'INFO', str(record)
+        if level=='DEBUG':return
         table = self.execution_log_table
         row = table.rowCount()
         table.insertRow(row)
-        for column,value in enumerate((datetime.now().strftime('%H:%M:%S'),level,sanitize_log_text(message))):
+        for column,value in enumerate((record['timestamp'],level,sanitize_log_text(message))):
             table.setItem(row,column,QTableWidgetItem(value))
         while table.rowCount()>200:
             table.removeRow(0)
@@ -1006,14 +1016,11 @@ class MainWindow(Phase2Presentation, QMainWindow):
         self.runtime_labels['elapsed'][1].setText(f'経過時間: {int(elapsed)}秒')
 
     def _append_runtime_message(self, value):
-        if not isinstance(value, dict) or not isinstance(value.get('runtime'), dict):
+        if not isinstance(value, dict) or value.get('level')=='DEBUG':
             return
-        record = value['runtime']
-        stage = operation_text(record.get('stage', ''))
-        decision = operation_text(record.get('decision', ''))
-        if record.get('message'):
-            decision = str(record['message'])
-        text = f"{datetime.now():%H:%M:%S} [{record.get('job', '－')}] {stage} / {decision}"
+        from djd_maker.core.diagnostics import normalize
+        record=normalize(value)
+        text = f"{record['timestamp']} [{record.get('job_title') or record.get('job_id') or 'システム'}] {record['message']}"
         self.runtime_messages.appendPlainText(sanitize_log_text(text))
 
     def _update_action_state(self) -> None:

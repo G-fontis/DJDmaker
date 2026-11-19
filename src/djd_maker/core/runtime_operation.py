@@ -152,6 +152,8 @@ def report_operation(stage, **fields):
         return
     sink = _sink.get()
     if sink is not None:
+        from .diagnostics import occurrence
+        fields = {**fields, **occurrence()}
         sink(stage, fields)
         if stage == 'hls.complete' and _yield_after_hls.get():
             raise LocalTaskComplete()

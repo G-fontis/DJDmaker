@@ -1,4 +1,4 @@
-# 台本から授業動画つくるマシーン Ver2.12
+# 台本から授業動画つくるマシーン Ver2.13
 
 台本TXTからNotebookLM動画を生成・回収し、任意Ending付与と、設定に応じたHLS/ZIP化または完成MP4保存までをジョブ単位で実行するWindowsデスクトップアプリです。
 
@@ -7,11 +7,13 @@ Created by 福ゼミ塾長
 
 ## Version
 
-Version 2.12.0（GUI表記 Ver2.12）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
+Version 2.13.0（GUI表記 Ver2.13）。Google認証は自動化flagのない通常Chromeで行い、そのChromeを閉じた後、同じ専用profileをautomation Chromeへ安全に引き継ぎます。現在のprocess/profile状態で判定し、過去のopen/close履歴では判定しません。授業動画作成開始時には、Notebookを作る前に7項目の自動Pre-flightを実行します。
 
 PySide6 GUI、動画生成プリセット管理、永続Notebook scheduler、非同期Pipeline、ジョブ詳細・ログ・再実行、Ending preview、専用Chrome profile、Fake Notebook E2Eを含みます。通常処理ではNotebook・source・remote動画artifactを保持し、回収したRAWを12項目の安全gateで検証します。
 
 Ver2.9では、Job番号管理の一時的な競合でreloadやpipelineが停止する問題を修正しました。競合時は通常GUIに待機を表示し、解放後に自動再開します。Job Noの一意性と既存番号を維持します。詳細は[Ver2.9の検証記録](docs/v29-sequence-lock-recovery.md)を参照してください。
+
+Ver2.13では、実行ログをUTCで保存しJST日時・Job No・原因・次の操作を表示します。通常/詳細表示を切り替え、元の失敗工程・診断ID・安全なtracebackを追跡できます。既存の復旧方針とJob隔離を維持します。詳細は[Ver2.13の検証記録](docs/v213-error-diagnostics-log-timestamp.md)を参照してください。
 
 Ver2.12では、再起動後に期限を過ぎたCredit情報を現在のNotebook UIで再確認します。接続済みの専用Chromeは再利用し、Browser profile待機とCredit上限を分けて再試行します。ローカル処理を継続し、生成可能と確認できたら生成優先へ復帰します。詳細は[Ver2.12の検証記録](docs/v212-quota-restart-browserlock-recovery.md)を参照してください。
 
@@ -79,7 +81,7 @@ GUI起動:
 .\.venv\Scripts\djd-maker.exe
 ```
 
-Portable版は`DJDmaker_Ver2.12`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
+Portable版は`DJDmaker_Ver2.13`を任意の書き込み可能な場所へ展開し、`DJDmaker.exe`を起動します。Portable版にはFFmpeg / ffprobeが同梱されています。Windowsの保護機能が警告した場合は、入手元と公開SHA-256を確認してください。
 
 Ver1.2.8では起動・再読込時に現行の出力所有権を照合します。同じTXTの未着手重複jobはIDを保持した「重複参照」として表示し、二重生成と誤FAILEDを防ぎます。異なる有効jobの本当の出力競合だけを対象jobに表示し、他jobは継続します。既存完成物は上書きしません。未完了jobが残る間は自動終了せず、実行可能taskがない間は次回確認まで待機します。両GUIに停止理由・最後のtask・次回確認時刻を表示します。詳細は[Ver1.2.8 検証記録](docs/v128-collision-stop-reason-current-window.md)を参照してください。
 

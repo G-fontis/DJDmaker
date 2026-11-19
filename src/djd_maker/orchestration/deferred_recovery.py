@@ -21,6 +21,7 @@ class DeferredRecovery:
         except SaveDeferred:
             pass
         except JobStateSaveError as error:
+            self._diagnose_save(job,error)
             self._defer(job, error)
 
     def _init_deferred(self):

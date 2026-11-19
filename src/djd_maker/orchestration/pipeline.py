@@ -303,11 +303,13 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         try:
             self.jobs.save(job)
         except SequenceUnavailable as error:
+            self._diagnose_save(job,error)
             self._defer(job,error)
             self.runtime_callback({'stage':'WAITING_FOR_JOBNO_LOCK','job_id':job.id,
                 'level':'INFO','message':'Job番号管理を再確認しています。他のJobを続行します。'})
             raise SaveDeferred() from error
         except JobStateSaveError as error:
+            self._diagnose_save(job,error)
             self._defer(job, error)
             raise SaveDeferred() from error
         self._progress_jobs[job.id] = Job.from_dict(job.to_dict())
@@ -950,7 +952,9 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 else:
                     self._idle_announced.pop(job.id, None)
                 started = time.monotonic()
-                record = dict(job=job.script_name, job_id=job.id, notebook=job.notebook_url or '－',
+                from uuid import uuid4
+                record = dict(job=job.script_name, job_title=job.script_name, job_no=job.job_no,
+                              operation_id=uuid4().hex, job_id=job.id, notebook=job.notebook_url or '－',
                               phase='動画生成開始フェーズ' if self._dispatch_only else '動画回収・変換フェーズ', decision='－', next_action='状態確認', outcome='－',
                               attempt='－', processed=index-1, total=len(values), started=started)
                 def update(stage, fields):
@@ -1043,18 +1047,23 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         return None
 
     def _finish_job(self, job: Job, reason: str, *, no_op: bool = False) -> None:
+        from djd_maker.core.diagnostics import error_summary
         if reason == 'COMPLETED_SKIP':
             report_operation('job.result', decision=reason, outcome='COMPLETED')
             self._no_op_count = 0
             return
         previous = (job.runtime_outcome, job.runtime_reason)
         previous_stage = job.presentation_stage
+        if reason=='FATAL_FAILED':job.failure_class='FATAL_FAILED'
         job.presentation_stage = job.state.value
         if no_op:
             job.error_code = 'NO_OP_JOB_TRANSITION'
             job.error_message = reason
             if job.state is not JobState.FAILED:
                 self._transition(job, JobState.FAILED)
+        if job.state in {JobState.FAILED,JobState.DOWNLOAD_VERIFY_FAILED} or reason=='FATAL_FAILED':
+            from djd_maker.core.diagnostics import job_error
+            job.error_details=job_error(job,previous_stage or job.resume_checkpoint or '状態確認')
         job.runtime_outcome = 'FAILED_WITH_REASON' if job.state is JobState.FAILED else job.state.value
         if reason == 'FATAL_FAILED':
             job.failure_class = 'FATAL_FAILED'
@@ -1064,10 +1073,37 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             self._save(job)
         report_operation('job.result', decision=reason, outcome=job.runtime_outcome,
                          notebook=job.notebook_url or '－',
-                         **({'message':f'ファイル {job.script_name} はエラーになりました。他のjobを継続します。{job.error_message or reason}'}
+                         **({'message':error_summary(job,job.error_details)}
                             if job.state is JobState.FAILED else {}))
         self._no_op_count = self._no_op_count + 1 if no_op else 0
         # Diagnosis failures belong to the individual persisted retry budget.
+
+    def _diagnose(self, job, exc):
+        from djd_maker.core.diagnostics import EventJournal, job_error
+        try:
+            job.error_details=EventJournal(self.paths.work_directory.parent/'logs').exception(
+                exc,job,job.presentation_stage or job.resume_checkpoint or '状態確認')
+        except OSError:
+            # A full/unavailable log disk must not defeat JobStateSave isolation.
+            job.error_details=job_error(job,job.presentation_stage or '状態確認',exc)
+            import traceback
+            from djd_maker.core.diagnostics import safe_text
+            job.error_details['traceback']=safe_text(''.join(traceback.format_exception(exc)))
+
+    def _diagnose_save(self,job,error):
+        """Capture the save exception without replacing the business checkpoint."""
+        from djd_maker.core.diagnostics import EventJournal,job_error,safe_text
+        shadow=Job.from_dict(job.to_dict())
+        shadow.error_code='JOB_STATE_SAVE_ERROR';shadow.failure_class=None
+        shadow.error_details={};shadow.attempt_by_stage={}
+        try:
+            details=EventJournal(self.paths.work_directory.parent/'logs').exception(error,shadow,'Job状態保存')
+        except OSError:
+            import traceback
+            details=job_error(shadow,'Job状態保存',error)
+            details['traceback']=safe_text(''.join(traceback.format_exception(error)))
+        self.runtime_callback(dict(stage='save.diagnostic',level='WARNING',job_id=job.id,
+            error_details=details,message='Job状態の保存を再確認します。診断ID: '+details['diagnostic_id']))
 
     def _check_act_job(self, job: Job) -> None:
         if remote_reconcile_candidate(job):
@@ -1222,6 +1258,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                     # A broken Notebook or download must not prevent the other
                     # recoverable jobs from being checked in this same scan.
                     job.error_message = str(exc)
+                    self._diagnose(job, exc)
                     if job.state is JobState.DOWNLOAD_VERIFY_FAILED:
                         job.failure_class = (
                             'RECOVERABLE_EXHAUSTED'
@@ -1358,6 +1395,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             job.attempt_by_stage[key] = job.attempt_by_stage.get(key, 0) + 1
             job.error_code = 'NOTEBOOK_STATE_UNKNOWN'
             job.error_message = str(exc)
+            self._diagnose(job, exc)
             job.remote_checkpoint = 'ARTIFACT_UNKNOWN'
             job.next_poll_at = (now + timedelta(seconds=RESCAN_SECONDS)).isoformat()
             if job.attempt_by_stage[key] >= MAX_ERROR_ATTEMPTS:
@@ -1454,6 +1492,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                     job.last_quality_result = 'DOWNLOAD_MEDIA_INVALID'
                     job.download_failure_reason = _download_failure_reason(exc)
                     job.error_message = str(exc)
+                    self._diagnose(job, exc)
                     try:
                         job.last_download_size = candidate.stat().st_size
                     except OSError:
@@ -1524,6 +1563,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 job.last_quality_result = 'DOWNLOAD_BROWSER_INCOMPLETE'
                 job.download_failure_reason = _download_failure_reason(exc)
                 job.error_message = str(exc)
+                self._diagnose(job, exc)
                 job.download_status = 'REDOWNLOAD_REQUIRED'
                 self._save(job)
                 if job.download_attempt_count >= MAX_QUALITY_DOWNLOAD_ATTEMPTS:
@@ -1684,6 +1724,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
             job.attempt_by_stage['scheduler.recovery'] = job.attempt_by_stage.get('scheduler.recovery', 0)+1
             job.error_code = "RECOVERY_CHECK_FAILED"
             job.error_message = str(exc)
+            self._diagnose(job, exc)
             job.next_poll_at = (checked_at+timedelta(seconds=RESCAN_SECONDS)).isoformat()
             if job.attempt_by_stage['scheduler.recovery'] >= MAX_ERROR_ATTEMPTS:
                 job.failure_class = 'TERMINAL_FAILED'
@@ -1870,6 +1911,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
         except (SourceRetryExhausted, GenerationRetryExhausted) as exc:
             job.error_code = str(exc).split(':', 1)[0]
             job.error_message = str(exc)
+            self._diagnose(job, exc)
             # The adapter explicitly certifies exhaustion. Persist that fact
             # before discovery so migration cannot demote it to generic fatal.
             stage = 'source.reupload' if isinstance(exc, SourceRetryExhausted) else 'generation.failed_retry'
@@ -1928,6 +1970,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 job.next_poll_at = (self.cloud_limit.clock()+timedelta(seconds=RESCAN_SECONDS)).isoformat()
                 job.error_code = 'REMOTE_ACCESS_UNAVAILABLE'
                 job.error_message = str(exc)
+                self._diagnose(job, exc)
                 job.runtime_reason = 'WAITING_REMOTE_ACCESS'
                 if job.attempt_by_stage[key] >= MAX_ERROR_ATTEMPTS:
                     job.state = JobState.FAILED
@@ -1938,6 +1981,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                     can_check_artifact=False, can_download=False)
                 return
             job.error_message = str(exc)
+            self._diagnose(job, exc)
             job.resume_checkpoint = job.state.value
             if job.state is JobState.DOWNLOADING:
                 job.error_code = (
@@ -2193,6 +2237,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 job.failure_class = 'FATAL_FAILED'
             job.resume_checkpoint = job.state.value
             job.error_message = str(exc)
+            self._diagnose(job, exc)
             if job.state not in {JobState.FAILED, JobState.COMPLETED}:
                 self._transition(job, JobState.FAILED)
 
@@ -2315,6 +2360,7 @@ class PipelineCoordinator(RawStorage, DeferredRecovery):
                 latest.manual_retry_requested = False
                 latest.last_quality_result = 'MANUAL_SAVE_RETRY_REJECTED'
                 latest.error_message = str(exc)
+                self._diagnose(latest, exc)
                 self._save(latest)
             self._manual_retry_failures[job_id] = str(exc)
             with self._manual_retry_lock:

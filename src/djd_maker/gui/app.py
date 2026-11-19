@@ -154,7 +154,8 @@ def build_desktop(
     )
     def publish_download_lifecycle(record: dict[str, object]) -> None:
         service._runtime_update({
-            **service._runtime,
+            'job_id':record.get('job_id'), 'job_title':None, 'job':None,
+            'timestamp':record.get('timestamp'),
             'stage': 'download.transfer',
             'lifecycle_state': download_lifecycle.state,
             'active_download_count': download_lifecycle.active_download_count,
@@ -162,6 +163,7 @@ def build_desktop(
             'download_event': dict(record),
         })
         service._log_callback({
+            'job_id':record.get('job_id'), 'timestamp':record.get('timestamp'),
             'level': 'INFO', 'stage': 'download.lifecycle',
             'message': str(record),
         })
